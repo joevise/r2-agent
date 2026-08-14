@@ -1,0 +1,28 @@
+# R2 Agent 配置示例 — 复制到 ~/.r2/config.toml 并填入你的 API Key
+
+[model]
+provider = "openai_compat"
+
+[model.openai_compat]
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+api_key = "你的key"
+model = "glm-5.2"
+
+[agent]
+max_turns = 50
+max_total_tokens = 500000
+work_dir = "."
+
+[context]
+l1_threshold = 0.7
+l2_summary_model = "glm-4.5-flash"
+l3_enabled = false
+
+[sandbox]
+level = "container"
+bash_timeout_secs = 30
+max_processes = 10
+max_memory_mb = 512
+
+[session]
+dir = "~/.r2/sessions"
