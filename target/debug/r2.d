@@ -1,0 +1,1 @@
+/home/elttilz/joe_ai_projects/local_claws/joevise_projects/r2-agent/target/debug/r2: /home/elttilz/joe_ai_projects/local_claws/joevise_projects/r2-agent/src/config.rs /home/elttilz/joe_ai_projects/local_claws/joevise_projects/r2-agent/src/main.rs /home/elttilz/joe_ai_projects/local_claws/joevise_projects/r2-agent/src/types.rs

@@ -1,0 +1,11 @@
+/home/elttilz/joe_ai_projects/local_claws/joevise_projects/r2-agent/target/debug/deps/ipnet-c3b4cb58bc09f447.d: /home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/lib.rs /home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/ipext.rs /home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/ipnet.rs /home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/mask.rs /home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/parser.rs
+
+/home/elttilz/joe_ai_projects/local_claws/joevise_projects/r2-agent/target/debug/deps/libipnet-c3b4cb58bc09f447.rlib: /home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/lib.rs /home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/ipext.rs /home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/ipnet.rs /home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/mask.rs /home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/parser.rs
+
+/home/elttilz/joe_ai_projects/local_claws/joevise_projects/r2-agent/target/debug/deps/libipnet-c3b4cb58bc09f447.rmeta: /home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/lib.rs /home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/ipext.rs /home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/ipnet.rs /home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/mask.rs /home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/parser.rs
+
+/home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/lib.rs:
+/home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/ipext.rs:
+/home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/ipnet.rs:
+/home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/mask.rs:
+/home/elttilz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ipnet-2.12.1/src/parser.rs:
