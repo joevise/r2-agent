@@ -1,5 +1,6 @@
 //! 模型层抽象：ModelProvider trait + Provider 工厂
 
+pub mod anthropic;
 pub mod openai_compat;
 
 use crate::types::{Message, StreamChunk, ToolCall, ToolSchema};
@@ -41,7 +42,11 @@ pub fn create_provider(config: &crate::config::Config) -> ModelResult<Box<dyn Mo
             &config.model.openai_compat.api_key,
             &config.model.openai_compat.model,
         ))),
-        "anthropic" => Err("anthropic provider 尚未实现（P0.5）".into()),
+        "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(
+            &config.model.anthropic.base_url,
+            &config.model.anthropic.api_key,
+            &config.model.anthropic.model,
+        ))),
         other => Err(format!("未知 provider: {other}").into()),
     }
 }
