@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 mod config;
+mod model;
 mod types;
 
 use config::Config;
@@ -9,5 +10,7 @@ use config::Config;
 fn main() {
     println!("R2 Agent — booting…");
     let config = Config::default_config();
+    let provider = model::create_provider(&config).expect("创建 model provider 失败");
+    println!("model provider: {}", provider.id());
     println!("{:#?}", config);
 }
