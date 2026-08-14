@@ -1,0 +1,43 @@
+[package]
+name = "r2-agent"
+version = "0.1.0"
+edition = "2021"
+description = "R2 Agent — Small droid, big jobs. A minimal Rust Agent runtime."
+license = "MIT"
+
+[dependencies]
+# HTTP + 异步
+reqwest = { version = "0.12", features = ["stream", "json"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+# L3 向量索引（可选，feature gate）
+rusqlite = { version = "0.31", optional = true }
+
+[features]
+default = []               # 默认不编译 L3（减少二进制大小）
+l3-memory = ["rusqlite"]   # 启用跨会话记忆
+
+[profile.release]
+opt-level = "z"     # 最小体积优化
+lto = true          # 链接时优化
+strip = true        # 去除调试符号
+panic = "abort"     # 减小二进制
+
+[[bin]]
+name = "r2"
+path = "src/main.rs"
