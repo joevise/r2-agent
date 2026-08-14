@@ -1,16 +1,18 @@
-//! Agent 循环引擎：用户输入 → 模型流式响应 → 输出
+//! Agent 循环引擎：用户输入 → 模型流式响应 → 工具执行 → 输出
 
 use crate::config::Config;
 use crate::context::ContextManager;
 use crate::model::{create_provider, ModelProvider, ModelResult};
+use crate::tools::ToolRegistry;
 use crate::types::{Role, StreamChunk};
 use futures_util::StreamExt;
 use std::io::Write;
 
-/// R2 Agent：Provider + L1 上下文 + 配置
+/// R2 Agent：Provider + L1 上下文 + 工具注册表 + 配置
 pub struct Agent {
     provider: Box<dyn ModelProvider>,
     context: ContextManager,
+    tools: ToolRegistry,
     config: Config,
 }
 
@@ -19,9 +21,14 @@ impl Agent {
         let provider = create_provider(&config)?;
         let max_tokens = config.agent.max_total_tokens;
         let context = ContextManager::new("你是 R2，一个极简但可靠的 Rust Agent。", max_tokens);
+        let tools = ToolRegistry::new_default(
+            &config.agent.work_dir,
+            config.sandbox.bash_timeout_secs,
+        );
         Ok(Self {
             provider,
             context,
+            tools,
             config,
         })
     }
@@ -35,7 +42,7 @@ impl Agent {
             let messages = self.context.build();
             let mut stream = self
                 .provider
-                .chat_stream(&messages, &[])
+                .chat_stream(&messages, &self.tools.schemas())
                 .await
                 .map_err(|e| format!("模型请求失败（第 {} 轮）：{}", turn + 1, e))?;
 
@@ -66,6 +73,14 @@ impl Agent {
 
             if tool_calls.is_empty() {
                 break;
+            }
+
+            // 逐个执行工具调用，结果回灌上下文后继续下一轮循环
+            for call in &tool_calls {
+                let result = self.tools.execute(call).await;
+                let preview: String = result.chars().take(80).collect();
+                println!("\n[tool] {} → {}...", call.name, preview);
+                self.context.add_tool_result(&call.id, &result)?;
             }
         }
         Ok(final_text)

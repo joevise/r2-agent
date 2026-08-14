@@ -5,6 +5,7 @@ mod agent;
 mod config;
 mod context;
 mod model;
+mod tools;
 mod types;
 
 use agent::Agent;
