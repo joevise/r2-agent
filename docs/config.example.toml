@@ -26,3 +26,14 @@ max_memory_mb = 512
 
 [session]
 dir = "~/.r2/sessions"
+
+# MCP 外部工具服务器（可选，stdio 传输；工具以 mcp_{name}_{tool} 注册，单个失败不影响启动）
+# [[mcp.servers]]
+# name = "filesystem"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+#
+# [[mcp.servers]]
+# name = "fetch"
+# command = "uvx"
+# args = ["mcp-server-fetch"]

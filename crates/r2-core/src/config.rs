@@ -23,6 +23,9 @@ pub struct Config {
     /// 会话存储配置
     #[serde(default)]
     pub session: SessionConfig,
+    /// MCP 外部工具服务器配置
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 /// 模型配置
@@ -148,6 +151,26 @@ pub struct SessionConfig {
     /// 会话文件目录（支持 ~ 展开）
     #[serde(default = "default_session_dir")]
     pub dir: String,
+}
+
+/// MCP 配置：要连接的外部 MCP server 列表（默认空，向后兼容）
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct McpConfig {
+    /// MCP server 列表
+    #[serde(default)]
+    pub servers: Vec<McpServerConfig>,
+}
+
+/// 单个 MCP server（stdio 传输：command + args 起子进程）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpServerConfig {
+    /// server 名（用于工具名前缀 mcp_{name}_{tool}）
+    pub name: String,
+    /// 启动命令（如 npx / uvx）
+    pub command: String,
+    /// 命令参数
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 fn default_provider() -> String {
@@ -321,6 +344,7 @@ impl Config {
             context: ContextConfig::default(),
             sandbox: SandboxConfig::default(),
             session: SessionConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
 
@@ -537,6 +561,35 @@ provider = "anthropic"
         apply_overrides(&mut config, None, Some("~/proj"));
         let home = std::env::var("HOME").unwrap();
         assert_eq!(config.agent.work_dir, format!("{home}/proj"));
+    }
+
+    #[test]
+    fn test_mcp_config_defaults_empty() {
+        // 旧配置（无 mcp 字段）向后兼容：servers 默认为空
+        let config = Config::load_from_str(FULL_TOML).unwrap();
+        assert!(config.mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn test_mcp_config_parse() {
+        let toml_str = r#"
+[[mcp.servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+[[mcp.servers]]
+name = "fetch"
+command = "uvx"
+args = ["mcp-server-fetch"]
+"#;
+        let config = Config::load_from_str(toml_str).unwrap();
+        assert_eq!(config.mcp.servers.len(), 2);
+        assert_eq!(config.mcp.servers[0].name, "filesystem");
+        assert_eq!(config.mcp.servers[0].command, "npx");
+        assert_eq!(config.mcp.servers[0].args.len(), 3);
+        assert_eq!(config.mcp.servers[1].name, "fetch");
+        assert_eq!(config.mcp.servers[1].args, vec!["mcp-server-fetch"]);
     }
 
     #[test]

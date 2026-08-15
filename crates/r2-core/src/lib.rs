@@ -33,6 +33,7 @@ pub mod agent;
 pub mod config;
 pub mod context;
 mod events;
+pub mod mcp;
 #[cfg(feature = "l3-memory")]
 pub mod memory;
 pub mod model;

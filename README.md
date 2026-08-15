@@ -119,6 +119,21 @@ r2-agent/
 
 详细设计文档见飞书（内部）。
 
+## MCP 外部工具
+
+r2 可作为 MCP host 连接外部 MCP server（stdio 传输），把 server 提供的工具动态注册进工具表，模型像用内置工具一样调用它们。配置示例：
+
+```toml
+[[mcp.servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+```
+
+- 工具以 `mcp_{server}_{tool}` 前缀注册，不与内置工具撞名
+- 单个 server 连接失败只告警跳过，不影响启动；请求默认 30s 超时
+- Agent 退出时自动杀掉 MCP server 子进程
+
 ## 沙箱
 
 | 级别 | 能力 |

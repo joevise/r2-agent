@@ -50,6 +50,11 @@ impl ToolRegistry {
         })
     }
 
+    /// 注册一个外部工具（MCP 适配器用）
+    pub(crate) fn push_tool(&mut self, tool: Box<dyn Tool>) {
+        self.tools.push(tool);
+    }
+
     /// 导出全部工具的 schema（发给模型）
     pub fn schemas(&self) -> Vec<ToolSchema> {
         self.tools

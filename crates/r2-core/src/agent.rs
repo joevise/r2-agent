@@ -43,8 +43,9 @@ impl Agent {
         let provider = create_provider(&config)?;
         let max_tokens = config.agent.max_total_tokens;
         let context = ContextManager::new(SYSTEM_PROMPT, max_tokens, config.context.l1_threshold);
-        let tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox)
+        let mut tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        tools.connect_mcp(&config.mcp);
         let session = Session::create(&crate::config::expand_tilde(&config.session.dir)).ok();
         #[cfg(feature = "l3-memory")]
         let (memory, embedding) = Self::init_memory(&config);
@@ -80,8 +81,9 @@ impl Agent {
             max_tokens,
             config.context.l1_threshold,
         );
-        let tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox)
+        let mut tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        tools.connect_mcp(&config.mcp);
         println!("已恢复会话 {session_id}（{count} 条历史消息）");
         #[cfg(feature = "l3-memory")]
         let (memory, embedding) = Self::init_memory(&config);
@@ -121,8 +123,9 @@ impl Agent {
             max_tokens,
             config.context.l1_threshold,
         );
-        let tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox)
+        let mut tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        tools.connect_mcp(&config.mcp);
         println!("已从会话 {parent_session_id} 分叉（继承 {count} 条消息，新会话 {new_id}）");
         #[cfg(feature = "l3-memory")]
         let (memory, embedding) = Self::init_memory(&config);
