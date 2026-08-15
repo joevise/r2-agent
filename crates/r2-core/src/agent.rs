@@ -27,6 +27,8 @@ pub struct Agent {
     memory: Option<MemoryStore>,
     /// 事件广播（库形态嵌入时由 AgentSession 注入；CLI 下为 None，行为不变）
     emitter: Option<tokio::sync::broadcast::Sender<AgentEvent>>,
+    /// 中途转向通道（AgentSession / CLI 注入；未注入时行为与原来完全一致）
+    steer_rx: Option<tokio::sync::mpsc::Receiver<String>>,
     /// 静音模式：为 true 时不向 stdout 打印（事件照常广播）
     quiet: bool,
 }
@@ -52,6 +54,7 @@ impl Agent {
             #[cfg(feature = "l3-memory")]
             memory,
             emitter: None,
+            steer_rx: None,
             quiet: false,
         })
     }
@@ -86,6 +89,7 @@ impl Agent {
             #[cfg(feature = "l3-memory")]
             memory,
             emitter: None,
+            steer_rx: None,
             quiet: false,
         })
     }
@@ -93,6 +97,17 @@ impl Agent {
     /// 注入事件广播通道（嵌入方使用；CLI 不调用，输出行为不变）
     pub fn set_emitter(&mut self, emitter: tokio::sync::broadcast::Sender<AgentEvent>) {
         self.emitter = Some(emitter);
+    }
+
+    /// 注入 steer 通道（AgentSession / CLI 用）：运行中可接收用户中途转向指令
+    pub fn set_steer_channel(&mut self, rx: tokio::sync::mpsc::Receiver<String>) {
+        self.steer_rx = Some(rx);
+    }
+
+    /// 测试注入 Mock Provider（不走 create_provider 工厂）
+    #[cfg(test)]
+    pub(crate) fn set_provider(&mut self, p: Box<dyn ModelProvider>) {
+        self.provider = p;
     }
 
     /// 静音开关：true 时不向 stdout 打印（事件照常广播）
@@ -247,6 +262,10 @@ impl Agent {
     /// 处理一次用户输入，流式打印 assistant 输出，返回完整回复文本
     pub async fn run(&mut self, user_input: &str) -> ModelResult<String> {
         self.emit(AgentEvent::AgentStart);
+        // 排空上一轮残留的 steer 消息——非运行时注入的指令不应影响本轮
+        if let Some(rx) = self.steer_rx.as_mut() {
+            while rx.try_recv().is_ok() {}
+        }
         // 关键：在 add_user 之前先压缩——否则上下文快满时用户消息会先撞限报错，
         // 压缩永远没机会触发
         self.compress_if_needed().await;
@@ -280,28 +299,56 @@ impl Agent {
                 .map_err(|e| format!("模型请求失败（第 {} 轮）：{}", turn + 1, e))?;
 
             let mut chunks: Vec<StreamChunk> = Vec::new();
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(chunk) => {
-                        if let StreamChunk::Delta(ref s) = chunk {
-                            if !self.quiet {
-                                print!("{s}");
-                                let _ = std::io::stdout().flush();
+            // 把 steer 通道临时拿出 self：select 的流分支要借用 self（emit/quiet），
+            // 不能同时持有 self.steer_rx 的可变借用。循环结束后放回。
+            let mut steer_rx = self.steer_rx.take();
+            let mut steered_msg: Option<String> = None;
+            loop {
+                tokio::select! {
+                    item = stream.next() => match item {
+                        Some(Ok(chunk)) => {
+                            if let StreamChunk::Delta(ref s) = chunk {
+                                if !self.quiet {
+                                    print!("{s}");
+                                    let _ = std::io::stdout().flush();
+                                }
+                                self.emit(AgentEvent::MessageUpdate(s.clone()));
                             }
-                            self.emit(AgentEvent::MessageUpdate(s.clone()));
+                            chunks.push(chunk);
                         }
-                        chunks.push(chunk);
-                    }
-                    Err(e) => {
-                        if !self.quiet {
-                            println!();
+                        Some(Err(e)) => {
+                            if !self.quiet {
+                                println!();
+                            }
+                            self.steer_rx = steer_rx;
+                            return Err(format!("流式响应中断：{e}").into());
                         }
-                        return Err(format!("流式响应中断：{e}").into());
-                    }
+                        None => break,   // 流正常结束
+                    },
+                    // 没装 steer 通道时此分支永远 pending，行为与原来完全一致
+                    msg = async {
+                        match steer_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => match msg {
+                        Some(m) => {
+                            steered_msg = Some(m);
+                            break; // 抛弃当前流（stream drop 即断开连接）
+                        }
+                        None => steer_rx = None, // 发送端已关闭：当作无 steer 通道
+                    },
                 }
             }
+            self.steer_rx = steer_rx;
             if !self.quiet {
                 println!();
+            }
+
+            // steer 处理：流被放弃后，带着部分输出 + 新指令继续下一轮
+            if let Some(steer) = steered_msg {
+                self.handle_steer(&chunks, &steer)?;
+                continue;
             }
 
             let (text, tool_calls) = self
@@ -336,6 +383,21 @@ impl Agent {
             }
             // 每轮结束落一个检查点
             self.log_session(&SessionEntry::checkpoint(turn + 1));
+
+            // 工具间隙检查 steer（非阻塞）。刻意放在整轮工具执行完之后检查：
+            // 中途丢弃剩余 tool_calls 会让 assistant 消息挂着没结果的工具调用，
+            // 破坏上下文完整性。语义：本轮全部工具结果已入上下文，
+            // steer 作为新 user 消息追加后直接继续外层 turn 循环。
+            let mut gap_msgs: Vec<String> = Vec::new();
+            if let Some(rx) = self.steer_rx.as_mut() {
+                while let Ok(msg) = rx.try_recv() {
+                    gap_msgs.push(msg);
+                }
+            }
+            if !gap_msgs.is_empty() {
+                self.handle_steer(&[], &gap_msgs.join("\n"))?;
+                continue;
+            }
         }
 
         // L3：存一轮 Q&A（session 可能为 None——持久化失败场景，用 "unknown" 代替）
@@ -350,6 +412,33 @@ impl Agent {
             final_text: final_text.clone(),
         });
         Ok(final_text)
+    }
+
+    /// steer 统一处理：保留已收到的文本部分（半截工具调用 JSON 不可用，全部丢弃），
+    /// 追加中断标注和 [用户中途指令] 消息，广播 Steered 事件
+    fn handle_steer(&mut self, chunks: &[StreamChunk], steer: &str) -> ModelResult<()> {
+        // 只取文本部分拼 partial_text
+        let partial_text: String = chunks
+            .iter()
+            .filter_map(|c| match c {
+                StreamChunk::Delta(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        if !partial_text.trim().is_empty() {
+            // 追加标注——让模型知道上次没说完
+            let annotated = format!("{}\n(此回复被用户中途打断)", partial_text);
+            self.context.add_assistant_with_tools(&annotated, vec![])?;
+            self.log_session(&SessionEntry::assistant(&annotated, vec![]));
+        }
+        let steer_msg = format!("[用户中途指令] {steer}");
+        self.context.add_message(Role::User, &steer_msg)?;
+        self.log_session(&SessionEntry::message(Role::User, &steer_msg));
+        self.emit(AgentEvent::Steered(steer.to_string()));
+        if !self.quiet {
+            println!("\n[steer] 收到中途指令，转向中…");
+        }
+        Ok(())
     }
 
     /// L3：检索跨会话记忆，非空则构造一条注入消息（不进 context.messages）
@@ -379,6 +468,141 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ChunkStream;
+    use crate::types::{Message, ToolCall, ToolSchema};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Mock Provider：第 0 次调用先吐"第一段"再挂起等 gate（steer 测试在此打断）；
+    /// 后续调用直接吐"最终回复"结束。parse_response 只聚合文本（不产生工具调用）。
+    struct MockProvider {
+        gate: tokio::sync::watch::Receiver<bool>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for MockProvider {
+        fn id(&self) -> &str {
+            "mock"
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+        ) -> ModelResult<ChunkStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let gate = self.gate.clone();
+            let stream = futures_util::stream::unfold((n, 0usize), move |(n, step)| {
+                let mut gate = gate.clone();
+                async move {
+                    match (n, step) {
+                        (0, 0) => Some((Ok(StreamChunk::Delta("第一段".to_string())), (n, 1))),
+                        (0, 1) => {
+                            // 挂起等 gate 打开；steer 打断时这里永远不会恢复
+                            while !*gate.borrow() {
+                                if gate.changed().await.is_err() {
+                                    break; // 发送端关闭：放行，避免挂死
+                                }
+                            }
+                            Some((Ok(StreamChunk::Delta("第二段".to_string())), (n, 2)))
+                        }
+                        (0, 2) => Some((Ok(StreamChunk::Done), (n, 3))),
+                        (_, 0) => Some((Ok(StreamChunk::Delta("最终回复".to_string())), (n, 1))),
+                        (_, 1) => Some((Ok(StreamChunk::Done), (n, 2))),
+                        _ => None,
+                    }
+                }
+            });
+            Ok(Box::pin(stream))
+        }
+
+        fn parse_response(&self, chunks: &[StreamChunk]) -> ModelResult<(String, Vec<ToolCall>)> {
+            let text: String = chunks
+                .iter()
+                .filter_map(|c| match c {
+                    StreamChunk::Delta(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            Ok((text, vec![]))
+        }
+    }
+
+    fn test_agent(tmp: &tempfile::TempDir, gate: tokio::sync::watch::Receiver<bool>) -> Agent {
+        let mut config = Config::default_config();
+        config.session.dir = tmp.path().to_string_lossy().to_string();
+        let mut agent = Agent::new(config).unwrap();
+        agent.set_provider(Box::new(MockProvider {
+            gate,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        agent.set_quiet(true);
+        agent
+    }
+
+    #[tokio::test]
+    async fn test_steer_during_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let mut agent = test_agent(&tmp, gate_rx);
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(32);
+        agent.set_steer_channel(steer_rx);
+
+        // 用块包裹：run future 持有 agent 的可变借用，出块即释放
+        let reply = {
+            let run = agent.run("任务");
+            tokio::pin!(run);
+            let driver = async {
+                // 等 run 进入流式等待 gate，再注入 steer
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                steer_tx.send("改口令".to_string()).await.unwrap();
+                // 兜底：即使 steer 没生效也打开 gate 让流程走完（断言失败而不是挂死）
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let _ = gate_tx.send(true);
+            };
+            let (result, _) = tokio::join!(run, driver);
+            result.expect("run 应成功完成")
+        };
+        assert_eq!(reply, "最终回复");
+
+        let messages = agent.context.build();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == Role::User && m.content == "[用户中途指令] 改口令"),
+            "上下文应包含 [用户中途指令]，实际：{messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.role == Role::Assistant
+                && m.content.contains("第一段")
+                && m.content.contains("(此回复被用户中途打断)")),
+            "上下文应保留半截文本并带中断标注，实际：{messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stale_steer_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        // gate 常开：流不挂起，run 正常走完
+        let (_gate_tx, gate_rx) = tokio::sync::watch::channel(true);
+        let mut agent = test_agent(&tmp, gate_rx);
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(32);
+        agent.set_steer_channel(steer_rx);
+        // 无 run 时注入一条——应被 run 开头排空丢弃
+        steer_tx.send("陈旧指令".to_string()).await.unwrap();
+
+        let reply = agent.run("正常任务").await.expect("run 应成功");
+        assert_eq!(reply, "第一段第二段");
+        let messages = agent.context.build();
+        assert!(
+            !messages.iter().any(|m| m.content.contains("陈旧指令")),
+            "陈旧 steer 不应进入上下文，实际：{messages:?}"
+        );
+    }
+
+    // 注：工具间隙 steer 的确定性测试需要 mock 出完整工具调用 JSON + ToolRegistry 配合，
+    // 构造复杂度高、收益低，v0.2 跳过。
 
     #[test]
     fn test_agent_construction() {

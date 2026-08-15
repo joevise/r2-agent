@@ -232,18 +232,38 @@ async fn main() -> MainResult<()> {
         Some(id) => println!("R2 v{} | 会话 {} | /help 帮助", env!("CARGO_PKG_VERSION"), id),
         None => println!("R2 v{} | /help 帮助", env!("CARGO_PKG_VERSION")),
     }
-    let stdin = std::io::stdin();
+    // 独立线程读 stdin 行 → tokio mpsc：这样 run 运行中用户也能随时打字
+    let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(32);
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        loop {
+            let mut buf = String::new();
+            match stdin.read_line(&mut buf) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    if line_tx.blocking_send(buf).is_err() {
+                        break; // 主循环已退出
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // steer 通道：运行中收到的行注入 Agent（中途转向）
+    let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<String>(32);
+    agent.set_steer_channel(steer_rx);
+
+    let mut quit_after_run = false;
     loop {
         print!("> ");
         std::io::stdout().flush()?;
 
-        let mut input = String::new();
-        let n = stdin.read_line(&mut input)?;
-        if n == 0 {
+        let Some(line) = line_rx.recv().await else {
             println!();
-            break;
-        }
-        let input = input.trim();
+            break; // stdin EOF
+        };
+        let input = line.trim();
         if input.is_empty() {
             continue;
         }
@@ -263,8 +283,45 @@ async fn main() -> MainResult<()> {
             }
             _ => {}
         }
-        if let Err(e) = agent.run(input).await {
+
+        // 运行中循环 select：run 完成 → 回到提示符；又来一行 → 注入 steer
+        let run = agent.run(input);
+        tokio::pin!(run);
+        let result = loop {
+            tokio::select! {
+                res = &mut run => break res,
+                maybe_line = line_rx.recv() => match maybe_line {
+                    Some(l) => {
+                        let l = l.trim();
+                        if l.is_empty() {
+                            continue;
+                        }
+                        match l {
+                            "/quit" | "/exit" => {
+                                // v0.2 简化：运行中 /quit = 等当前 run 完成后退出
+                                println!("\n等待当前任务结束后退出…");
+                                quit_after_run = true;
+                            }
+                            _ => {
+                                let _ = steer_tx.send(l.to_string()).await;
+                                let preview: String = l.chars().take(60).collect();
+                                println!("\n[steer] 指令已注入: {preview}");
+                            }
+                        }
+                    }
+                    None => {
+                        // 运行中 stdin 关闭：等当前任务结束后退出
+                        quit_after_run = true;
+                        break run.await;
+                    }
+                },
+            }
+        };
+        if let Err(e) = result {
             eprintln!("错误：{e}");
+        }
+        if quit_after_run {
+            break;
         }
     }
     println!("再见！");

@@ -11,6 +11,8 @@ pub enum AgentEvent {
     ToolCall { name: String, arguments: String },
     /// 工具执行结果
     ToolResult { name: String, output: String },
+    /// 用户中途转向指令（steering）
+    Steered(String),
     /// 一轮结束
     Done { final_text: String },
     /// 出错

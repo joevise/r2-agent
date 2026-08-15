@@ -14,12 +14,14 @@
 use crate::agent::Agent;
 use crate::config::Config;
 use crate::events::AgentEvent;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 /// 面向嵌入方的会话门面：包一层 Agent，输出走 broadcast 事件而非 stdout
 pub struct AgentSession {
     agent: Agent,
     event_tx: broadcast::Sender<AgentEvent>,
+    /// 中途转向发送端（接收端已注入 agent）
+    steer_tx: mpsc::Sender<String>,
 }
 
 impl AgentSession {
@@ -37,9 +39,15 @@ impl AgentSession {
 
     fn wrap(mut agent: Agent) -> Self {
         let (event_tx, _) = broadcast::channel(256);
+        let (steer_tx, steer_rx) = mpsc::channel(32);
         agent.set_emitter(event_tx.clone());
+        agent.set_steer_channel(steer_rx);
         agent.set_quiet(true);
-        Self { agent, event_tx }
+        Self {
+            agent,
+            event_tx,
+            steer_tx,
+        }
     }
 
     /// 当前会话 ID（用于恢复）
@@ -62,6 +70,19 @@ impl AgentSession {
                 Err(msg)
             }
         }
+    }
+
+    /// 中途转向：prompt 运行中随时调用；非运行时注入的消息会被下次 run 开头丢弃
+    pub async fn steer(&self, instruction: &str) -> Result<(), String> {
+        self.steer_tx
+            .send(instruction.to_string())
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// 克隆一份 steer 发送端（交互循环等场景持有，运行中随时注入指令）
+    pub fn steer_handle(&self) -> mpsc::Sender<String> {
+        self.steer_tx.clone()
     }
 
     /// 清空当前上下文（等价于 CLI 的 /clear）：新建会话文件 + 重置 L1
