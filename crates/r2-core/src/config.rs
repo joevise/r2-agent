@@ -93,6 +93,30 @@ pub struct ContextConfig {
     /// 是否启用 L3 跨会话记忆
     #[serde(default)]
     pub l3_enabled: bool,
+    /// L3 嵌入后端：hash（默认，零依赖）| api（OpenAI 兼容 embedding API）
+    #[serde(default = "default_l3_embedding")]
+    pub l3_embedding: String,
+    /// API 嵌入后端配置（l3_embedding = "api" 时生效）
+    #[serde(default)]
+    pub embedding: EmbeddingConfig,
+}
+
+/// API 嵌入后端配置（OpenAI 兼容 /embeddings 协议）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EmbeddingConfig {
+    /// API 基础地址（如 https://open.bigmodel.cn/api/paas/v4）
+    #[serde(default)]
+    pub base_url: String,
+    /// API 密钥
+    #[serde(default)]
+    pub api_key: String,
+    /// 嵌入模型名（如 embedding-3）
+    #[serde(default)]
+    pub model: String,
+    /// 同主题覆盖阈值：新记忆与旧记忆相似度超过该值时，旧记忆标记为被覆盖。
+    /// hash 后端语义弱，0.92 几乎只在字面全同时命中；语义 API 后端才会真正触发。
+    #[serde(default = "default_supersede_threshold")]
+    pub supersede_threshold: f64,
 }
 
 /// 沙箱配置
@@ -155,6 +179,12 @@ fn default_l1_threshold() -> f64 {
 }
 fn default_l2_summary_model() -> String {
     "gpt-4o-mini".to_string()
+}
+fn default_l3_embedding() -> String {
+    "hash".to_string()
+}
+fn default_supersede_threshold() -> f64 {
+    0.92
 }
 fn default_sandbox_level() -> String {
     "container".to_string()
@@ -230,6 +260,19 @@ impl Default for ContextConfig {
             l1_threshold: default_l1_threshold(),
             l2_summary_model: default_l2_summary_model(),
             l3_enabled: false,
+            l3_embedding: default_l3_embedding(),
+            embedding: EmbeddingConfig::default(),
+        }
+    }
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            supersede_threshold: default_supersede_threshold(),
         }
     }
 }
@@ -414,6 +457,42 @@ dir = "~/.r2/sessions"
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("bad_provider"));
+    }
+
+    #[test]
+    fn test_embedding_config_defaults() {
+        // 旧配置（无 embedding 字段）向后兼容：默认 hash 后端 + 0.92 覆盖阈值
+        let config = Config::load_from_str(FULL_TOML).unwrap();
+        assert_eq!(config.context.l3_embedding, "hash");
+        assert!(config.context.embedding.base_url.is_empty());
+        assert!(config.context.embedding.api_key.is_empty());
+        assert!(config.context.embedding.model.is_empty());
+        assert!((config.context.embedding.supersede_threshold - 0.92).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_embedding_config_parse() {
+        let toml_str = r#"
+[context]
+l3_enabled = true
+l3_embedding = "api"
+
+[context.embedding]
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key = "sk-emb"
+model = "embedding-3"
+supersede_threshold = 0.95
+"#;
+        let config = Config::load_from_str(toml_str).unwrap();
+        assert!(config.context.l3_enabled);
+        assert_eq!(config.context.l3_embedding, "api");
+        assert_eq!(
+            config.context.embedding.base_url,
+            "https://open.bigmodel.cn/api/paas/v4"
+        );
+        assert_eq!(config.context.embedding.api_key, "sk-emb");
+        assert_eq!(config.context.embedding.model, "embedding-3");
+        assert!((config.context.embedding.supersede_threshold - 0.95).abs() < f64::EPSILON);
     }
 
     #[test]

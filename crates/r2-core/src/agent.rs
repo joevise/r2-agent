@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::context::ContextManager;
 use crate::events::AgentEvent;
 #[cfg(feature = "l3-memory")]
-use crate::memory::MemoryStore;
+use crate::memory::{EmbeddingProvider, MemoryStore};
 use crate::model::{create_provider, ModelProvider, ModelResult};
 use crate::session::{Session, SessionEntry};
 use crate::tools::ToolRegistry;
@@ -25,6 +25,9 @@ pub struct Agent {
     /// L3 跨会话记忆（l3_enabled=false 或打开失败时为 None）
     #[cfg(feature = "l3-memory")]
     memory: Option<MemoryStore>,
+    /// L3 嵌入后端（与 memory 同生共死；API 后端失败时降级跳过记忆读写）
+    #[cfg(feature = "l3-memory")]
+    embedding: Option<Box<dyn EmbeddingProvider>>,
     /// 事件广播（库形态嵌入时由 AgentSession 注入；CLI 下为 None，行为不变）
     emitter: Option<tokio::sync::broadcast::Sender<AgentEvent>>,
     /// 中途转向通道（AgentSession / CLI 注入；未注入时行为与原来完全一致）
@@ -44,7 +47,7 @@ impl Agent {
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         let session = Session::create(&crate::config::expand_tilde(&config.session.dir)).ok();
         #[cfg(feature = "l3-memory")]
-        let memory = Self::init_memory(&config);
+        let (memory, embedding) = Self::init_memory(&config);
         Ok(Self {
             provider,
             context,
@@ -53,6 +56,8 @@ impl Agent {
             session,
             #[cfg(feature = "l3-memory")]
             memory,
+            #[cfg(feature = "l3-memory")]
+            embedding,
             emitter: None,
             steer_rx: None,
             quiet: false,
@@ -79,7 +84,7 @@ impl Agent {
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         println!("已恢复会话 {session_id}（{count} 条历史消息）");
         #[cfg(feature = "l3-memory")]
-        let memory = Self::init_memory(&config);
+        let (memory, embedding) = Self::init_memory(&config);
         Ok(Self {
             provider,
             context,
@@ -88,6 +93,8 @@ impl Agent {
             session: Some(session),
             #[cfg(feature = "l3-memory")]
             memory,
+            #[cfg(feature = "l3-memory")]
+            embedding,
             emitter: None,
             steer_rx: None,
             quiet: false,
@@ -118,7 +125,7 @@ impl Agent {
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         println!("已从会话 {parent_session_id} 分叉（继承 {count} 条消息，新会话 {new_id}）");
         #[cfg(feature = "l3-memory")]
-        let memory = Self::init_memory(&config);
+        let (memory, embedding) = Self::init_memory(&config);
         Ok(Self {
             provider,
             context,
@@ -127,6 +134,8 @@ impl Agent {
             session: Some(session),
             #[cfg(feature = "l3-memory")]
             memory,
+            #[cfg(feature = "l3-memory")]
+            embedding,
             emitter: None,
             steer_rx: None,
             quiet: false,
@@ -169,18 +178,19 @@ impl Agent {
         self.emit(AgentEvent::MessageUpdate(format!("{text}\n")));
     }
 
-    /// 初始化 L3 跨会话记忆：l3_enabled=false 或打开失败时为 None
+    /// 初始化 L3 跨会话记忆 + 嵌入后端：l3_enabled=false 或打开失败时为 (None, None)
     #[cfg(feature = "l3-memory")]
-    fn init_memory(config: &Config) -> Option<MemoryStore> {
+    fn init_memory(config: &Config) -> (Option<MemoryStore>, Option<Box<dyn EmbeddingProvider>>) {
         if !config.context.l3_enabled {
-            return None;
+            return (None, None);
         }
-        let path = format!("{}/memory.db", crate::config::expand_tilde(&config.session.dir));
-        match MemoryStore::open(&path) {
-            Ok(m) => Some(m),
+        let embedding = crate::memory::build_embedding_provider(config);
+        let path = crate::memory::memory_db_path(config);
+        match MemoryStore::open(&path, embedding.id()) {
+            Ok(m) => (Some(m), Some(embedding)),
             Err(e) => {
                 tracing::warn!("L3 记忆库初始化失败（跳过）：{e}");
-                None
+                (None, None)
             }
         }
     }
@@ -319,7 +329,7 @@ impl Agent {
 
         // L3：检索跨会话记忆（排除当前会话——它已在上下文里）
         #[cfg(feature = "l3-memory")]
-        let memory_msg = self.recall_memory(user_input);
+        let memory_msg = self.recall_memory(user_input).await;
 
         let mut final_text = String::new();
         for turn in 0..self.config.agent.max_turns {
@@ -446,10 +456,33 @@ impl Agent {
 
         // L3：存一轮 Q&A（session 可能为 None——持久化失败场景，用 "unknown" 代替）
         #[cfg(feature = "l3-memory")]
-        if let Some(memory) = &self.memory {
+        if let (Some(memory), Some(embedding)) = (&self.memory, &self.embedding) {
             let session_id = self.session_id().unwrap_or("unknown");
-            if let Err(e) = memory.store(session_id, user_input, &final_text) {
-                tracing::warn!("L3 记忆写入失败：{e}");
+            // query / answer 两次嵌入并行；API 后端失败时降级：本轮不存，不阻塞主流程
+            let (qv, av) = tokio::join!(
+                embedding.embed(user_input),
+                embedding.embed(&final_text)
+            );
+            match (qv, av) {
+                (Ok(qv), Ok(av)) => {
+                    if let Err(e) = memory
+                        .store(
+                            session_id,
+                            user_input,
+                            &final_text,
+                            &qv,
+                            &av,
+                            self.config.context.embedding.supersede_threshold,
+                        )
+                        .await
+                    {
+                        tracing::warn!("L3 记忆写入失败：{e}");
+                    }
+                }
+                (q, a) => {
+                    let err = q.err().or_else(|| a.err()).unwrap_or_default();
+                    tracing::warn!("L3 嵌入计算失败（本轮不写入记忆）：{err}");
+                }
             }
         }
         self.emit(AgentEvent::Done {
@@ -486,11 +519,27 @@ impl Agent {
     }
 
     /// L3：检索跨会话记忆，非空则构造一条注入消息（不进 context.messages）
+    ///
+    /// 嵌入/检索失败（含模型签名不匹配）只告警并跳过——记忆是增强不是依赖。
     #[cfg(feature = "l3-memory")]
-    fn recall_memory(&self, user_input: &str) -> Option<crate::types::Message> {
+    async fn recall_memory(&self, user_input: &str) -> Option<crate::types::Message> {
         let memory = self.memory.as_ref()?;
+        let embedding = self.embedding.as_ref()?;
         let current = self.session_id().unwrap_or("unknown");
-        let hits = memory.search(user_input, 3, 0.30, current).ok()?;
+        let qv = match embedding.embed(user_input).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("L3 查询嵌入失败（跳过记忆检索）：{e}");
+                return None;
+            }
+        };
+        let hits = match memory.search(&qv, 3, 0.30, current).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!("L3 记忆检索失败：{e}");
+                return None;
+            }
+        };
         if hits.is_empty() {
             return None;
         }

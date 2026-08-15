@@ -53,6 +53,41 @@ enum Commands {
     },
     /// JSON-RPC serve 模式：stdin/stdout 说行分隔 JSON-RPC 2.0（供任何语言嵌入）
     Serve,
+    /// 跨会话记忆管理：list / search / delete / stats / migrate
+    #[cfg(feature = "l3-memory")]
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
+}
+
+#[cfg(feature = "l3-memory")]
+#[derive(Subcommand)]
+enum MemoryAction {
+    /// 重建记忆索引（嵌入模型变更后使用，逐条重新 embed）
+    Migrate,
+    /// 列出记忆（query 预览 / 时间 / 嵌入后端）
+    List {
+        /// 最多列出条数
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// 手动检索测试（打印衰减后分数）
+    Search {
+        /// 检索关键词
+        keyword: String,
+        /// 返回条数
+        #[arg(long, default_value_t = 5)]
+        k: usize,
+    },
+    /// 删除指定记忆（id 来自 memory list）
+    Delete {
+        /// 记忆 ID
+        #[arg(long)]
+        id: i64,
+    },
+    /// 记忆库统计（总数 / 各后端分布 / 时间跨度）
+    Stats,
 }
 
 #[derive(Subcommand)]
@@ -236,6 +271,100 @@ fn print_sessions_tree(config: &Config) -> MainResult<()> {
     Ok(())
 }
 
+/// memory 子命令组：打开记忆库 + 当前配置的嵌入后端，分发到各管理操作
+#[cfg(feature = "l3-memory")]
+async fn run_memory(config: &Config, action: &MemoryAction) -> MainResult<()> {
+    use r2_core::memory::{self, MemoryStore};
+
+    let provider = memory::build_embedding_provider(config);
+    let path = memory::memory_db_path(config);
+    let store = MemoryStore::open(&path, provider.id())
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+
+    match action {
+        MemoryAction::Migrate => {
+            let report = store
+                .migrate(provider.as_ref(), &|done, total| {
+                    println!("重建记忆索引 {done}/{total}");
+                })
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            println!(
+                "迁移完成：共 {} 条，成功 {} 条，跳过（失败）{} 条",
+                report.total, report.migrated, report.failed
+            );
+        }
+        MemoryAction::List { limit } => {
+            let entries = store
+                .list(*limit)
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            if entries.is_empty() {
+                println!("暂无记忆");
+                return Ok(());
+            }
+            for e in &entries {
+                let preview: String = e.query.chars().take(50).collect();
+                let flag = if e.superseded { "  [已被覆盖]" } else { "" };
+                println!(
+                    "id={}  |  ts={}  |  {}  |  {}{}",
+                    e.id, e.created_at, e.embed_id, preview, flag
+                );
+            }
+        }
+        MemoryAction::Search { keyword, k } => {
+            let qv = provider
+                .embed(keyword)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            let hits = store
+                .search(&qv, *k, 0.0, "")
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            if hits.is_empty() {
+                println!("无匹配记忆");
+                return Ok(());
+            }
+            for h in &hits {
+                let answer: String = h.answer.chars().take(80).collect();
+                println!("score={:.3}  |  问：{}", h.score, h.query);
+                println!("           答：{answer}");
+            }
+        }
+        MemoryAction::Delete { id } => {
+            let deleted = store
+                .delete(*id)
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            if deleted {
+                println!("已删除记忆 id={id}");
+            } else {
+                println!("记忆不存在：id={id}");
+            }
+        }
+        MemoryAction::Stats => {
+            let s = store
+                .stats()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            println!("记忆总数：{}", s.total);
+            if !s.by_embed_id.is_empty() {
+                println!("嵌入后端分布：");
+                for (id, count) in &s.by_embed_id {
+                    println!("  {id}: {count} 条");
+                }
+            }
+            match (s.oldest, s.newest) {
+                (Some(oldest), Some(newest)) => {
+                    println!("时间跨度：ts={oldest} ~ ts={newest}");
+                }
+                _ => println!("时间跨度：（空库）"),
+            }
+            if let Some(msg) = store.mismatch() {
+                println!("警告：{msg}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// serve 主循环：stdin 读行 → RpcServer 路由 → stdout 单行写出
 ///
 /// 结构：
@@ -391,6 +520,12 @@ async fn main() -> MainResult<()> {
     }
     if cli.list_sessions {
         return print_sessions(&config);
+    }
+
+    // memory 子命令（需 l3-memory feature；只做记忆管理，不校验模型 api_key）
+    #[cfg(feature = "l3-memory")]
+    if let Some(Commands::Memory { action }) = &cli.command {
+        return run_memory(&config, action).await;
     }
 
     check_api_key(&config)?;

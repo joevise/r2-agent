@@ -30,6 +30,12 @@ work_dir = "{work_dir}"
 
 [context]
 l3_enabled = true
+l3_embedding = "api"
+
+[context.embedding]
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key = "{get_key()}"
+model = "embedding-3"
 
 [session]
 dir = "{session_dir}"
