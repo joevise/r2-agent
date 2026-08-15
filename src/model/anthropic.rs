@@ -466,6 +466,44 @@ mod tests {
         assert!(matches!(chunks[4], StreamChunk::Done));
     }
 
+    /// 恶意/畸形 SSE 输入 fuzz：解析器绝不能 panic（产出什么都行，核心是不崩）
+    #[test]
+    fn test_sse_malformed_never_panics() {
+        let cases: Vec<&str> = vec![
+            "",                                    // 空
+            "data:",                               // 空 payload
+            "data: \n\n",                          // 空白 payload
+            "data: {broken json\n\n",              // 半截 JSON
+            "data: {}\n\n",                        // type 字段缺失
+            "data: {\"type\":null}\n\n",           // type 为 null
+            "data: {\"type\":123}\n\n",            // type 为数字
+            "data: {\"type\":\"content_block_delta\"}\n\n",  // 缺 index / delta
+            "data: {\"type\":\"content_block_delta\",\"index\":\"abc\"}\n\n",  // index 类型错
+            "data: {\"type\":\"content_block_delta\",\"index\":-1,\"delta\":null}\n\n",  // 负 index + null delta
+            "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\"},\"index\":-1}\n\n",
+            "data: {\"type\":\"content_block_start\",\"content_block\":null}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",  // 正常停止
+            "data: \x00\x01binary garbage\n\n",    // 二进制垃圾
+            // 孤代理对（serde_json 应解析失败而非 panic）
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"\\ud800\"}}\n\n",
+            "event: message\ndata: {}\ndata: not json\n\n",  // 事件行混合
+            "\n\n\n\ndata: {}\n\n\n",              // 多空行
+        ];
+        for case in &cases {
+            // 整块喂入
+            let mut parser = SseParser::new();
+            let mut out = parser.feed(case.as_bytes());
+            out.extend(parser.finish());
+            drop(out);
+            // 逐字节喂入（跨块边界也不许崩）
+            let mut parser = SseParser::new();
+            for b in case.as_bytes() {
+                drop(parser.feed(&[*b]));
+            }
+            drop(parser.finish());
+        }
+    }
+
     #[test]
     fn test_sse_parse_cross_chunk_boundary() {
         // 把一个 JSON 事件拆到两个网络块里，验证缓冲区能正确拼装

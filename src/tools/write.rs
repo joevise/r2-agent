@@ -110,4 +110,27 @@ mod tests {
         let result = tool.execute(&serde_json::json!({"path": "f.txt"})).await;
         assert!(result.starts_with("ERROR: content 缺失"));
     }
+
+    /// path 指向已存在的目录 → ERROR 不 panic
+    #[tokio::test]
+    async fn test_write_to_directory_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("subdir")).unwrap();
+        let tool = WriteTool::new(tmp.path().to_str().unwrap());
+        let result = tool
+            .execute(&serde_json::json!({"path": "subdir", "content": "x"}))
+            .await;
+        assert!(result.starts_with("ERROR:"), "got: {result}");
+    }
+
+    /// path 参数类型错误（数字）→ ERROR 不 panic
+    #[tokio::test]
+    async fn test_write_path_wrong_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = WriteTool::new(tmp.path().to_str().unwrap());
+        let result = tool
+            .execute(&serde_json::json!({"path": 123, "content": "x"}))
+            .await;
+        assert!(result.starts_with("ERROR: 缺少 path"), "got: {result}");
+    }
 }

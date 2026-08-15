@@ -128,6 +128,8 @@ impl Session {
         }
         let content = fs::read_to_string(&path)
             .map_err(|e| format!("读取会话文件失败（{}）：{e}", path.display()))?;
+        // 剥掉 UTF-8 BOM（Windows 编辑器常见），否则首行会被当坏行丢弃
+        let content = content.trim_start_matches('\u{feff}');
 
         let lines: Vec<&str> = content.lines().collect();
         let mut messages = Vec::new();
@@ -358,5 +360,63 @@ mod tests {
             "messages": messages,
         });
         assert_eq!(json["messages"].as_array().unwrap().len(), 3);
+    }
+
+    /// 超大行：一行 5MB 的合法 JSON → recover 不 OOM 不 panic，内容完整还原
+    #[test]
+    fn test_recover_huge_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().to_string();
+        let big = "x".repeat(5 * 1024 * 1024);
+        let mut session = Session::create(&dir).unwrap();
+        let id = session.id().to_string();
+        session.append(&SessionEntry::message(Role::User, &big)).unwrap();
+        drop(session);
+
+        let (_s, messages) = Session::recover(&dir, &id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content.len(), big.len());
+    }
+
+    /// 全是坏行的文件 → 0 消息，不 panic
+    #[test]
+    fn test_recover_all_bad_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().to_string();
+        let path = tmp.path().join("bad.jsonl");
+        std::fs::write(&path, "not json\n{broken\n\x00\x01garbage\n{\"type\":\"message\"}\n").unwrap();
+
+        let (_s, messages) = Session::recover(&dir, "bad").unwrap();
+        assert!(messages.is_empty());
+    }
+
+    /// BOM 开头的文件：剥掉 BOM 后正常解析
+    #[test]
+    fn test_recover_bom_prefixed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().to_string();
+        let line = serde_json::to_string(&SessionEntry::message(Role::User, "你好")).unwrap();
+        let path = tmp.path().join("bom.jsonl");
+        std::fs::write(&path, format!("\u{feff}{line}\n")).unwrap();
+
+        let (_s, messages) = Session::recover(&dir, "bom").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "你好");
+    }
+
+    /// CRLF 换行：应正常解析（lines() 与 trim 都会去掉 \r）
+    #[test]
+    fn test_recover_crlf_line_endings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().to_string();
+        let l1 = serde_json::to_string(&SessionEntry::message(Role::User, "问")).unwrap();
+        let l2 = serde_json::to_string(&SessionEntry::message(Role::Assistant, "答")).unwrap();
+        let path = tmp.path().join("crlf.jsonl");
+        std::fs::write(&path, format!("{l1}\r\n{l2}\r\n")).unwrap();
+
+        let (_s, messages) = Session::recover(&dir, "crlf").unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "问");
+        assert_eq!(messages[1].content, "答");
     }
 }

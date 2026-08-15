@@ -159,4 +159,24 @@ mod tests {
             .await;
         assert!(result.contains("路径越界"), "got: {result}");
     }
+
+    /// old_text 是空字符串 → 报 ERROR（不允许空匹配，否则会无限替换）
+    #[tokio::test]
+    async fn test_edit_empty_old_text() {
+        let (_tmp, tool) = setup();
+        let result = tool
+            .execute(&serde_json::json!({"path": "f.txt", "old_text": "", "new_text": "x"}))
+            .await;
+        assert!(result.contains("old_text 不能为空"), "got: {result}");
+    }
+
+    /// path 参数类型错误（数字）→ ERROR 不 panic
+    #[tokio::test]
+    async fn test_edit_path_wrong_type() {
+        let (_tmp, tool) = setup();
+        let result = tool
+            .execute(&serde_json::json!({"path": 123, "old_text": "a", "new_text": "b"}))
+            .await;
+        assert!(result.starts_with("ERROR: 缺少 path"), "got: {result}");
+    }
 }

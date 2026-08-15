@@ -449,4 +449,45 @@ mod tests {
         // token_count 已扣除被压缩消息，低于阈值后不再触发
         assert!(!ctx.should_compress());
     }
+
+    /// l1_threshold = 0：只要有 token 且有可压缩消息，永远触发压缩
+    #[test]
+    fn test_threshold_zero_always_compresses() {
+        let mut ctx = ContextManager::new("sys", 10_000, 0.0);
+        fill(&mut ctx, 20);
+        assert!(ctx.should_compress());
+    }
+
+    /// l1_threshold = 1.5（>1）：token 数被 check_limit 限制在 max 内，永不触发
+    #[test]
+    fn test_threshold_above_one_never_compresses() {
+        let mut ctx = ContextManager::new("sys", 100, 1.5);
+        fill(&mut ctx, 20); // 约 80 token < 100*1.5
+        assert!(!ctx.should_compress());
+    }
+
+    /// l1_threshold 为负数：阈值恒小于 0，行为等同 0（永远触发），不 panic
+    #[test]
+    fn test_threshold_negative_behaves_like_zero() {
+        let mut ctx = ContextManager::new("sys", 10_000, -0.5);
+        fill(&mut ctx, 20);
+        assert!(ctx.should_compress());
+        // 无可压缩消息时仍不触发（1 条消息，保留阶梯最小为 2，切不出旧消息）
+        let mut ctx2 = ContextManager::new("sys", 10_000, -0.5);
+        fill(&mut ctx2, 1);
+        assert!(!ctx2.should_compress());
+    }
+
+    /// max_total_tokens = 0：任何非空消息都报“上下文超限”（符合逻辑）
+    #[test]
+    fn test_zero_max_tokens_rejects_everything() {
+        let mut ctx = ContextManager::new("sys", 0, THRESHOLD);
+        let result = ctx.add_message(Role::User, "hi");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("上下文超限"));
+        let result = ctx.add_tool_result("c1", "ok");
+        assert!(result.is_err());
+        // 空内容估算为 0 token，0 > 0 不成立，仍可加入（不 panic 即可）
+        assert!(ctx.add_message(Role::User, "").is_ok());
+    }
 }

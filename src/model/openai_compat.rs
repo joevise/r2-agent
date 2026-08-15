@@ -403,6 +403,45 @@ mod tests {
         }
     }
 
+    /// 恶意/畸形 SSE 输入 fuzz：解析器绝不能 panic（产出什么都行，核心是不崩）
+    #[test]
+    fn test_sse_malformed_never_panics() {
+        let cases: Vec<&str> = vec![
+            "",                                    // 空
+            "data:",                               // 空 payload
+            "data: \n\n",                          // 空白 payload
+            "data: {broken json\n\n",              // 半截 JSON
+            "data: [DONE",                         // 无换行 DONE
+            "data: {\"choices\":null}\n\n",        // null choices
+            "data: {\"choices\":[]}\n\n",          // 空 choices
+            "data: {\"choices\":[{\"delta\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":null}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":null}}]}\n\n",
+            // 负 index（as_u64 失败应回退 0）
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":-1}]}}]}\n\n",
+            // 空工具调用对象
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{}]}}]}\n\n",
+            "data: \x00\x01binary garbage\n\n",    // 二进制垃圾
+            // 孤代理对（serde_json 应解析失败而非 panic）
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\\ud800\"}}]}\n\n",
+            "event: message\ndata: {}\ndata: not json\n\n",  // 事件行混合
+            "\n\n\n\ndata: {}\n\n\n",              // 多空行
+        ];
+        for case in &cases {
+            // 整块喂入
+            let mut parser = SseParser::new();
+            let mut out = parser.feed(case.as_bytes());
+            out.extend(parser.finish());
+            drop(out);
+            // 逐字节喂入（跨块边界也不许崩）
+            let mut parser = SseParser::new();
+            for b in case.as_bytes() {
+                drop(parser.feed(&[*b]));
+            }
+            drop(parser.finish());
+        }
+    }
+
     #[test]
     fn test_parse_response_mixed() {
         let provider = OpenAiCompatProvider::new("https://api.example.com/v1", "k", "m");

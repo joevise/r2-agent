@@ -236,4 +236,17 @@ mod tests {
         let result = tool.execute(&serde_json::json!({})).await;
         assert!(result.starts_with("ERROR: 缺少 command"));
     }
+
+    /// command 参数类型错误（数字/对象而非字符串）→ ERROR 不 panic
+    #[tokio::test]
+    async fn test_bash_command_wrong_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = make_tool(tmp.path());
+        let result = tool.execute(&serde_json::json!({"command": 123})).await;
+        assert!(result.starts_with("ERROR: 缺少 command"), "got: {result}");
+        let result = tool
+            .execute(&serde_json::json!({"command": {"cmd": "ls"}}))
+            .await;
+        assert!(result.starts_with("ERROR: 缺少 command"), "got: {result}");
+    }
 }

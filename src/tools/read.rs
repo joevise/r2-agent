@@ -127,4 +127,23 @@ mod tests {
         let result = tool.execute(&serde_json::json!({"path": "bin.dat"})).await;
         assert!(result.contains("非 UTF-8"));
     }
+
+    /// 读目录而不是文件 → ERROR 不 panic
+    #[tokio::test]
+    async fn test_read_directory_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("subdir")).unwrap();
+        let tool = ReadTool::new(tmp.path().to_str().unwrap());
+        let result = tool.execute(&serde_json::json!({"path": "subdir"})).await;
+        assert!(result.starts_with("ERROR:"), "got: {result}");
+    }
+
+    /// path 参数类型错误（数字）→ ERROR 不 panic
+    #[tokio::test]
+    async fn test_read_path_wrong_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = ReadTool::new(tmp.path().to_str().unwrap());
+        let result = tool.execute(&serde_json::json!({"path": 123})).await;
+        assert!(result.starts_with("ERROR: 缺少 path"), "got: {result}");
+    }
 }
