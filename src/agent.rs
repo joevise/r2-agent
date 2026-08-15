@@ -25,7 +25,7 @@ impl Agent {
     pub fn new(config: Config) -> ModelResult<Self> {
         let provider = create_provider(&config)?;
         let max_tokens = config.agent.max_total_tokens;
-        let context = ContextManager::new(SYSTEM_PROMPT, max_tokens);
+        let context = ContextManager::new(SYSTEM_PROMPT, max_tokens, config.context.l1_threshold);
         let tools = ToolRegistry::new_default(
             &config.agent.work_dir,
             config.sandbox.bash_timeout_secs,
@@ -48,7 +48,12 @@ impl Agent {
         let (session, messages) = Session::recover(&session_dir, session_id)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         let count = messages.len();
-        let context = ContextManager::from_messages(SYSTEM_PROMPT, messages, max_tokens);
+        let context = ContextManager::from_messages(
+            SYSTEM_PROMPT,
+            messages,
+            max_tokens,
+            config.context.l1_threshold,
+        );
         let tools = ToolRegistry::new_default(
             &config.agent.work_dir,
             config.sandbox.bash_timeout_secs,
@@ -77,13 +82,96 @@ impl Agent {
         }
     }
 
+    /// L2 压缩：把旧消息发给模型生成摘要
+    ///
+    /// v0.1 复用主模型做摘要（config.context.l2_summary_model 暂忽略，
+    /// 独立的小模型做摘要是后续优化点）。
+    /// 已有摘要时，让模型把旧摘要和新消息合并成一份新摘要。
+    async fn summarize(&self, old_msgs: &[crate::types::Message]) -> ModelResult<String> {
+        // 把待压缩消息转成可读对话文本
+        let mut dialogue = String::new();
+        for m in old_msgs {
+            let role = match m.role {
+                Role::System => "system",
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::Tool => "tool",
+            };
+            dialogue.push_str(&format!("[{role}] {}\n", m.content));
+            if let Some(calls) = &m.tool_calls {
+                for c in calls {
+                    dialogue.push_str(&format!("[tool_call] {}({})\n", c.name, c.arguments));
+                }
+            }
+        }
+
+        let prompt = match self.context.l2_summary() {
+            Some(old_summary) => format!(
+                "以下是已有的会话历史摘要和新的对话内容。请把它们合并成一份简洁摘要，保留：关键决策、结论、重要文件路径、未完成任务、用户偏好。直接输出摘要内容，不要任何前缀。\n\n【已有摘要】\n{old_summary}\n\n【新对话内容】\n{dialogue}"
+            ),
+            None => format!(
+                "把以下对话历史压缩成简洁摘要，保留：关键决策、结论、重要文件路径、未完成任务、用户偏好。直接输出摘要内容，不要任何前缀。\n\n{dialogue}"
+            ),
+        };
+
+        let req = vec![crate::types::Message {
+            role: Role::User,
+            content: prompt,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        // 摘要请求不带 tools
+        let mut stream = self.provider.chat_stream(&req, &[]).await?;
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item?);
+        }
+        let (text, _) = self.provider.parse_response(&chunks)?;
+        if text.trim().is_empty() {
+            return Err("摘要模型返回空内容".into());
+        }
+        Ok(text.trim().to_string())
+    }
+
+    /// L2 压缩：超阈值时把旧消息交给模型摘要，腾出 L1 空间。
+    /// 失败只告警不中断（调用方决定是否继续）。
+    async fn compress_if_needed(&mut self) {
+        if !self.context.should_compress() {
+            return;
+        }
+        let Some(old_msgs) = self.context.take_compressible() else {
+            return;
+        };
+        match self.summarize(&old_msgs).await {
+            Ok(summary) => {
+                println!("\n[context] L1 超阈值，已压缩 {} 条历史消息", old_msgs.len());
+                // 摘要落盘：append-only，恢复时由 from_messages 重建
+                self.log_session(&SessionEntry::message(
+                    Role::System,
+                    &format!("{}\n{}", crate::context::SUMMARY_PREFIX, summary),
+                ));
+                self.context.set_summary(summary);
+            }
+            Err(e) => {
+                tracing::warn!("L2 压缩失败（跳过本轮）：{e}");
+            }
+        }
+    }
+
     /// 处理一次用户输入，流式打印 assistant 输出，返回完整回复文本
     pub async fn run(&mut self, user_input: &str) -> ModelResult<String> {
+        // 关键：在 add_user 之前先压缩——否则上下文快满时用户消息会先撞限报错，
+        // 压缩永远没机会触发
+        self.compress_if_needed().await;
+
         self.context.add_message(Role::User, user_input)?;
         self.log_session(&SessionEntry::message(Role::User, user_input));
 
         let mut final_text = String::new();
         for turn in 0..self.config.agent.max_turns {
+            // turn 循环内也保留检查（长回复多轮工具调用时 token 也会涨）
+            self.compress_if_needed().await;
+
             let messages = self.context.build();
             let mut stream = self
                 .provider
