@@ -8,6 +8,17 @@ fn estimate_tokens(text: &str) -> usize {
     text.len() / 2
 }
 
+/// 估算一条完整消息的 token 数（content + 工具调用参数）
+fn message_tokens(msg: &Message) -> usize {
+    let mut tokens = estimate_tokens(&msg.content);
+    if let Some(calls) = &msg.tool_calls {
+        for tc in calls {
+            tokens += estimate_tokens(&tc.arguments) + estimate_tokens(&tc.name);
+        }
+    }
+    tokens
+}
+
 /// L1 工作记忆管理器
 pub struct ContextManager {
     system_prompt: String,
@@ -77,6 +88,17 @@ impl ContextManager {
         });
         self.token_count += tokens;
         Ok(())
+    }
+
+    /// 从恢复的消息列表重建 L1（system_prompt 用当前配置的，历史消息直接灌入）
+    pub fn from_messages(system_prompt: &str, messages: Vec<Message>, max_tokens: usize) -> Self {
+        let token_count = messages.iter().map(message_tokens).sum();
+        Self {
+            system_prompt: system_prompt.to_string(),
+            messages,
+            token_count,
+            max_tokens,
+        }
     }
 
     /// 构建发给模型的消息序列：system + 全部历史

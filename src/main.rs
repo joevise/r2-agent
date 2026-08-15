@@ -5,6 +5,7 @@ mod agent;
 mod config;
 mod context;
 mod model;
+mod session;
 mod tools;
 mod types;
 
@@ -24,6 +25,14 @@ struct Cli {
     /// 指定配置文件路径
     #[arg(long)]
     config: Option<String>,
+
+    /// 恢复指定会话（带历史上下文继续对话）
+    #[arg(long)]
+    session: Option<String>,
+
+    /// 列出所有历史会话后退出
+    #[arg(long)]
+    list_sessions: bool,
 }
 
 const CONFIG_EXAMPLE: &str = r#"最小配置示例（~/.r2/config.toml）：
@@ -69,19 +78,54 @@ fn check_api_key(config: &Config) -> MainResult<()> {
     Ok(())
 }
 
+/// 打印会话列表（--list-sessions）
+fn print_sessions(config: &Config) -> MainResult<()> {
+    let dir = config::expand_tilde(&config.session.dir);
+    let sessions = session::list_sessions(&dir)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    if sessions.is_empty() {
+        println!("暂无历史会话");
+        return Ok(());
+    }
+    for s in sessions {
+        let preview = if s.first_user_preview.is_empty() {
+            "（无用户消息）"
+        } else {
+            &s.first_user_preview
+        };
+        println!(
+            "{}  |  {} 条消息  |  ts={}  |  {}",
+            s.id, s.message_count, s.last_ts, preview
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> MainResult<()> {
     let cli = Cli::parse();
     let config = load_config(&cli)?;
+
+    if cli.list_sessions {
+        return print_sessions(&config);
+    }
+
     check_api_key(&config)?;
 
-    let mut agent = Agent::new(config)?;
+    let mut agent = if let Some(session_id) = &cli.session {
+        Agent::resume(config, session_id)?
+    } else {
+        Agent::new(config)?
+    };
 
     if let Some(question) = cli.once {
         agent.run(&question).await?;
         return Ok(());
     }
 
+    if let Some(id) = agent.session_id() {
+        println!("当前会话：{id}（可用 r2 --session {id} 恢复）");
+    }
     println!("R2 Agent — 输入 /quit 或 /exit 退出");
     let stdin = std::io::stdin();
     loop {
