@@ -190,7 +190,7 @@ impl ContextManager {
         self.l2_summary = Some(summary);
     }
 
-    /// 构建发给模型的消息序列：system_prompt + [摘要消息] + 剩余历史
+    /// 构建发给模型的消息序列：system_prompt + 摘要消息 + 剩余历史
     ///
     /// 摘要消息用 role=System：OpenAI 兼容多条 system 消息；
     /// Anthropic 侧 messages_to_anthropic 会把所有 system 消息合并进顶层 system 字段，

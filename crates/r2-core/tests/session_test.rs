@@ -1,15 +1,8 @@
 //! 会话持久化集成测试：JSONL 往返、崩溃恢复、坏行容忍
-//!
-//! 本 crate 仅产出二进制，测试通过 #[path] 直接引用源码模块。
 
-#[path = "../src/types.rs"]
-mod types;
-#[path = "../src/session.rs"]
-mod session;
-
-use session::{Session, SessionEntry};
+use r2_core::session::{Session, SessionEntry};
+use r2_core::types::{Role, ToolCall};
 use tempfile::TempDir;
-use types::{Role, ToolCall};
 
 /// 往会话里写 3 条标准记录（user / assistant 带工具调用 / tool_result）
 fn write_three(session: &mut Session) -> ToolCall {

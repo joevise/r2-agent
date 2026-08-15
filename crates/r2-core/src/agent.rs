@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use crate::context::ContextManager;
+use crate::events::AgentEvent;
 #[cfg(feature = "l3-memory")]
 use crate::memory::MemoryStore;
 use crate::model::{create_provider, ModelProvider, ModelResult};
@@ -24,6 +25,10 @@ pub struct Agent {
     /// L3 跨会话记忆（l3_enabled=false 或打开失败时为 None）
     #[cfg(feature = "l3-memory")]
     memory: Option<MemoryStore>,
+    /// 事件广播（库形态嵌入时由 AgentSession 注入；CLI 下为 None，行为不变）
+    emitter: Option<tokio::sync::broadcast::Sender<AgentEvent>>,
+    /// 静音模式：为 true 时不向 stdout 打印（事件照常广播）
+    quiet: bool,
 }
 
 impl Agent {
@@ -46,6 +51,8 @@ impl Agent {
             session,
             #[cfg(feature = "l3-memory")]
             memory,
+            emitter: None,
+            quiet: false,
         })
     }
 
@@ -78,7 +85,34 @@ impl Agent {
             session: Some(session),
             #[cfg(feature = "l3-memory")]
             memory,
+            emitter: None,
+            quiet: false,
         })
+    }
+
+    /// 注入事件广播通道（嵌入方使用；CLI 不调用，输出行为不变）
+    pub fn set_emitter(&mut self, emitter: tokio::sync::broadcast::Sender<AgentEvent>) {
+        self.emitter = Some(emitter);
+    }
+
+    /// 静音开关：true 时不向 stdout 打印（事件照常广播）
+    pub fn set_quiet(&mut self, quiet: bool) {
+        self.quiet = quiet;
+    }
+
+    /// 广播一条事件（无订阅者时忽略错误）
+    fn emit(&self, event: AgentEvent) {
+        if let Some(tx) = &self.emitter {
+            let _ = tx.send(event);
+        }
+    }
+
+    /// 输出一行提示：quiet 时只发事件不打印；否则打印 + 发事件
+    fn notice(&self, text: String) {
+        if !self.quiet {
+            println!("{text}");
+        }
+        self.emit(AgentEvent::MessageUpdate(format!("{text}\n")));
     }
 
     /// 初始化 L3 跨会话记忆：l3_enabled=false 或打开失败时为 None
@@ -193,7 +227,10 @@ impl Agent {
         };
         match self.summarize(&old_msgs).await {
             Ok(summary) => {
-                println!("\n[context] L1 超阈值，已压缩 {} 条历史消息", old_msgs.len());
+                self.notice(format!(
+                    "\n[context] L1 超阈值，已压缩 {} 条历史消息",
+                    old_msgs.len()
+                ));
                 // 摘要落盘：append-only，恢复时由 from_messages 重建
                 self.log_session(&SessionEntry::message(
                     Role::System,
@@ -209,6 +246,7 @@ impl Agent {
 
     /// 处理一次用户输入，流式打印 assistant 输出，返回完整回复文本
     pub async fn run(&mut self, user_input: &str) -> ModelResult<String> {
+        self.emit(AgentEvent::AgentStart);
         // 关键：在 add_user 之前先压缩——否则上下文快满时用户消息会先撞限报错，
         // 压缩永远没机会触发
         self.compress_if_needed().await;
@@ -246,18 +284,25 @@ impl Agent {
                 match item {
                     Ok(chunk) => {
                         if let StreamChunk::Delta(ref s) = chunk {
-                            print!("{s}");
-                            let _ = std::io::stdout().flush();
+                            if !self.quiet {
+                                print!("{s}");
+                                let _ = std::io::stdout().flush();
+                            }
+                            self.emit(AgentEvent::MessageUpdate(s.clone()));
                         }
                         chunks.push(chunk);
                     }
                     Err(e) => {
-                        println!();
+                        if !self.quiet {
+                            println!();
+                        }
                         return Err(format!("流式响应中断：{e}").into());
                     }
                 }
             }
-            println!();
+            if !self.quiet {
+                println!();
+            }
 
             let (text, tool_calls) = self
                 .provider
@@ -273,9 +318,19 @@ impl Agent {
 
             // 逐个执行工具调用，结果回灌上下文后继续下一轮循环
             for call in &tool_calls {
+                self.emit(AgentEvent::ToolCall {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                });
                 let result = self.tools.execute(call).await;
                 let preview: String = result.chars().take(80).collect();
-                println!("\n[tool] {} → {}...", call.name, preview);
+                if !self.quiet {
+                    println!("\n[tool] {} → {}...", call.name, preview);
+                }
+                self.emit(AgentEvent::ToolResult {
+                    name: call.name.clone(),
+                    output: result.clone(),
+                });
                 self.context.add_tool_result(&call.id, &result)?;
                 self.log_session(&SessionEntry::tool_result(&call.id, &result));
             }
@@ -291,6 +346,9 @@ impl Agent {
                 tracing::warn!("L3 记忆写入失败：{e}");
             }
         }
+        self.emit(AgentEvent::Done {
+            final_text: final_text.clone(),
+        });
         Ok(final_text)
     }
 
@@ -303,7 +361,7 @@ impl Agent {
         if hits.is_empty() {
             return None;
         }
-        println!("\n[memory] 唤起 {} 条跨会话记忆", hits.len());
+        self.notice(format!("\n[memory] 唤起 {} 条跨会话记忆", hits.len()));
         let mut content = String::from("【跨会话记忆】以下是你（R2）在之前会话中的相关经历：");
         for hit in &hits {
             let answer: String = hit.answer.chars().take(400).collect();

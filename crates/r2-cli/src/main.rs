@@ -1,20 +1,6 @@
-// 地基阶段：部分核心类型尚未被运行时消费，暂允许 dead_code
-#![allow(dead_code)]
-
-mod agent;
-mod config;
-mod context;
-#[cfg(feature = "l3-memory")]
-mod memory;
-mod model;
-mod sandbox;
-mod session;
-mod tools;
-mod types;
-
-use agent::Agent;
 use clap::{Parser, Subcommand};
-use config::Config;
+use r2_core::config::{self, apply_overrides, Config};
+use r2_core::{session, types, Agent};
 use std::io::Write;
 
 /// R2 Agent — 极简但可靠的 Rust Agent
@@ -116,19 +102,6 @@ fn check_api_key(config: &Config) -> MainResult<()> {
         std::process::exit(1);
     }
     Ok(())
-}
-
-/// 应用命令行覆盖项：--model 作用于当前 provider，--work_dir 覆盖并展开 ~
-pub fn apply_overrides(config: &mut Config, model: Option<&str>, work_dir: Option<&str>) {
-    if let Some(model) = model {
-        match config.model.provider.as_str() {
-            "anthropic" => config.model.anthropic.model = model.to_string(),
-            _ => config.model.openai_compat.model = model.to_string(),
-        }
-    }
-    if let Some(dir) = work_dir {
-        config.agent.work_dir = config::expand_tilde(dir);
-    }
 }
 
 /// 校验会话目录可用，返回展开后的路径
@@ -304,43 +277,3 @@ const HELP_TEXT: &str = "可用命令：
   /exit    退出
   /clear   清空当前上下文（开新会话文件，但保持进程）
 ";
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_override_model_openai_compat() {
-        let mut config = Config::default_config();
-        apply_overrides(&mut config, Some("glm-5.2"), None);
-        assert_eq!(config.model.openai_compat.model, "glm-5.2");
-        // anthropic 侧不受影响
-        assert_ne!(config.model.anthropic.model, "glm-5.2");
-    }
-
-    #[test]
-    fn test_override_model_anthropic() {
-        let mut config = Config::default_config();
-        config.model.provider = "anthropic".to_string();
-        apply_overrides(&mut config, Some("claude-opus-4"), None);
-        assert_eq!(config.model.anthropic.model, "claude-opus-4");
-    }
-
-    #[test]
-    fn test_override_work_dir_tilde() {
-        let mut config = Config::default_config();
-        apply_overrides(&mut config, None, Some("~/proj"));
-        let home = std::env::var("HOME").unwrap();
-        assert_eq!(config.agent.work_dir, format!("{home}/proj"));
-    }
-
-    #[test]
-    fn test_override_none_keeps_config() {
-        let mut config = Config::default_config();
-        let model_before = config.model.openai_compat.model.clone();
-        let dir_before = config.agent.work_dir.clone();
-        apply_overrides(&mut config, None, None);
-        assert_eq!(config.model.openai_compat.model, model_before);
-        assert_eq!(config.agent.work_dir, dir_before);
-    }
-}

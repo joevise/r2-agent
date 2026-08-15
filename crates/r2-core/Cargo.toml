@@ -1,0 +1,34 @@
+[package]
+name = "r2-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+
+[lib]
+name = "r2_core"
+path = "src/lib.rs"
+
+[dependencies]
+reqwest.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+libc.workspace = true
+rusqlite = { workspace = true, optional = true }
+libseccomp = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+
+[features]
+default = []               # 默认不编译 L3（减少二进制大小）
+l3-memory = ["rusqlite"]   # 启用跨会话记忆
+sandbox-strict = ["libseccomp"]  # 启用 strict 级 seccomp 白名单（需 libseccomp-dev）

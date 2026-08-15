@@ -1,0 +1,21 @@
+[package]
+name = "r2-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+
+[[bin]]
+name = "r2"
+path = "src/main.rs"
+
+[dependencies]
+r2-core.workspace = true
+clap.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+
+[features]
+default = []
+l3-memory = ["r2-core/l3-memory"]          # 转发：启用跨会话记忆
+sandbox-strict = ["r2-core/sandbox-strict"] # 转发：strict 级 seccomp 白名单
