@@ -25,8 +25,9 @@ pub struct ModelInfo {
     pub coding_plan: &'static str,
 }
 
-/// 内置注册表（价格为参考值——2026-08 调研行情，以官网为准。
-/// 国际模型美元价按 7.2 汇率折元，注释标美元原价）
+/// 内置注册表（价格为参考值，以官网为准。
+/// 国际模型：OpenRouter 2026-08-16 实时价（美元×7.2 折元，注释标美元原价）；
+/// 国内模型：官方国内定价（OpenRouter 平台价常有补贴，仅注释参考））
 static REGISTRY: &[ModelInfo] = &[
     // ===== 国内 =====
     ModelInfo {
@@ -196,25 +197,25 @@ static REGISTRY: &[ModelInfo] = &[
         coding_plan: "小米 Token Plan（免费额度大）",
     },
     // ===== 国际（美元价按 7.2 汇率折元） =====
-    // $15/$75
+    // OpenRouter $5/$25（2026-08 大幅降价）
     ModelInfo {
         key: "claude-opus-4.5",
         display_name: "claude-opus-4.5",
         context_window: 200_000,
-        input_price_per_m: 108.0,
-        output_price_per_m: 540.0,
+        input_price_per_m: 36.0,
+        output_price_per_m: 180.0,
         tool_support: true,
         provider_hint: "anthropic",
         endpoint: "https://api.anthropic.com",
         coding_plan: "",
     },
-    // $3/$15
+    // OpenRouter $2/$10（已降价）
     ModelInfo {
         key: "claude-sonnet-5",
         display_name: "claude-sonnet-5",
-        context_window: 200_000,
-        input_price_per_m: 22.0,
-        output_price_per_m: 110.0,
+        context_window: 1_000_000,
+        input_price_per_m: 14.4,
+        output_price_per_m: 72.0,
         tool_support: true,
         provider_hint: "anthropic",
         endpoint: "https://api.anthropic.com",
@@ -244,13 +245,13 @@ static REGISTRY: &[ModelInfo] = &[
         endpoint: "https://api.anthropic.com",
         coding_plan: "",
     },
-    // $12/$48
+    // OpenRouter $2.50/$15（此前误用 GPT-5.2 旧价，已修正）
     ModelInfo {
         key: "gpt-5.4",
         display_name: "gpt-5.4",
-        context_window: 400_000,
-        input_price_per_m: 86.0,
-        output_price_per_m: 346.0,
+        context_window: 1_050_000,
+        input_price_per_m: 18.0,
+        output_price_per_m: 108.0,
         tool_support: true,
         provider_hint: "openai",
         endpoint: "https://api.openai.com/v1",
@@ -260,19 +261,20 @@ static REGISTRY: &[ModelInfo] = &[
         key: "gpt-5.2-mini",
         display_name: "gpt-5.2-mini",
         context_window: 256_000,
-        input_price_per_m: 20.0,
-        output_price_per_m: 79.0, // $2.8/$11
+        input_price_per_m: 9.0,
+        output_price_per_m: 32.0, // 约 $1.25/$4.4
         tool_support: true,
         provider_hint: "openai",
         endpoint: "https://api.openai.com/v1",
         coding_plan: "",
     },
+    // 上代旗舰，OpenRouter 约 $1.25/$10
     ModelInfo {
         key: "gpt-5.2",
         display_name: "gpt-5.2",
         context_window: 400_000,
-        input_price_per_m: 86.0,
-        output_price_per_m: 346.0,
+        input_price_per_m: 9.0,
+        output_price_per_m: 72.0,
         tool_support: true,
         provider_hint: "openai",
         endpoint: "https://api.openai.com/v1",
@@ -290,25 +292,25 @@ static REGISTRY: &[ModelInfo] = &[
         endpoint: "https://generativelanguage.googleapis.com/v1beta/openai",
         coding_plan: "",
     },
-    // $0.2/$0.8
+    // OpenRouter $0.5/$3（flash 档）
     ModelInfo {
         key: "gemini-3.1-flash",
         display_name: "gemini-3.1-flash",
         context_window: 1_000_000,
-        input_price_per_m: 1.4,
-        output_price_per_m: 5.8,
+        input_price_per_m: 3.6,
+        output_price_per_m: 21.6,
         tool_support: true,
         provider_hint: "google",
         endpoint: "https://generativelanguage.googleapis.com/v1beta/openai",
         coding_plan: "",
     },
-    // $3/$15
+    // OpenRouter $2/$6
     ModelInfo {
-        key: "grok-4",
-        display_name: "grok-4",
-        context_window: 256_000,
-        input_price_per_m: 22.0,
-        output_price_per_m: 110.0,
+        key: "grok-4.6",
+        display_name: "grok-4.6",
+        context_window: 500_000,
+        input_price_per_m: 14.4,
+        output_price_per_m: 43.2,
         tool_support: true,
         provider_hint: "xai",
         endpoint: "https://api.x.ai/v1",
