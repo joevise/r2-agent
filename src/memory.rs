@@ -127,8 +127,14 @@ impl MemoryStore {
     /// 存一轮 Q&A（answer 截断到 MAX_ANSWER_CHARS 防膨胀）
     pub fn store(&self, session_id: &str, query: &str, answer: &str) -> Result<(), String> {
         let answer: String = answer.chars().take(MAX_ANSWER_CHARS).collect();
-        // 嵌入对用户输入 + 回答的拼接计算，检索时哪边命中都算
-        let emb = encode_emb(&embed(&format!("{query}\n{answer}")));
+        // 双向量策略：query 和 answer 各存一条独立 fragments 记录（同 session/q/a）。
+        // - 拼接嵌入会让两边互相稀释（T7 长文本埋藏检索变弱），
+        //   还会抬高无关查询的基础相似度（T4 误召回：长 answer 常用字 n-gram 重叠 → 0.385）。
+        // - 只嵌 query 会丢掉语义桥接（T2："宠物"查询匹配不上"橘猫"输入，
+        //   但能匹配 GLM 回答里的"宠物猫"）。
+        // - 检索时天然取 max(query分, answer分)，两边哪边命中都算。
+        let emb_q = encode_emb(&embed(query));
+        let emb_a = encode_emb(&embed(&answer));
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -137,7 +143,14 @@ impl MemoryStore {
             .execute(
                 "INSERT INTO fragments (session_id, query, answer, emb, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![session_id, query, answer, emb, created_at],
+                params![session_id, query, answer, emb_q, created_at],
+            )
+            .map_err(|e| format!("写入记忆失败：{e}"))?;
+        self.conn
+            .execute(
+                "INSERT INTO fragments (session_id, query, answer, emb, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![session_id, query, answer, emb_a, created_at],
             )
             .map_err(|e| format!("写入记忆失败：{e}"))?;
         Ok(())
@@ -177,21 +190,29 @@ impl MemoryStore {
             })
             .map_err(|e| format!("检索记忆失败：{e}"))?;
 
-        let mut hits = Vec::new();
+        // 双向量存储下同一 Q&A 有两条记录（query 向量 + answer 向量），
+        // 按 (session_id, query) 去重、保留最高分，对上层透明
+        use std::collections::HashMap;
+        let mut best: HashMap<(String, String), MemoryHit> = HashMap::new();
         for row in rows {
             let (session_id, q, a, emb, created_at) =
                 row.map_err(|e| format!("读取记忆失败：{e}"))?;
             let score = cosine(&qv, &decode_emb(&emb));
-            if score >= threshold {
-                hits.push(MemoryHit {
-                    query: q,
-                    answer: a,
-                    score,
-                    session_id,
-                    created_at,
-                });
+            if score < threshold {
+                continue;
+            }
+            let key = (session_id.clone(), q.clone());
+            match best.get(&key) {
+                Some(prev) if prev.score >= score => {}
+                _ => {
+                    best.insert(
+                        key,
+                        MemoryHit { query: q, answer: a, score, session_id, created_at },
+                    );
+                }
             }
         }
+        let mut hits: Vec<MemoryHit> = best.into_values().collect();
         hits.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -302,5 +323,109 @@ mod tests {
         let hits = store.search("what is ownership in Rust", 3, 0.1, "s2").unwrap();
         assert!(!hits.is_empty());
         assert!(hits[0].query.contains("ownership"));
+    }
+
+    #[test]
+    fn test_score_identical_text() {
+        let a = embed("我最喜欢的颜色是蓝色");
+        let b = embed("我最喜欢的颜色是蓝色");
+        assert!((cosine(&a, &b) - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_unrelated_below_threshold() {
+        let a = embed("数据库索引优化");
+        let b = embed("我养了一只橘猫");
+        assert!(cosine(&a, &b) < 0.30);
+    }
+
+    #[test]
+    fn test_short_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mem.db").to_string_lossy().to_string();
+        let store = MemoryStore::open(&path).unwrap();
+        store
+            .store("s1", "我喜欢蓝色", "好的，我记住了你喜欢蓝色")
+            .unwrap();
+        store
+            .store("s1", "今晚吃什么", "推荐你去吃火锅")
+            .unwrap();
+        // 单字查询：一元 n-gram 应能命中含"蓝"的条目
+        let hits = store.search("蓝", 3, 0.0, "s2").unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits[0].query.contains("蓝"));
+    }
+
+    #[test]
+    fn test_semantic_paraphrase_order() {
+        let unrelated = embed("Rust所有权与生命周期");
+        let pairs = [
+            ("我养了一只橘猫叫咪咪", "我的宠物猫名字"),
+            ("我的项目代号是凤凰计划", "凤凰计划代号"),
+            ("我最喜欢的颜色是蓝色", "我喜欢的颜色"),
+        ];
+        for (a, b) in pairs {
+            let sim_pair = cosine(&embed(a), &embed(b));
+            let sim_unrelated = cosine(&embed(a), &unrelated);
+            assert!(
+                sim_pair > sim_unrelated,
+                "改写对 ({a}, {b}) 相似度 {sim_pair} 应 > 无关对相似度 {sim_unrelated}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_scale_200() {
+        let colors = ["红", "蓝", "绿", "黄", "紫"];
+        let numbers = ["编号0", "编号1", "编号2", "编号3", "编号4", "编号5", "编号6"];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mem.db").to_string_lossy().to_string();
+        let store = MemoryStore::open(&path).unwrap();
+        for i in 0..200 {
+            let content = format!(
+                "用户测试条目 {i}：主题是{}{}",
+                colors[i % colors.len()],
+                numbers[i % numbers.len()]
+            );
+            store.store("s1", &content, "已记录").unwrap();
+        }
+        let hits = store
+            .search("主题是红色编号5的条目", 3, 0.0, "s2")
+            .unwrap();
+        assert!(!hits.is_empty());
+        let top = &hits[0];
+        assert!(top.query.contains('红'), "top-1 应含\"红\"：{}", top.query);
+        assert!(
+            top.query.contains("编号5"),
+            "top-1 应含\"编号5\"：{}",
+            top.query
+        );
+        // i % 5 == 0 且 i % 7 == 5 → i ∈ {5, 40, 75, 110, 145, 180}（同分并列，任一即可）
+        let expected: Vec<String> = [5, 40, 75, 110, 145, 180]
+            .iter()
+            .map(|i| format!("用户测试条目 {i}：主题是红编号5"))
+            .collect();
+        assert!(
+            expected.contains(&top.query),
+            "top-1 应为候选之一：{}",
+            top.query
+        );
+    }
+
+    #[test]
+    fn test_threshold_filter_effective() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mem.db").to_string_lossy().to_string();
+        let store = MemoryStore::open(&path).unwrap();
+        store
+            .store("s1", "我喜欢蓝色", "好的，我记住了你喜欢蓝色")
+            .unwrap();
+        // 用改写查询（相似度介于 0~1）：高阈值过滤、零阈值命中
+        let none = store.search("我超喜欢蓝色", 3, 0.99, "s2").unwrap();
+        assert!(none.is_empty());
+        let hits = store.search("我超喜欢蓝色", 3, 0.0, "s2").unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits[0].score > 0.0);
     }
 }
