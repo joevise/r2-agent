@@ -321,4 +321,42 @@ mod tests {
         let cp = serde_json::to_string(&SessionEntry::checkpoint(3)).unwrap();
         assert!(cp.contains(r#""type":"checkpoint""#));
     }
+
+    #[test]
+    fn test_recover_rebuilds_messages() {
+        // 导出/查看共用 recover 的重建逻辑：checkpoint 被忽略，tool_result 还原为 tool 消息
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().to_string();
+        let mut session = Session::create(&dir).unwrap();
+        let id = session.id().to_string();
+        session.append(&SessionEntry::message(Role::User, "问题")).unwrap();
+        session
+            .append(&SessionEntry::assistant(
+                "回答",
+                vec![ToolCall {
+                    id: "c1".to_string(),
+                    name: "bash".to_string(),
+                    arguments: r#"{"command":"ls"}"#.to_string(),
+                }],
+            ))
+            .unwrap();
+        session.append(&SessionEntry::tool_result("c1", "ok")).unwrap();
+        session.append(&SessionEntry::checkpoint(1)).unwrap();
+        drop(session);
+
+        let (_s, messages) = Session::recover(&dir, &id).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].name, "bash");
+        assert_eq!(messages[2].role, Role::Tool);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("c1"));
+        // 序列化为导出 JSON 结构应包含全部字段
+        let json = serde_json::json!({
+            "session_id": id,
+            "created_at": 0,
+            "messages": messages,
+        });
+        assert_eq!(json["messages"].as_array().unwrap().len(), 3);
+    }
 }

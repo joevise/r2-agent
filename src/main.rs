@@ -13,7 +13,7 @@ mod tools;
 mod types;
 
 use agent::Agent;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use config::Config;
 use std::io::Write;
 
@@ -33,9 +33,46 @@ struct Cli {
     #[arg(long)]
     session: Option<String>,
 
-    /// 列出所有历史会话后退出
+    /// 列出所有历史会话后退出（等价于 `r2 sessions`，保留作向后兼容）
     #[arg(long)]
     list_sessions: bool,
+
+    /// 覆盖配置里的模型名（作用于当前 provider）
+    #[arg(long)]
+    model: Option<String>,
+
+    /// 覆盖工作目录（工具操作的根目录，支持 ~ 展开）
+    #[arg(long)]
+    work_dir: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// 会话管理：列出 / 导出 / 查看历史会话
+    Sessions {
+        #[command(subcommand)]
+        action: Option<SessionsAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionsAction {
+    /// 导出会话为 JSON
+    Export {
+        /// 会话 ID
+        id: String,
+        /// 输出到文件（缺省打印到 stdout）
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// 查看会话内容（人类可读格式）
+    Show {
+        /// 会话 ID
+        id: String,
+    },
 }
 
 const CONFIG_EXAMPLE: &str = r#"最小配置示例（~/.r2/config.toml）：
@@ -81,6 +118,88 @@ fn check_api_key(config: &Config) -> MainResult<()> {
     Ok(())
 }
 
+/// 应用命令行覆盖项：--model 作用于当前 provider，--work_dir 覆盖并展开 ~
+pub fn apply_overrides(config: &mut Config, model: Option<&str>, work_dir: Option<&str>) {
+    if let Some(model) = model {
+        match config.model.provider.as_str() {
+            "anthropic" => config.model.anthropic.model = model.to_string(),
+            _ => config.model.openai_compat.model = model.to_string(),
+        }
+    }
+    if let Some(dir) = work_dir {
+        config.agent.work_dir = config::expand_tilde(dir);
+    }
+}
+
+/// 校验会话目录可用，返回展开后的路径
+fn sessions_dir(config: &Config) -> MainResult<String> {
+    let dir = config::expand_tilde(&config.session.dir);
+    if !std::path::Path::new(&dir).is_dir() {
+        return Err(format!("会话目录不可用：{dir}（还没有任何会话记录）").into());
+    }
+    Ok(dir)
+}
+
+/// 导出会话为 JSON：复用 Session::recover 的重建逻辑，导出干净的恢复后消息列表
+fn export_session(config: &Config, id: &str, out: Option<&str>) -> MainResult<()> {
+    let dir = sessions_dir(config)?;
+    let path = std::path::Path::new(&dir).join(format!("{id}.jsonl"));
+    if !path.exists() {
+        return Err(format!("会话不存在：{id}").into());
+    }
+    // created_at 取文件 mtime（v0.1 没有单独的创建时间元数据）
+    let created_at = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (_session, messages) = session::Session::recover(&dir, id)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let json = serde_json::json!({
+        "session_id": id,
+        "created_at": created_at,
+        "messages": messages,
+    });
+    let pretty = serde_json::to_string_pretty(&json)?;
+    match out {
+        Some(file) => {
+            std::fs::write(file, &pretty)?;
+            println!("已导出到 {file}");
+        }
+        None => println!("{pretty}"),
+    }
+    Ok(())
+}
+
+/// 人类可读格式打印会话内容
+fn show_session(config: &Config, id: &str) -> MainResult<()> {
+    let dir = sessions_dir(config)?;
+    let (_session, messages) = session::Session::recover(&dir, id)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    println!("会话 {id}（{} 条消息）", messages.len());
+    for m in &messages {
+        let role = match m.role {
+            types::Role::System => "system",
+            types::Role::User => "user",
+            types::Role::Assistant => "assistant",
+            types::Role::Tool => "tool",
+        };
+        println!("\n[{role}]");
+        if !m.content.is_empty() {
+            println!("{}", m.content);
+        }
+        if let Some(calls) = &m.tool_calls {
+            for c in calls {
+                // 参数摘要：截断到 120 字符，避免刷屏
+                let args: String = c.arguments.chars().take(120).collect();
+                println!("  → 工具调用 {}({})", c.name, args);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 打印会话列表（--list-sessions）
 fn print_sessions(config: &Config) -> MainResult<()> {
     let dir = config::expand_tilde(&config.session.dir);
@@ -107,8 +226,17 @@ fn print_sessions(config: &Config) -> MainResult<()> {
 #[tokio::main]
 async fn main() -> MainResult<()> {
     let cli = Cli::parse();
-    let config = load_config(&cli)?;
+    let mut config = load_config(&cli)?;
+    apply_overrides(&mut config, cli.model.as_deref(), cli.work_dir.as_deref());
 
+    // sessions 子命令（无子命令 = 列出全部）
+    if let Some(Commands::Sessions { action }) = &cli.command {
+        return match action {
+            None => print_sessions(&config),
+            Some(SessionsAction::Export { id, out }) => export_session(&config, id, out.as_deref()),
+            Some(SessionsAction::Show { id }) => show_session(&config, id),
+        };
+    }
     if cli.list_sessions {
         return print_sessions(&config);
     }
@@ -126,10 +254,11 @@ async fn main() -> MainResult<()> {
         return Ok(());
     }
 
-    if let Some(id) = agent.session_id() {
-        println!("当前会话：{id}（可用 r2 --session {id} 恢复）");
+    // 启动横幅：单行
+    match agent.session_id() {
+        Some(id) => println!("R2 v{} | 会话 {} | /help 帮助", env!("CARGO_PKG_VERSION"), id),
+        None => println!("R2 v{} | /help 帮助", env!("CARGO_PKG_VERSION")),
     }
-    println!("R2 Agent — 输入 /quit 或 /exit 退出");
     let stdin = std::io::stdin();
     loop {
         print!("> ");
@@ -145,8 +274,21 @@ async fn main() -> MainResult<()> {
         if input.is_empty() {
             continue;
         }
-        if input == "/quit" || input == "/exit" {
-            break;
+        match input {
+            "/quit" | "/exit" => break,
+            "/help" => {
+                print!("{HELP_TEXT}");
+                continue;
+            }
+            "/clear" => {
+                agent.reset_context();
+                match agent.session_id() {
+                    Some(id) => println!("已清空上下文，新会话：{id}"),
+                    None => println!("已清空上下文"),
+                }
+                continue;
+            }
+            _ => {}
         }
         if let Err(e) = agent.run(input).await {
             eprintln!("错误：{e}");
@@ -154,4 +296,51 @@ async fn main() -> MainResult<()> {
     }
     println!("再见！");
     Ok(())
+}
+
+const HELP_TEXT: &str = "可用命令：
+  /help    显示本帮助
+  /quit    退出
+  /exit    退出
+  /clear   清空当前上下文（开新会话文件，但保持进程）
+";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_override_model_openai_compat() {
+        let mut config = Config::default_config();
+        apply_overrides(&mut config, Some("glm-5.2"), None);
+        assert_eq!(config.model.openai_compat.model, "glm-5.2");
+        // anthropic 侧不受影响
+        assert_ne!(config.model.anthropic.model, "glm-5.2");
+    }
+
+    #[test]
+    fn test_override_model_anthropic() {
+        let mut config = Config::default_config();
+        config.model.provider = "anthropic".to_string();
+        apply_overrides(&mut config, Some("claude-opus-4"), None);
+        assert_eq!(config.model.anthropic.model, "claude-opus-4");
+    }
+
+    #[test]
+    fn test_override_work_dir_tilde() {
+        let mut config = Config::default_config();
+        apply_overrides(&mut config, None, Some("~/proj"));
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(config.agent.work_dir, format!("{home}/proj"));
+    }
+
+    #[test]
+    fn test_override_none_keeps_config() {
+        let mut config = Config::default_config();
+        let model_before = config.model.openai_compat.model.clone();
+        let dir_before = config.agent.work_dir.clone();
+        apply_overrides(&mut config, None, None);
+        assert_eq!(config.model.openai_compat.model, model_before);
+        assert_eq!(config.agent.work_dir, dir_before);
+    }
 }

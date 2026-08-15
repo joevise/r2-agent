@@ -110,6 +110,18 @@ impl Agent {
         self.session.as_ref().map(|s| s.id())
     }
 
+    /// 清空当前上下文（/clear）：新建会话文件 + 重置 L1。
+    /// L3 跨会话记忆（若启用）刻意保留不动——它是跨会话的。
+    pub fn reset_context(&mut self) {
+        self.session =
+            Session::create(&crate::config::expand_tilde(&self.config.session.dir)).ok();
+        self.context = ContextManager::new(
+            SYSTEM_PROMPT,
+            self.config.agent.max_total_tokens,
+            self.config.context.l1_threshold,
+        );
+    }
+
     /// 追加会话记录；失败只告警不中断主流程
     fn log_session(&mut self, entry: &SessionEntry) {
         if let Some(session) = &mut self.session {
@@ -322,5 +334,26 @@ mod tests {
         let mut config = Config::default_config();
         config.model.provider = "unknown".to_string();
         assert!(Agent::new(config).is_err());
+    }
+
+    #[test]
+    fn test_reset_context() {
+        // 会话目录指向临时目录，避免污染真实数据
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default_config();
+        config.session.dir = tmp.path().to_string_lossy().to_string();
+        let mut agent = Agent::new(config).unwrap();
+        let old_id = agent.session_id().map(|s| s.to_string());
+        agent
+            .context
+            .add_message(Role::User, "你好")
+            .expect("加消息应成功");
+        agent.reset_context();
+        // 上下文已清空（build 只剩 system prompt 一条）
+        assert_eq!(agent.context.build().len(), 1);
+        // 会话换成了新 id，且新文件已创建
+        let new_id = agent.session_id().expect("reset 后应有新会话");
+        assert!(old_id.as_deref() != Some(new_id));
+        assert!(tmp.path().join(format!("{new_id}.jsonl")).exists());
     }
 }
