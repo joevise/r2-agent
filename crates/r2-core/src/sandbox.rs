@@ -148,7 +148,12 @@ fn install_pre_exec(cmd: &mut tokio::process::Command, sbx: &Sandbox, use_seccom
     // SAFETY: 闭包内只调用异步信号安全的 libc 函数与 seccomp 安装，符合 pre_exec 约束
     unsafe {
         cmd.pre_exec(move || {
-            set_rlimit(libc::RLIMIT_NPROC, nproc)?;
+            // RLIMIT_NPROC 按"真实 UID 名下全部线程"计数（man 2 setrlimit）——
+            // 桌面/共享 UID 机器上 GUI 应用线程（飞书/Cursor 等）会把配额吃满，导致 fork 全部 EAGAIN。
+            // max_processes=0 表示不设此限制；仅单用途容器（r2 独占 uid）建议设 64-256。
+            if nproc > 0 { 
+                set_rlimit(libc::RLIMIT_NPROC, nproc)?; 
+            }
             set_rlimit(libc::RLIMIT_AS, mem)?;
             set_rlimit(libc::RLIMIT_CPU, cpu)?;
             set_rlimit(libc::RLIMIT_FSIZE, fsize)?;

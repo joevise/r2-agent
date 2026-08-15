@@ -216,7 +216,10 @@ fn default_bash_timeout() -> u64 {
     30
 }
 fn default_max_processes() -> usize {
-    10
+    // 0 = 不设 RLIMIT_NPROC。默认关闭：RLIMIT_NPROC 按真实 UID 全部线程计数，
+    // 桌面/共享 uid 机器上（飞书/Cursor 等 GUI 线程数轻易上千）设任何小值都会让
+    // bash 工具 fork 全部失败。仅 r2 独占 uid 的容器部署建议显式设 64-256。
+    0
 }
 fn default_max_memory_mb() -> usize {
     512
