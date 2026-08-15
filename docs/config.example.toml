@@ -16,7 +16,7 @@ work_dir = "."
 [context]
 l1_threshold = 0.7
 l2_summary_model = "glm-4.5-flash"
-l3_enabled = false
+l3_enabled = false   # 跨会话记忆（需编译 --features l3-memory，存储于 ~/.r2/sessions/memory.db）
 
 [sandbox]
 level = "container"

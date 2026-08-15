@@ -2,6 +2,8 @@
 
 use crate::config::Config;
 use crate::context::ContextManager;
+#[cfg(feature = "l3-memory")]
+use crate::memory::MemoryStore;
 use crate::model::{create_provider, ModelProvider, ModelResult};
 use crate::session::{Session, SessionEntry};
 use crate::tools::ToolRegistry;
@@ -19,27 +21,38 @@ pub struct Agent {
     config: Config,
     /// 会话持久化（Option：会话目录不可写时不影响主流程，也保持既有测试不炸）
     session: Option<Session>,
+    /// L3 跨会话记忆（l3_enabled=false 或打开失败时为 None）
+    #[cfg(feature = "l3-memory")]
+    memory: Option<MemoryStore>,
 }
 
 impl Agent {
     pub fn new(config: Config) -> ModelResult<Self> {
+        #[cfg(not(feature = "l3-memory"))]
+        Self::warn_l3_not_compiled(&config);
         let provider = create_provider(&config)?;
         let max_tokens = config.agent.max_total_tokens;
         let context = ContextManager::new(SYSTEM_PROMPT, max_tokens, config.context.l1_threshold);
         let tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         let session = Session::create(&crate::config::expand_tilde(&config.session.dir)).ok();
+        #[cfg(feature = "l3-memory")]
+        let memory = Self::init_memory(&config);
         Ok(Self {
             provider,
             context,
             tools,
             config,
             session,
+            #[cfg(feature = "l3-memory")]
+            memory,
         })
     }
 
     /// 恢复指定会话：读 JSONL 重建上下文，继续追加写
     pub fn resume(config: Config, session_id: &str) -> ModelResult<Self> {
+        #[cfg(not(feature = "l3-memory"))]
+        Self::warn_l3_not_compiled(&config);
         let provider = create_provider(&config)?;
         let max_tokens = config.agent.max_total_tokens;
         let session_dir = crate::config::expand_tilde(&config.session.dir);
@@ -55,13 +68,41 @@ impl Agent {
         let tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         println!("已恢复会话 {session_id}（{count} 条历史消息）");
+        #[cfg(feature = "l3-memory")]
+        let memory = Self::init_memory(&config);
         Ok(Self {
             provider,
             context,
             tools,
             config,
             session: Some(session),
+            #[cfg(feature = "l3-memory")]
+            memory,
         })
+    }
+
+    /// 初始化 L3 跨会话记忆：l3_enabled=false 或打开失败时为 None
+    #[cfg(feature = "l3-memory")]
+    fn init_memory(config: &Config) -> Option<MemoryStore> {
+        if !config.context.l3_enabled {
+            return None;
+        }
+        let path = format!("{}/memory.db", crate::config::expand_tilde(&config.session.dir));
+        match MemoryStore::open(&path) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                tracing::warn!("L3 记忆库初始化失败（跳过）：{e}");
+                None
+            }
+        }
+    }
+
+    /// 没开 feature 但配置开了 l3_enabled：启动时提示一行
+    #[cfg(not(feature = "l3-memory"))]
+    fn warn_l3_not_compiled(config: &Config) {
+        if config.context.l3_enabled {
+            eprintln!("[memory] l3_enabled=true 但 l3-memory 未编译（需 cargo build --features l3-memory），已跳过");
+        }
     }
 
     /// 当前会话 ID（用于提示用户如何恢复）
@@ -163,12 +204,25 @@ impl Agent {
         self.context.add_message(Role::User, user_input)?;
         self.log_session(&SessionEntry::message(Role::User, user_input));
 
+        // L3：检索跨会话记忆（排除当前会话——它已在上下文里）
+        #[cfg(feature = "l3-memory")]
+        let memory_msg = self.recall_memory(user_input);
+
         let mut final_text = String::new();
         for turn in 0..self.config.agent.max_turns {
             // turn 循环内也保留检查（长回复多轮工具调用时 token 也会涨）
             self.compress_if_needed().await;
 
-            let messages = self.context.build();
+            #[allow(unused_mut)]
+            let mut messages = self.context.build();
+            // 瞬态注入：记忆消息插在 system_prompt 之后（index 1），
+            // 不进 context.messages（不污染历史、不落盘 JSONL），只在 turn 0 注入一次
+            #[cfg(feature = "l3-memory")]
+            if turn == 0 {
+                if let Some(msg) = &memory_msg {
+                    messages.insert(1, msg.clone());
+                }
+            }
             let mut stream = self
                 .provider
                 .chat_stream(&messages, &self.tools.schemas())
@@ -216,7 +270,39 @@ impl Agent {
             // 每轮结束落一个检查点
             self.log_session(&SessionEntry::checkpoint(turn + 1));
         }
+
+        // L3：存一轮 Q&A（session 可能为 None——持久化失败场景，用 "unknown" 代替）
+        #[cfg(feature = "l3-memory")]
+        if let Some(memory) = &self.memory {
+            let session_id = self.session_id().unwrap_or("unknown");
+            if let Err(e) = memory.store(session_id, user_input, &final_text) {
+                tracing::warn!("L3 记忆写入失败：{e}");
+            }
+        }
         Ok(final_text)
+    }
+
+    /// L3：检索跨会话记忆，非空则构造一条注入消息（不进 context.messages）
+    #[cfg(feature = "l3-memory")]
+    fn recall_memory(&self, user_input: &str) -> Option<crate::types::Message> {
+        let memory = self.memory.as_ref()?;
+        let current = self.session_id().unwrap_or("unknown");
+        let hits = memory.search(user_input, 3, 0.30, current).ok()?;
+        if hits.is_empty() {
+            return None;
+        }
+        println!("\n[memory] 唤起 {} 条跨会话记忆", hits.len());
+        let mut content = String::from("【跨会话记忆】以下是你（R2）在之前会话中的相关经历：");
+        for hit in &hits {
+            let answer: String = hit.answer.chars().take(400).collect();
+            content.push_str(&format!("\n- 用户曾问：{}\n  你答：{}", hit.query, answer));
+        }
+        Some(crate::types::Message {
+            role: Role::System,
+            content,
+            tool_calls: None,
+            tool_call_id: None,
+        })
     }
 }
 

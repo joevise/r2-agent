@@ -4,6 +4,8 @@
 mod agent;
 mod config;
 mod context;
+#[cfg(feature = "l3-memory")]
+mod memory;
 mod model;
 mod sandbox;
 mod session;
