@@ -220,6 +220,11 @@ impl ContextManager {
         self.token_count
     }
 
+    /// L1 中的历史消息条数（不含 system prompt / L2 摘要）
+    pub fn history_len(&self) -> usize {
+        self.messages.len()
+    }
+
     fn check_limit(&self, additional: usize) -> ModelResult<()> {
         if self.token_count + additional > self.max_tokens {
             return Err(format!(

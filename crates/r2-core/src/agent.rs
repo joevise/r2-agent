@@ -198,6 +198,11 @@ impl Agent {
         self.session.as_ref().map(|s| s.id())
     }
 
+    /// 当前 L1 中的历史消息条数（不含 system prompt / L2 摘要）
+    pub fn history_len(&self) -> usize {
+        self.context.history_len()
+    }
+
     /// 清空当前上下文（/clear）：新建会话文件 + 重置 L1。
     /// L3 跨会话记忆（若启用）刻意保留不动——它是跨会话的。
     pub fn reset_context(&mut self) {

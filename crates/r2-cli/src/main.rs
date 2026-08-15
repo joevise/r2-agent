@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use r2_core::config::{self, apply_overrides, Config};
-use r2_core::{session, types, Agent};
+use r2_core::rpc::{self, RpcOutcome, RpcServer};
+use r2_core::{session, types, Agent, AgentSession};
 use std::io::Write;
 
 /// R2 Agent — 极简但可靠的 Rust Agent
@@ -50,6 +51,8 @@ enum Commands {
         #[command(subcommand)]
         action: Option<SessionsAction>,
     },
+    /// JSON-RPC serve 模式：stdin/stdout 说行分隔 JSON-RPC 2.0（供任何语言嵌入）
+    Serve,
 }
 
 #[derive(Subcommand)]
@@ -233,9 +236,147 @@ fn print_sessions_tree(config: &Config) -> MainResult<()> {
     Ok(())
 }
 
+/// serve 主循环：stdin 读行 → RpcServer 路由 → stdout 单行写出
+///
+/// 结构：
+/// - stdin 独立线程读行 → mpsc（阻塞 IO 不进 tokio 调度器）
+/// - 单一写任务持有 mpsc<String> 收端口，逐行 println + flush（避免多写者交错）
+/// - prompt 在 tokio 任务里异步执行：边跑边把 AgentEvent 转成通知行送入写通道；
+///   完成后会话 + 结果经 done 通道交还主循环，由主循环写最终响应（保证响应在
+///   最后一条 done 通知之后）
+async fn run_serve(config_path: Option<String>) -> MainResult<()> {
+    let mut server = RpcServer::new();
+    if let Some(path) = config_path {
+        server.set_config_path(path);
+    }
+
+    // 单写者：所有输出行都经这个通道汇聚
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(256);
+    let writer = tokio::spawn(async move {
+        while let Some(line) = out_rx.recv().await {
+            // StdoutLock 不是 Send，不能跨 await 持有：每行现取现放（通道已保证单写者）
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            if writeln!(lock, "{line}").and_then(|_| lock.flush()).is_err() {
+                break; // stdout 已关闭：宿主消失，写出线程退出
+            }
+        }
+    });
+
+    // stdin 读行线程：EOF 时关闭通道通知主循环
+    let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(64);
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        loop {
+            let mut buf = String::new();
+            match stdin.read_line(&mut buf) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    if line_tx.blocking_send(buf).is_err() {
+                        break; // 主循环已退出
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // prompt 完成回流：(会话, 请求 id, 结果)
+    type PromptDone = (AgentSession, u64, Result<String, String>);
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<PromptDone>(4);
+
+    let mut stdin_open = true;
+    loop {
+        tokio::select! {
+            maybe_line = line_rx.recv(), if stdin_open => match maybe_line {
+                Some(line) => match server.handle_line(&line) {
+                    RpcOutcome::Line(l) => {
+                        let _ = out_tx.send(l).await;
+                    }
+                    RpcOutcome::None => {}
+                    RpcOutcome::Shutdown(l) => {
+                        let _ = out_tx.send(l).await;
+                        break;
+                    }
+                    RpcOutcome::PendingPrompt { id, input } => {
+                        match server.begin_prompt() {
+                            Some((session, mut events)) => {
+                                let out = out_tx.clone();
+                                let done = done_tx.clone();
+                                tokio::spawn(async move {
+                                    let mut session = session;
+                                    let result = {
+                                        let fut = session.prompt(&input);
+                                        tokio::pin!(fut);
+                                        loop {
+                                            tokio::select! {
+                                                r = &mut fut => break r,
+                                                evt = events.recv() => match evt {
+                                                    Ok(e) => {
+                                                        let _ = out.send(rpc::event_notification(&e)).await;
+                                                    }
+                                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                                        eprintln!("[serve] 事件通道滞后，丢弃 {n} 条事件");
+                                                    }
+                                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                                                }
+                                            }
+                                        }
+                                    };
+                                    // prompt 返回前发出的 Done 等事件可能还压在缓冲里，排空后再交还
+                                    while let Ok(e) = events.try_recv() {
+                                        let _ = out.send(rpc::event_notification(&e)).await;
+                                    }
+                                    let _ = done.send((session, id, result)).await;
+                                });
+                            }
+                            None => {
+                                // 理论不可达（handle_prompt 已确保会话存在），回滚状态并报错
+                                server.cancel_prompt();
+                                let _ = out_tx
+                                    .send(rpc::error_line(Some(id), rpc::SESSION_ERROR, "会话不可用"))
+                                    .await;
+                            }
+                        }
+                    }
+                },
+                None => {
+                    // stdin EOF：不再接受新请求；若有在途 prompt 则等它结束
+                    stdin_open = false;
+                    if !server.in_flight() {
+                        break;
+                    }
+                }
+            },
+            done = done_rx.recv() => {
+                let Some((session, id, result)) = done else { break };
+                server.end_prompt(session);
+                let line = match result {
+                    Ok(text) => rpc::result_line(id, serde_json::json!({"final_text": text})),
+                    Err(e) => rpc::error_line(Some(id), rpc::SESSION_ERROR, &e),
+                };
+                let _ = out_tx.send(line).await;
+                if !stdin_open {
+                    break; // EOF 后在途 prompt 已完成，优雅退出
+                }
+            }
+        }
+    }
+
+    drop(out_tx);
+    let _ = writer.await;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> MainResult<()> {
     let cli = Cli::parse();
+
+    // serve 子命令：不进交互/单次流程，自己管配置加载（initialize 请求可覆盖）
+    if let Some(Commands::Serve) = &cli.command {
+        return run_serve(cli.config.clone()).await;
+    }
+
     let mut config = load_config(&cli)?;
     apply_overrides(&mut config, cli.model.as_deref(), cli.work_dir.as_deref());
 

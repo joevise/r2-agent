@@ -37,6 +37,17 @@ impl AgentSession {
         Ok(Self::wrap(agent))
     }
 
+    /// 从指定会话分叉（继承父会话 upto 点之前的历史）
+    pub fn branch_from(
+        config: Config,
+        parent_session_id: &str,
+        upto: Option<usize>,
+    ) -> Result<Self, String> {
+        let agent =
+            Agent::branch_from(config, parent_session_id, upto).map_err(|e| e.to_string())?;
+        Ok(Self::wrap(agent))
+    }
+
     fn wrap(mut agent: Agent) -> Self {
         let (event_tx, _) = broadcast::channel(256);
         let (steer_tx, steer_rx) = mpsc::channel(32);
@@ -88,5 +99,16 @@ impl AgentSession {
     /// 清空当前上下文（等价于 CLI 的 /clear）：新建会话文件 + 重置 L1
     pub fn reset_context(&mut self) {
         self.agent.reset_context();
+    }
+
+    /// 当前 L1 中的历史消息条数（不含 system prompt / L2 摘要）
+    pub fn history_len(&self) -> usize {
+        self.agent.history_len()
+    }
+
+    /// 测试用：把外部构造好的 Agent（注入了 MockProvider）包成会话
+    #[cfg(test)]
+    pub(crate) fn wrap_test(agent: Agent) -> Self {
+        Self::wrap(agent)
     }
 }
