@@ -26,10 +26,8 @@ impl Agent {
         let provider = create_provider(&config)?;
         let max_tokens = config.agent.max_total_tokens;
         let context = ContextManager::new(SYSTEM_PROMPT, max_tokens, config.context.l1_threshold);
-        let tools = ToolRegistry::new_default(
-            &config.agent.work_dir,
-            config.sandbox.bash_timeout_secs,
-        );
+        let tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         let session = Session::create(&crate::config::expand_tilde(&config.session.dir)).ok();
         Ok(Self {
             provider,
@@ -54,10 +52,8 @@ impl Agent {
             max_tokens,
             config.context.l1_threshold,
         );
-        let tools = ToolRegistry::new_default(
-            &config.agent.work_dir,
-            config.sandbox.bash_timeout_secs,
-        );
+        let tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         println!("已恢复会话 {session_id}（{count} 条历史消息）");
         Ok(Self {
             provider,

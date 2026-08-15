@@ -29,15 +29,25 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     /// 创建默认注册表：read/write/edit/bash 四个核心工具
-    pub fn new_default(work_dir: &str, bash_timeout_secs: u64) -> Self {
-        Self {
+    ///
+    /// bash 工具按 sandbox_cfg 构造沙箱；level 非法返回错误（正常路径下 config 加载已校验）
+    pub fn new_default(
+        work_dir: &str,
+        sandbox_cfg: &crate::config::SandboxConfig,
+    ) -> Result<Self, String> {
+        let sandbox = crate::sandbox::Sandbox::from_config(sandbox_cfg)?;
+        Ok(Self {
             tools: vec![
                 Box::new(read::ReadTool::new(work_dir)),
                 Box::new(write::WriteTool::new(work_dir)),
                 Box::new(edit::EditTool::new(work_dir)),
-                Box::new(bash::BashTool::new(work_dir, bash_timeout_secs)),
+                Box::new(bash::BashTool::new(
+                    work_dir,
+                    sandbox_cfg.bash_timeout_secs,
+                    sandbox,
+                )),
             ],
-        }
+        })
     }
 
     /// 导出全部工具的 schema（发给模型）
@@ -130,7 +140,11 @@ mod tests {
     use super::*;
 
     fn make_registry(dir: &Path) -> ToolRegistry {
-        ToolRegistry::new_default(dir.to_str().unwrap(), 30)
+        let cfg = crate::config::SandboxConfig {
+            level: "off".to_string(),
+            ..Default::default()
+        };
+        ToolRegistry::new_default(dir.to_str().unwrap(), &cfg).unwrap()
     }
 
     #[tokio::test]

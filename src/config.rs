@@ -110,6 +110,12 @@ pub struct SandboxConfig {
     /// 最大内存（MB）
     #[serde(default = "default_max_memory_mb")]
     pub max_memory_mb: usize,
+    /// CPU 时间上限（秒，RLIMIT_CPU）
+    #[serde(default = "default_cpu_time_secs")]
+    pub cpu_time_secs: u32,
+    /// 单文件写入上限（MB，RLIMIT_FSIZE，防写爆磁盘）
+    #[serde(default = "default_max_file_size_mb")]
+    pub max_file_size_mb: u32,
 }
 
 /// 会话存储配置
@@ -161,6 +167,12 @@ fn default_max_processes() -> usize {
 }
 fn default_max_memory_mb() -> usize {
     512
+}
+fn default_cpu_time_secs() -> u32 {
+    60
+}
+fn default_max_file_size_mb() -> u32 {
+    100
 }
 fn default_session_dir() -> String {
     "~/.r2/sessions".to_string()
@@ -229,6 +241,8 @@ impl Default for SandboxConfig {
             bash_timeout_secs: default_bash_timeout(),
             max_processes: default_max_processes(),
             max_memory_mb: default_max_memory_mb(),
+            cpu_time_secs: default_cpu_time_secs(),
+            max_file_size_mb: default_max_file_size_mb(),
         }
     }
 }
@@ -284,6 +298,7 @@ impl Config {
             )
             .into());
         }
+        crate::sandbox::SandboxLevel::parse(&self.sandbox.level)?;
         self.session.dir = expand_tilde(&self.session.dir);
         self.agent.work_dir = expand_tilde(&self.agent.work_dir);
         Ok(())
@@ -326,6 +341,8 @@ level = "container"
 bash_timeout_secs = 30
 max_processes = 10
 max_memory_mb = 512
+cpu_time_secs = 60
+max_file_size_mb = 100
 
 [session]
 dir = "~/.r2/sessions"
@@ -357,6 +374,16 @@ dir = "~/.r2/sessions"
         assert_eq!(config.sandbox.bash_timeout_secs, 30);
         assert_eq!(config.sandbox.max_processes, 10);
         assert_eq!(config.sandbox.max_memory_mb, 512);
+        assert_eq!(config.sandbox.cpu_time_secs, 60);
+        assert_eq!(config.sandbox.max_file_size_mb, 100);
+    }
+
+    #[test]
+    fn test_invalid_sandbox_level() {
+        let toml_str = FULL_TOML.replace("level = \"container\"", "level = \"docker\"");
+        let result = Config::load_from_str(&toml_str);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("docker"));
     }
 
     #[test]

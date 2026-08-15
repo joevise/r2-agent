@@ -5,6 +5,7 @@ mod agent;
 mod config;
 mod context;
 mod model;
+mod sandbox;
 mod session;
 mod tools;
 mod types;
