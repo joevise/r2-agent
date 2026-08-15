@@ -53,6 +53,8 @@ enum Commands {
     },
     /// JSON-RPC serve 模式：stdin/stdout 说行分隔 JSON-RPC 2.0（供任何语言嵌入）
     Serve,
+    /// 列出内置模型注册表（上下文窗口 / 参考价格 / 工具支持）
+    Models,
     /// 跨会话记忆管理：list / search / delete / stats / migrate
     #[cfg(feature = "l3-memory")]
     Memory {
@@ -218,7 +220,42 @@ fn show_session(config: &Config, id: &str) -> MainResult<()> {
             }
         }
     }
+    // 累计用量（JSONL 里有 usage 记录才显示）；成本按当前配置模型价估算并注明
+    let usage = session::Session::recover_usage(&dir, id);
+    if usage.llm_calls > 0 {
+        let model = config.current_model();
+        let base = format!(
+            "累计用量：输入 {} tok · 输出 {} tok · 调用 {} 次",
+            r2_core::models::format_tokens(usage.input_tokens),
+            r2_core::models::format_tokens(usage.output_tokens),
+            usage.llm_calls
+        );
+        match r2_core::models::estimate_cost(model, &usage) {
+            Some(cost) => println!("\n{base} · 成本 ≈ ¥{cost:.2}（按 {model} 估算）"),
+            None => println!("\n{base}"),
+        }
+    }
     Ok(())
+}
+
+/// 打印模型注册表（r2 models）
+fn print_models() {
+    println!(
+        "{:<18} {:>10} {:>10} {:>10} {:>6}  提供商",
+        "模型名", "窗口", "输入价", "输出价", "工具"
+    );
+    for m in r2_core::models::registry() {
+        println!(
+            "{:<18} {:>10} {:>10} {:>10} {:>6}  {}",
+            m.display_name,
+            r2_core::models::format_tokens(m.context_window as u64),
+            m.input_price_per_m,
+            m.output_price_per_m,
+            if m.tool_support { "✓" } else { "✗" },
+            m.provider_hint
+        );
+    }
+    println!("\n价格单位：元/百万 token。模型名匹配规则：包含即命中（大小写不敏感），价格仅供参考，以官网为准。");
 }
 
 /// 打印会话列表（--list-sessions）
@@ -520,6 +557,12 @@ async fn main() -> MainResult<()> {
     }
     if cli.list_sessions {
         return print_sessions(&config);
+    }
+
+    // models 子命令：只读注册表，不需要 api_key
+    if let Some(Commands::Models) = &cli.command {
+        print_models();
+        return Ok(());
     }
 
     // memory 子命令（需 l3-memory feature；只做记忆管理，不校验模型 api_key）

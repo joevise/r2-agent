@@ -48,6 +48,13 @@ pub enum SessionEntry {
         parent_upto: usize,
         ts: u64,
     },
+    /// 用量统计快照（每轮 run 结束 append，存累计值；恢复时取最后一条）
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+        llm_calls: u64,
+        ts: u64,
+    },
 }
 
 impl SessionEntry {
@@ -90,6 +97,16 @@ impl SessionEntry {
     pub fn checkpoint(turn: usize) -> Self {
         Self::Checkpoint {
             turn,
+            ts: now_ts(),
+        }
+    }
+
+    /// 构造一条用量统计记录（累计值快照）
+    pub fn usage(stats: &crate::types::UsageStats) -> Self {
+        Self::Usage {
+            input_tokens: stats.input_tokens,
+            output_tokens: stats.output_tokens,
+            llm_calls: stats.llm_calls,
             ts: now_ts(),
         }
     }
@@ -254,6 +271,10 @@ impl Session {
                     first_entry_seen = true;
                     // v0.1 不需要检查点，忽略
                 }
+                Ok(SessionEntry::Usage { .. }) => {
+                    first_entry_seen = true;
+                    // 消息重建时忽略用量记录（由 recover_usage 单独读取）
+                }
                 Err(e) => {
                     if is_last {
                         // 崩溃残行：静默丢弃
@@ -308,6 +329,33 @@ impl Session {
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// 读取会话文件里最后一条用量记录（只读，不开写句柄）。
+    /// 无用量记录或文件不存在时返回默认值。
+    /// 注意：只读本会话自身文件，分支会话不继承父会话用量。
+    pub fn recover_usage(session_dir: &str, session_id: &str) -> crate::types::UsageStats {
+        let path = session_path(session_dir, session_id);
+        let Ok(content) = fs::read_to_string(&path) else {
+            return crate::types::UsageStats::default();
+        };
+        let mut usage = crate::types::UsageStats::default();
+        for line in content.lines() {
+            if let Ok(SessionEntry::Usage {
+                input_tokens,
+                output_tokens,
+                llm_calls,
+                ..
+            }) = serde_json::from_str::<SessionEntry>(line.trim())
+            {
+                usage = crate::types::UsageStats {
+                    input_tokens,
+                    output_tokens,
+                    llm_calls,
+                };
+            }
+        }
+        usage
     }
 }
 
@@ -384,6 +432,9 @@ pub fn list_sessions(session_dir: &str) -> Result<Vec<SessionSummary>, String> {
                 } => {
                     summary.branch_from = Some(parent_session.clone());
                     summary.branch_upto = Some(parent_upto);
+                    summary.last_ts = summary.last_ts.max(ts);
+                }
+                SessionEntry::Usage { ts, .. } => {
                     summary.last_ts = summary.last_ts.max(ts);
                 }
             }
@@ -506,6 +557,45 @@ mod tests {
 
         let (_s, messages) = Session::recover(&dir, "bad").unwrap();
         assert!(messages.is_empty());
+    }
+
+    /// usage 记录：落盘后 recover_usage 取最后一条累计值；recover 消息重建不受影响
+    #[test]
+    fn test_usage_entry_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().to_string();
+        let mut session = Session::create(&dir).unwrap();
+        let id = session.id().to_string();
+        session.append(&SessionEntry::message(Role::User, "问题")).unwrap();
+        session
+            .append(&SessionEntry::usage(&crate::types::UsageStats {
+                input_tokens: 100,
+                output_tokens: 50,
+                llm_calls: 1,
+            }))
+            .unwrap();
+        session
+            .append(&SessionEntry::usage(&crate::types::UsageStats {
+                input_tokens: 300,
+                output_tokens: 120,
+                llm_calls: 2,
+            }))
+            .unwrap();
+        drop(session);
+
+        // 恢复取最后一条快照
+        let usage = Session::recover_usage(&dir, &id);
+        assert_eq!(usage.input_tokens, 300);
+        assert_eq!(usage.output_tokens, 120);
+        assert_eq!(usage.llm_calls, 2);
+
+        // 消息重建忽略 usage 行
+        let (_s, messages) = Session::recover(&dir, &id).unwrap();
+        assert_eq!(messages.len(), 1);
+
+        // 无记录的会话 → 默认值
+        let usage = Session::recover_usage(&dir, "nonexistent");
+        assert_eq!(usage.llm_calls, 0);
     }
 
     /// BOM 开头的文件：剥掉 BOM 后正常解析

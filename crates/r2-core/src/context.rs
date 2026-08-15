@@ -10,12 +10,12 @@ pub const KEEP_RECENT: usize = 12;
 pub const SUMMARY_PREFIX: &str = "【会话历史摘要】";
 
 /// 近似 token 计数：字符数 / 2（中英文混合够用）
-fn estimate_tokens(text: &str) -> usize {
+pub(crate) fn estimate_tokens(text: &str) -> usize {
     text.len() / 2
 }
 
 /// 估算一条完整消息的 token 数（content + 工具调用参数）
-fn message_tokens(msg: &Message) -> usize {
+pub(crate) fn message_tokens(msg: &Message) -> usize {
     let mut tokens = estimate_tokens(&msg.content);
     if let Some(calls) = &msg.tool_calls {
         for tc in calls {

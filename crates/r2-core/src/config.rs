@@ -76,7 +76,7 @@ pub struct AgentConfig {
     /// 单轮对话最大循环次数
     #[serde(default = "default_max_turns")]
     pub max_turns: usize,
-    /// 会话最大累计 token 数
+    /// 会话最大累计 token 数。0 = 自动（按 models 注册表推导当前模型的上下文窗口）
     #[serde(default = "default_max_total_tokens")]
     pub max_total_tokens: usize,
     /// 工作目录
@@ -192,7 +192,8 @@ fn default_max_turns() -> usize {
     50
 }
 fn default_max_total_tokens() -> usize {
-    500_000
+    // 0 = 自动：post_process / Agent 构造时按 models 注册表推导窗口预算
+    0
 }
 fn default_work_dir() -> String {
     ".".to_string()
@@ -371,7 +372,37 @@ impl Config {
         crate::sandbox::SandboxLevel::parse(&self.sandbox.level)?;
         self.session.dir = expand_tilde(&self.session.dir);
         self.agent.work_dir = expand_tilde(&self.agent.work_dir);
+        self.resolve_auto_budget();
         Ok(())
+    }
+
+    /// 窗口自动预算：max_total_tokens == 0 时按 models 注册表推导。
+    /// 幂等：显式设置过（非 0）时不做任何事。
+    pub fn resolve_auto_budget(&mut self) {
+        if self.agent.max_total_tokens != 0 {
+            return;
+        }
+        let model = self.current_model().to_string();
+        match crate::models::lookup(&model) {
+            Some(info) => {
+                // L1 预算 = 上下文窗口；压缩线由 context.l1_threshold 控制
+                self.agent.max_total_tokens = info.context_window;
+            }
+            None => {
+                self.agent.max_total_tokens = 128_000;
+                tracing::warn!(
+                    "未知模型 {model}，预算默认 128K，建议 config 显式设置 max_total_tokens 或用 `r2 models` 查看支持列表"
+                );
+            }
+        }
+    }
+
+    /// 当前 provider 生效的模型名
+    pub fn current_model(&self) -> &str {
+        match self.model.provider.as_str() {
+            "anthropic" => &self.model.anthropic.model,
+            _ => &self.model.openai_compat.model,
+        }
     }
 
     /// 供测试使用：从 TOML 字符串解析
@@ -462,6 +493,38 @@ dir = "~/.r2/sessions"
     }
 
     #[test]
+    fn test_auto_budget_known_model() {
+        // 不显式设置 max_total_tokens（默认 0=自动）：mock 模型 → 窗口 8192
+        let toml_str = r#"
+[model.openai_compat]
+model = "mock"
+"#;
+        let config = Config::load_from_str(toml_str).unwrap();
+        assert_eq!(config.agent.max_total_tokens, 8_192);
+    }
+
+    #[test]
+    fn test_auto_budget_unknown_model_fallback() {
+        let toml_str = r#"
+[model.openai_compat]
+model = "no-such-model-xyz"
+"#;
+        let config = Config::load_from_str(toml_str).unwrap();
+        assert_eq!(config.agent.max_total_tokens, 128_000);
+    }
+
+    #[test]
+    fn test_auto_budget_explicit_not_overridden() {
+        // 显式设置不受自动推导影响（FULL_TOML 模型是 glm-5.2，窗口 200K，显式 500K 保留）
+        let config = Config::load_from_str(FULL_TOML).unwrap();
+        assert_eq!(config.agent.max_total_tokens, 500_000);
+        // 幂等：再调一次也不变
+        let mut config = config;
+        config.resolve_auto_budget();
+        assert_eq!(config.agent.max_total_tokens, 500_000);
+    }
+
+    #[test]
     fn test_invalid_sandbox_level() {
         let toml_str = FULL_TOML.replace("level = \"container\"", "level = \"docker\"");
         let result = Config::load_from_str(&toml_str);
@@ -532,7 +595,8 @@ provider = "anthropic"
         assert_eq!(config.model.provider, "anthropic");
         // 缺失字段应使用默认值
         assert_eq!(config.agent.max_turns, 50);
-        assert_eq!(config.agent.max_total_tokens, 500000);
+        // max_total_tokens 默认 0（自动）：anthropic 默认模型不在注册表 → 兜底 128K
+        assert_eq!(config.agent.max_total_tokens, 128_000);
         assert_eq!(config.sandbox.level, "container");
         assert_eq!(config.sandbox.bash_timeout_secs, 30);
         assert_eq!(

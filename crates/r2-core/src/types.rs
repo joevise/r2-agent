@@ -44,6 +44,14 @@ pub struct ToolSchema {
     pub parameters: serde_json::Value,
 }
 
+/// 一轮对话的用量统计
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageStats {
+    pub input_tokens: u64,  // 发给模型的全部消息（含system）估算
+    pub output_tokens: u64, // 模型回复估算
+    pub llm_calls: u64,     // 模型调用次数（含摘要/重试）
+}
+
 /// 流式响应块
 #[derive(Debug, Clone)]
 pub enum StreamChunk {

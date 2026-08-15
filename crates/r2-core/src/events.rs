@@ -1,5 +1,7 @@
 //! Agent 运行时事件：供嵌入方订阅（broadcast 通道）
 
+use crate::types::UsageStats;
+
 /// Agent 一轮运行中广播的事件
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -15,6 +17,8 @@ pub enum AgentEvent {
     Steered(String),
     /// 一轮结束
     Done { final_text: String },
+    /// 用量统计更新（Done 前发出，含会话累计值）
+    UsageUpdate(UsageStats),
     /// 出错
     Error(String),
 }

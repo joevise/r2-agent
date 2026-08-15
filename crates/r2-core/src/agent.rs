@@ -8,7 +8,7 @@ use crate::memory::{EmbeddingProvider, MemoryStore};
 use crate::model::{create_provider, ModelProvider, ModelResult};
 use crate::session::{Session, SessionEntry};
 use crate::tools::ToolRegistry;
-use crate::types::{Role, StreamChunk};
+use crate::types::{Role, StreamChunk, UsageStats};
 use futures_util::StreamExt;
 use std::io::Write;
 
@@ -34,12 +34,17 @@ pub struct Agent {
     steer_rx: Option<tokio::sync::mpsc::Receiver<String>>,
     /// 静音模式：为 true 时不向 stdout 打印（事件照常广播）
     quiet: bool,
+    /// 会话生命周期的累计用量统计
+    usage: UsageStats,
 }
 
 impl Agent {
     pub fn new(config: Config) -> ModelResult<Self> {
         #[cfg(not(feature = "l3-memory"))]
         Self::warn_l3_not_compiled(&config);
+        // 直接构造的 Config（未走 load_from_file）也在这里兜底做窗口自动预算
+        let mut config = config;
+        config.resolve_auto_budget();
         let provider = create_provider(&config)?;
         let max_tokens = config.agent.max_total_tokens;
         let context = ContextManager::new(SYSTEM_PROMPT, max_tokens, config.context.l1_threshold);
@@ -62,6 +67,7 @@ impl Agent {
             emitter: None,
             steer_rx: None,
             quiet: false,
+            usage: UsageStats::default(),
         })
     }
 
@@ -69,11 +75,15 @@ impl Agent {
     pub fn resume(config: Config, session_id: &str) -> ModelResult<Self> {
         #[cfg(not(feature = "l3-memory"))]
         Self::warn_l3_not_compiled(&config);
+        let mut config = config;
+        config.resolve_auto_budget();
         let provider = create_provider(&config)?;
         let max_tokens = config.agent.max_total_tokens;
         let session_dir = crate::config::expand_tilde(&config.session.dir);
         let (session, messages) = Session::recover(&session_dir, session_id)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        // 累计用量一并恢复（取 JSONL 里最后一条 usage 快照）
+        let usage = Session::recover_usage(&session_dir, session_id);
         let count = messages.len();
         let context = ContextManager::from_messages(
             SYSTEM_PROMPT,
@@ -100,6 +110,7 @@ impl Agent {
             emitter: None,
             steer_rx: None,
             quiet: false,
+            usage,
         })
     }
 
@@ -110,6 +121,8 @@ impl Agent {
     pub fn branch_from(config: Config, parent_session_id: &str, upto: Option<usize>) -> ModelResult<Self> {
         #[cfg(not(feature = "l3-memory"))]
         Self::warn_l3_not_compiled(&config);
+        let mut config = config;
+        config.resolve_auto_budget();
         let provider = create_provider(&config)?;
         let max_tokens = config.agent.max_total_tokens;
         let session_dir = crate::config::expand_tilde(&config.session.dir);
@@ -142,6 +155,8 @@ impl Agent {
             emitter: None,
             steer_rx: None,
             quiet: false,
+            // 分支会话的用量从头累计（不继承父会话的用量快照）
+            usage: UsageStats::default(),
         })
     }
 
@@ -226,6 +241,13 @@ impl Agent {
             self.config.agent.max_total_tokens,
             self.config.context.l1_threshold,
         );
+        // 新会话文件：用量统计一并清零
+        self.usage = UsageStats::default();
+    }
+
+    /// 当前会话的累计用量统计
+    pub fn usage(&self) -> &UsageStats {
+        &self.usage
     }
 
     /// 追加会话记录；失败只告警不中断主流程
@@ -242,7 +264,7 @@ impl Agent {
     /// v0.1 复用主模型做摘要（config.context.l2_summary_model 暂忽略，
     /// 独立的小模型做摘要是后续优化点）。
     /// 已有摘要时，让模型把旧摘要和新消息合并成一份新摘要。
-    async fn summarize(&self, old_msgs: &[crate::types::Message]) -> ModelResult<String> {
+    async fn summarize(&mut self, old_msgs: &[crate::types::Message]) -> ModelResult<String> {
         // 把待压缩消息转成可读对话文本
         let mut dialogue = String::new();
         for m in old_msgs {
@@ -276,12 +298,16 @@ impl Agent {
             tool_call_id: None,
         }];
         // 摘要请求不带 tools
+        // L2 摘要也计入用量：明细标不了就并入总数
+        self.usage.input_tokens += crate::context::message_tokens(&req[0]) as u64;
+        self.usage.llm_calls += 1;
         let mut stream = self.provider.chat_stream(&req, &[]).await?;
         let mut chunks = Vec::new();
         while let Some(item) = stream.next().await {
             chunks.push(item?);
         }
         let (text, _) = self.provider.parse_response(&chunks)?;
+        self.usage.output_tokens += crate::context::estimate_tokens(&text) as u64;
         if text.trim().is_empty() {
             return Err("摘要模型返回空内容".into());
         }
@@ -349,6 +375,12 @@ impl Agent {
                     messages.insert(1, msg.clone());
                 }
             }
+            // 用量统计：输入 = 本次发给模型的全部消息（含 system prompt / 摘要 / 记忆注入）
+            self.usage.input_tokens += messages
+                .iter()
+                .map(crate::context::message_tokens)
+                .sum::<usize>() as u64;
+            self.usage.llm_calls += 1;
             let mut stream = self
                 .provider
                 .chat_stream(&messages, &self.tools.schemas())
@@ -412,6 +444,13 @@ impl Agent {
                 .provider
                 .parse_response(&chunks)
                 .map_err(|e| format!("解析模型响应失败：{e}"))?;
+            // 用量统计：输出 = 回复文本 + 工具调用参数
+            self.usage.output_tokens += crate::context::estimate_tokens(&text) as u64;
+            for tc in &tool_calls {
+                self.usage.output_tokens += (crate::context::estimate_tokens(&tc.arguments)
+                    + crate::context::estimate_tokens(&tc.name))
+                    as u64;
+            }
             self.context.add_assistant_with_tools(&text, tool_calls.clone())?;
             self.log_session(&SessionEntry::assistant(&text, tool_calls.clone()));
             final_text = text;
@@ -488,10 +527,30 @@ impl Agent {
                 }
             }
         }
+        // 用量：UsageUpdate 事件在 Done 前发出（嵌入方可订阅），累计值落盘 JSONL
+        self.emit(AgentEvent::UsageUpdate(self.usage.clone()));
+        self.log_session(&SessionEntry::usage(&self.usage));
         self.emit(AgentEvent::Done {
             final_text: final_text.clone(),
         });
+        if !self.quiet {
+            println!("[usage] {}", self.usage_line());
+        }
         Ok(final_text)
+    }
+
+    /// 组装 [usage] 行：token 统计恒有；命中注册表时追加成本估算
+    fn usage_line(&self) -> String {
+        let base = format!(
+            "输入 {} tok · 输出 {} tok · 调用 {} 次",
+            crate::models::format_tokens(self.usage.input_tokens),
+            crate::models::format_tokens(self.usage.output_tokens),
+            self.usage.llm_calls
+        );
+        match crate::models::estimate_cost(self.config.current_model(), &self.usage) {
+            Some(cost) => format!("{base} · 累计成本 ≈ ¥{cost:.2}"),
+            None => base, // 未知模型只显示 token 不显示价格
+        }
     }
 
     /// steer 统一处理：保留已收到的文本部分（半截工具调用 JSON 不可用，全部丢弃），
@@ -699,6 +758,42 @@ mod tests {
 
     // 注：工具间隙 steer 的确定性测试需要 mock 出完整工具调用 JSON + ToolRegistry 配合，
     // 构造复杂度高、收益低，v0.2 跳过。
+
+    #[tokio::test]
+    async fn test_usage_stats_and_jsonl_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        // gate 常开：一轮直接走完（1 次模型调用）
+        let (_gate_tx, gate_rx) = tokio::sync::watch::channel(true);
+        let mut agent = test_agent(&tmp, gate_rx);
+        let session_id = agent.session_id().unwrap().to_string();
+
+        agent.run("统计用量").await.expect("run 应成功");
+        assert!(agent.usage().input_tokens > 0);
+        assert!(agent.usage().output_tokens > 0);
+        assert_eq!(agent.usage().llm_calls, 1);
+
+        // usage 记录已落盘 JSONL（每轮结束 append 累计值）
+        let dir = tmp.path().to_string_lossy().to_string();
+        let disk = Session::recover_usage(&dir, &session_id);
+        assert_eq!(disk.llm_calls, 1);
+        assert_eq!(disk.input_tokens, agent.usage().input_tokens);
+        assert_eq!(disk.output_tokens, agent.usage().output_tokens);
+
+        // 恢复会话：usage 一并恢复，再跑一轮在累计值上继续
+        let mut config = Config::default_config();
+        config.session.dir = dir;
+        let mut agent2 = Agent::resume(config, &session_id).expect("resume 应成功");
+        assert_eq!(agent2.usage().llm_calls, 1);
+        let (_g2, gate_rx2) = tokio::sync::watch::channel(true);
+        agent2.set_provider(Box::new(MockProvider {
+            gate: gate_rx2,
+            calls: Arc::new(AtomicUsize::new(1)), // 直接走"最终回复"分支
+        }));
+        agent2.set_quiet(true);
+        agent2.run("继续").await.expect("run 应成功");
+        assert_eq!(agent2.usage().llm_calls, 2);
+        assert!(agent2.usage().input_tokens > disk.input_tokens);
+    }
 
     #[test]
     fn test_agent_construction() {

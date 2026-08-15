@@ -86,6 +86,11 @@ pub fn event_notification(event: &AgentEvent) -> String {
         }
         AgentEvent::Steered(instruction) => ("steered", json!({"instruction": instruction})),
         AgentEvent::Done { final_text } => ("done", json!({"final_text": final_text})),
+        AgentEvent::UsageUpdate(u) => ("usage_update", json!({
+            "input_tokens": u.input_tokens,
+            "output_tokens": u.output_tokens,
+            "llm_calls": u.llm_calls,
+        })),
         AgentEvent::Error(message) => ("error", json!({"message": message})),
     };
     json!({

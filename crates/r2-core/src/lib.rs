@@ -37,6 +37,7 @@ pub mod mcp;
 #[cfg(feature = "l3-memory")]
 pub mod memory;
 pub mod model;
+pub mod models;
 pub mod rpc;
 pub mod sandbox;
 pub mod session;
