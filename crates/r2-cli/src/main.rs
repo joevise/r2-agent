@@ -54,7 +54,11 @@ enum Commands {
     /// JSON-RPC serve 模式：stdin/stdout 说行分隔 JSON-RPC 2.0（供任何语言嵌入）
     Serve,
     /// 列出内置模型注册表（上下文窗口 / 参考价格 / 工具支持）
-    Models,
+    Models {
+        /// 额外显示每模型的 API 端点与订阅计划说明
+        #[arg(long)]
+        verbose: bool,
+    },
     /// 跨会话记忆管理：list / search / delete / stats / migrate
     #[cfg(feature = "l3-memory")]
     Memory {
@@ -239,22 +243,49 @@ fn show_session(config: &Config, id: &str) -> MainResult<()> {
 }
 
 /// 打印模型注册表（r2 models）
-fn print_models() {
-    println!(
-        "{:<18} {:>10} {:>10} {:>10} {:>6}  提供商",
-        "模型名", "窗口", "输入价", "输出价", "工具"
-    );
-    for m in r2_core::models::registry() {
+fn print_models(verbose: bool) {
+    if verbose {
         println!(
-            "{:<18} {:>10} {:>10} {:>10} {:>6}  {}",
-            m.display_name,
-            r2_core::models::format_tokens(m.context_window as u64),
-            m.input_price_per_m,
-            m.output_price_per_m,
-            if m.tool_support { "✓" } else { "✗" },
-            m.provider_hint
+            "{:<18} {:>10} {:>10} {:>10} {:>6} {:>6}  提供商  端点",
+            "模型名", "窗口", "输入价", "输出价", "工具", "订阅"
+        );
+    } else {
+        println!(
+            "{:<18} {:>10} {:>10} {:>10} {:>6} {:>6}  提供商",
+            "模型名", "窗口", "输入价", "输出价", "工具", "订阅"
         );
     }
+    for m in r2_core::models::registry() {
+        if verbose {
+            println!(
+                "{:<18} {:>10} {:>10} {:>10} {:>6} {:>6}  {}  {}",
+                m.display_name,
+                r2_core::models::format_tokens(m.context_window as u64),
+                m.input_price_per_m,
+                m.output_price_per_m,
+                if m.tool_support { "✓" } else { "✗" },
+                if m.coding_plan.is_empty() { "-" } else { "✓" },
+                m.provider_hint,
+                if m.endpoint.is_empty() { "-" } else { m.endpoint },
+            );
+        } else {
+            println!(
+                "{:<18} {:>10} {:>10} {:>10} {:>6} {:>6}  {}",
+                m.display_name,
+                r2_core::models::format_tokens(m.context_window as u64),
+                m.input_price_per_m,
+                m.output_price_per_m,
+                if m.tool_support { "✓" } else { "✗" },
+                if m.coding_plan.is_empty() { "-" } else { "✓" },
+                m.provider_hint
+            );
+        }
+    }
+    println!("\n订阅/Coding Plan：");
+    println!("· 智谱 Coding Plan：open.bigmodel.cn/api/coding/paas/v4（GLM 系列包月）");
+    println!("· Kimi Coding Plan：api.kimi.com/coding（k3 / kimi-for-coding 包月）");
+    println!("· GitHub Copilot：claude-sonnet-4.6 / gpt-5.4 等（$10/月档含额度）");
+    println!("· 小米 Token Plan：token-plan-cn.xiaomimimo.com/v1");
     println!("\n价格单位：元/百万 token。模型名匹配规则：包含即命中（大小写不敏感），价格仅供参考，以官网为准。");
 }
 
@@ -560,8 +591,8 @@ async fn main() -> MainResult<()> {
     }
 
     // models 子命令：只读注册表，不需要 api_key
-    if let Some(Commands::Models) = &cli.command {
-        print_models();
+    if let Some(Commands::Models { verbose }) = &cli.command {
+        print_models(*verbose);
         return Ok(());
     }
 
