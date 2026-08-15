@@ -19,6 +19,14 @@ struct Cli {
     #[arg(long)]
     session: Option<String>,
 
+    /// 从指定会话分叉（继承历史后进入新会话）
+    #[arg(long)]
+    branch: Option<String>,
+
+    /// 分叉截止点：只继承父会话前 N 条消息（配合 --branch 使用）
+    #[arg(long)]
+    at: Option<usize>,
+
     /// 列出所有历史会话后退出（等价于 `r2 sessions`，保留作向后兼容）
     #[arg(long)]
     list_sessions: bool,
@@ -59,6 +67,8 @@ enum SessionsAction {
         /// 会话 ID
         id: String,
     },
+    /// 列出会话及分支关系
+    Tree,
 }
 
 const CONFIG_EXAMPLE: &str = r#"最小配置示例（~/.r2/config.toml）：
@@ -196,6 +206,33 @@ fn print_sessions(config: &Config) -> MainResult<()> {
     Ok(())
 }
 
+/// 打印会话树（sessions tree）：简单列表 + 分支指示
+fn print_sessions_tree(config: &Config) -> MainResult<()> {
+    let dir = config::expand_tilde(&config.session.dir);
+    let sessions = session::list_sessions(&dir)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    if sessions.is_empty() {
+        println!("暂无历史会话");
+        return Ok(());
+    }
+    for s in sessions {
+        let preview = if s.first_user_preview.is_empty() {
+            "（无用户消息）"
+        } else {
+            &s.first_user_preview
+        };
+        match (&s.branch_from, s.branch_upto) {
+            (Some(parent), Some(upto)) => {
+                // 父会话 id 截断显示，避免行过长
+                let short: String = parent.chars().take(8).collect();
+                println!("{}  {}条  {}  ← 分支自 {}@{}", s.id, s.message_count, preview, short, upto);
+            }
+            _ => println!("{}  {}条  {}", s.id, s.message_count, preview),
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> MainResult<()> {
     let cli = Cli::parse();
@@ -208,6 +245,7 @@ async fn main() -> MainResult<()> {
             None => print_sessions(&config),
             Some(SessionsAction::Export { id, out }) => export_session(&config, id, out.as_deref()),
             Some(SessionsAction::Show { id }) => show_session(&config, id),
+            Some(SessionsAction::Tree) => print_sessions_tree(&config),
         };
     }
     if cli.list_sessions {
@@ -216,8 +254,14 @@ async fn main() -> MainResult<()> {
 
     check_api_key(&config)?;
 
+    if cli.at.is_some() && cli.branch.is_none() {
+        eprintln!("警告：--at 仅在配合 --branch 时生效，已忽略");
+    }
+
     let mut agent = if let Some(session_id) = &cli.session {
         Agent::resume(config, session_id)?
+    } else if let Some(parent_id) = &cli.branch {
+        Agent::branch_from(config, parent_id, cli.at)?
     } else {
         Agent::new(config)?
     };

@@ -94,6 +94,45 @@ impl Agent {
         })
     }
 
+    /// 从某会话分叉并继续（上下文 = 父会话 upto 点 + 后续新对话）
+    ///
+    /// 流程：Session::branch 新建分支会话文件 → 继承消息灌入 L1 → 组装 Agent。
+    /// 之后对话追加写到新会话文件，不碰父文件。
+    pub fn branch_from(config: Config, parent_session_id: &str, upto: Option<usize>) -> ModelResult<Self> {
+        #[cfg(not(feature = "l3-memory"))]
+        Self::warn_l3_not_compiled(&config);
+        let provider = create_provider(&config)?;
+        let max_tokens = config.agent.max_total_tokens;
+        let session_dir = crate::config::expand_tilde(&config.session.dir);
+        let (session, messages) = Session::branch(&session_dir, parent_session_id, upto)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        let count = messages.len();
+        let new_id = session.id().to_string();
+        let context = ContextManager::from_messages(
+            SYSTEM_PROMPT,
+            messages,
+            max_tokens,
+            config.context.l1_threshold,
+        );
+        let tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        println!("已从会话 {parent_session_id} 分叉（继承 {count} 条消息，新会话 {new_id}）");
+        #[cfg(feature = "l3-memory")]
+        let memory = Self::init_memory(&config);
+        Ok(Self {
+            provider,
+            context,
+            tools,
+            config,
+            session: Some(session),
+            #[cfg(feature = "l3-memory")]
+            memory,
+            emitter: None,
+            steer_rx: None,
+            quiet: false,
+        })
+    }
+
     /// 注入事件广播通道（嵌入方使用；CLI 不调用，输出行为不变）
     pub fn set_emitter(&mut self, emitter: tokio::sync::broadcast::Sender<AgentEvent>) {
         self.emitter = Some(emitter);

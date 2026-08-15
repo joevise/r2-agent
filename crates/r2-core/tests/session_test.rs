@@ -162,3 +162,146 @@ fn test_recover_missing_session() {
     };
     assert!(err.contains("会话不存在"));
 }
+
+/// 基础分叉：父写 3 条 → branch(None) → 新会话 append 1 条 →
+/// recover 新会话得 4 条（3 继承 + 1 新），父会话仍 3 条（不可变）
+#[test]
+fn test_branch_basic() {
+    let dir = TempDir::new().unwrap();
+    let dir_path = dir.path().to_str().unwrap();
+
+    let parent_id = {
+        let mut parent = Session::create(dir_path).unwrap();
+        write_three(&mut parent);
+        parent.id().to_string()
+    };
+
+    let (mut child, inherited) = Session::branch(dir_path, &parent_id, None).unwrap();
+    assert_eq!(inherited.len(), 3);
+    assert_eq!(inherited[0].content, "帮我创建文件");
+    let child_id = child.id().to_string();
+    child
+        .append(&SessionEntry::message(Role::User, "分支后的新问题"))
+        .unwrap();
+    drop(child);
+
+    let (_s, messages) = Session::recover(dir_path, &child_id).unwrap();
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[3].content, "分支后的新问题");
+
+    // 父会话不可变
+    let (_p, parent_msgs) = Session::recover(dir_path, &parent_id).unwrap();
+    assert_eq!(parent_msgs.len(), 3);
+}
+
+/// 定点分叉：父写 5 条 → branch(Some(2)) → recover 只继承前 2 条 + 自己的后续
+#[test]
+fn test_branch_at() {
+    let dir = TempDir::new().unwrap();
+    let dir_path = dir.path().to_str().unwrap();
+
+    let parent_id = {
+        let mut parent = Session::create(dir_path).unwrap();
+        for i in 1..=5 {
+            parent
+                .append(&SessionEntry::message(Role::User, &format!("第{i}条")))
+                .unwrap();
+        }
+        parent.id().to_string()
+    };
+
+    let (mut child, inherited) = Session::branch(dir_path, &parent_id, Some(2)).unwrap();
+    assert_eq!(inherited.len(), 2);
+    assert_eq!(inherited[1].content, "第2条");
+    let child_id = child.id().to_string();
+    child
+        .append(&SessionEntry::message(Role::User, "分叉点之后"))
+        .unwrap();
+    drop(child);
+
+    let (_s, messages) = Session::recover(dir_path, &child_id).unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0].content, "第1条");
+    assert_eq!(messages[1].content, "第2条");
+    assert_eq!(messages[2].content, "分叉点之后");
+
+    // 超界 upto → 取全部
+    let (_c2, inherited_all) = Session::branch(dir_path, &parent_id, Some(999)).unwrap();
+    assert_eq!(inherited_all.len(), 5);
+}
+
+/// 链式分支：A 分出 B，B 分出 C → recover C 得 A 前缀 + B 段 + 自己
+#[test]
+fn test_branch_chain() {
+    let dir = TempDir::new().unwrap();
+    let dir_path = dir.path().to_str().unwrap();
+
+    let id_a = {
+        let mut a = Session::create(dir_path).unwrap();
+        a.append(&SessionEntry::message(Role::User, "A的消息")).unwrap();
+        a.id().to_string()
+    };
+    let id_b = {
+        let (mut b, _) = Session::branch(dir_path, &id_a, None).unwrap();
+        b.append(&SessionEntry::message(Role::User, "B的消息")).unwrap();
+        b.id().to_string()
+    };
+    let id_c = {
+        let (mut c, _) = Session::branch(dir_path, &id_b, None).unwrap();
+        c.append(&SessionEntry::message(Role::User, "C的消息")).unwrap();
+        c.id().to_string()
+    };
+
+    let (_s, messages) = Session::recover(dir_path, &id_c).unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0].content, "A的消息");
+    assert_eq!(messages[1].content, "B的消息");
+    assert_eq!(messages[2].content, "C的消息");
+}
+
+/// 断链降级：branch 后删除父文件 → recover 不 panic，只返回自己的消息
+#[test]
+fn test_branch_broken_parent() {
+    let dir = TempDir::new().unwrap();
+    let dir_path = dir.path().to_str().unwrap();
+
+    let parent_id = {
+        let mut parent = Session::create(dir_path).unwrap();
+        write_three(&mut parent);
+        parent.id().to_string()
+    };
+    let child_id = {
+        let (mut child, _) = Session::branch(dir_path, &parent_id, None).unwrap();
+        child
+            .append(&SessionEntry::message(Role::User, "孤儿消息"))
+            .unwrap();
+        child.id().to_string()
+    };
+
+    std::fs::remove_file(dir.path().join(format!("{parent_id}.jsonl"))).unwrap();
+
+    let (_s, messages) = Session::recover(dir_path, &child_id).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].content, "孤儿消息");
+}
+
+/// Branch entry 序列化往返
+#[test]
+fn test_entry_branch_serde() {
+    let entry = SessionEntry::branch_marker("parent-123", 6);
+    let line = serde_json::to_string(&entry).unwrap();
+    assert!(line.contains(r#""type":"branch""#));
+    assert!(line.contains(r#""parent_session":"parent-123""#));
+    let back: SessionEntry = serde_json::from_str(&line).unwrap();
+    match back {
+        SessionEntry::Branch {
+            parent_session,
+            parent_upto,
+            ..
+        } => {
+            assert_eq!(parent_session, "parent-123");
+            assert_eq!(parent_upto, 6);
+        }
+        _ => panic!("应为 branch 记录"),
+    }
+}

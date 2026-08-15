@@ -6,6 +6,7 @@
 
 use crate::types::{Message, Role, ToolCall};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -40,6 +41,13 @@ pub enum SessionEntry {
     },
     /// 轮次检查点（v0.1 仅落盘，恢复时忽略）
     Checkpoint { turn: usize, ts: u64 },
+    /// 分支标记（仅出现在会话文件首行）：指向父会话 + 截止消息数。
+    /// 恢复时先重建父会话前 parent_upto 条消息作为前缀，再接本会话自己的消息。
+    Branch {
+        parent_session: String,
+        parent_upto: usize,
+        ts: u64,
+    },
 }
 
 impl SessionEntry {
@@ -85,6 +93,15 @@ impl SessionEntry {
             ts: now_ts(),
         }
     }
+
+    /// 构造一条分支标记记录（写入新会话文件首行）
+    pub fn branch_marker(parent_session: &str, parent_upto: usize) -> Self {
+        Self::Branch {
+            parent_session: parent_session.to_string(),
+            parent_upto,
+            ts: now_ts(),
+        }
+    }
 }
 
 /// Role 枚举 → 字符串（持久化用）
@@ -121,18 +138,59 @@ impl Session {
     ///
     /// 崩溃安全核心：最后一行如果不完整（解析失败），丢弃它；
     /// 中间坏行同样跳过（日志 warn，历史可能被手动编辑过）。
+    /// 若首条有效记录是 Branch 分支标记，先递归重建父会话前缀再接自己的消息。
     pub fn recover(session_dir: &str, session_id: &str) -> Result<(Self, Vec<Message>), String> {
         let path = session_path(session_dir, session_id);
         if !path.exists() {
             return Err(format!("会话不存在：{session_id}"));
         }
-        let content = fs::read_to_string(&path)
-            .map_err(|e| format!("读取会话文件失败（{}）：{e}", path.display()))?;
+        let mut visited = HashSet::new();
+        let messages = Self::recover_messages(session_dir, session_id, None, &mut visited);
+
+        let file = open_append(&path)?;
+        Ok((
+            Self {
+                id: session_id.to_string(),
+                file: BufWriter::new(file),
+            },
+            messages,
+        ))
+    }
+
+    /// 递归重建消息列表（纯读，不开写句柄）。
+    ///
+    /// upto=Some(n) 时只保留重建后的前 n 条消息（按消息数计，不是行数）。
+    /// 断链（父文件不存在）或循环引用（A分B分A）时 warn 降级：前缀为空，不 panic。
+    fn recover_messages(
+        session_dir: &str,
+        session_id: &str,
+        upto: Option<usize>,
+        visited: &mut HashSet<String>,
+    ) -> Vec<Message> {
+        // 循环引用防御：重复访问即断链处理
+        if !visited.insert(session_id.to_string()) {
+            eprintln!("[session] 警告：检测到分支循环引用（{session_id}），按断链处理");
+            return Vec::new();
+        }
+        let path = session_path(session_dir, session_id);
+        if !path.exists() {
+            eprintln!("[session] 警告：父会话文件不存在（{session_id}），分支断链，仅从断点后恢复");
+            return Vec::new();
+        }
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[session] 警告：读取会话文件失败（{}）：{e}", path.display());
+                return Vec::new();
+            }
+        };
         // 剥掉 UTF-8 BOM（Windows 编辑器常见），否则首行会被当坏行丢弃
         let content = content.trim_start_matches('\u{feff}');
 
         let lines: Vec<&str> = content.lines().collect();
-        let mut messages = Vec::new();
+        let mut prefix: Vec<Message> = Vec::new();
+        let mut own: Vec<Message> = Vec::new();
+        let mut first_entry_seen = false;
         for (i, raw) in lines.iter().enumerate() {
             let line = raw.trim();
             if line.is_empty() {
@@ -147,6 +205,7 @@ impl Session {
                     tool_call_id,
                     ..
                 }) => {
+                    first_entry_seen = true;
                     let role = match role.as_str() {
                         "user" => Role::User,
                         "assistant" => Role::Assistant,
@@ -156,7 +215,7 @@ impl Session {
                             continue;
                         }
                     };
-                    messages.push(Message {
+                    own.push(Message {
                         role,
                         content,
                         tool_calls,
@@ -165,13 +224,34 @@ impl Session {
                 }
                 Ok(SessionEntry::ToolResult {
                     call_id, content, ..
-                }) => messages.push(Message {
-                    role: Role::Tool,
-                    content,
-                    tool_calls: None,
-                    tool_call_id: Some(call_id),
-                }),
+                }) => {
+                    first_entry_seen = true;
+                    own.push(Message {
+                        role: Role::Tool,
+                        content,
+                        tool_calls: None,
+                        tool_call_id: Some(call_id),
+                    });
+                }
+                Ok(SessionEntry::Branch {
+                    parent_session,
+                    parent_upto,
+                    ..
+                }) => {
+                    // 只有首条有效记录的 Branch 才作为分支标记；
+                    // 出现在中间（手动编辑/异常拼接）的忽略，避免误改语义
+                    if !first_entry_seen {
+                        first_entry_seen = true;
+                        prefix = Self::recover_messages(
+                            session_dir,
+                            &parent_session,
+                            Some(parent_upto),
+                            visited,
+                        );
+                    }
+                }
                 Ok(SessionEntry::Checkpoint { .. }) => {
+                    first_entry_seen = true;
                     // v0.1 不需要检查点，忽略
                 }
                 Err(e) => {
@@ -184,15 +264,38 @@ impl Session {
                 }
             }
         }
+        prefix.extend(own);
+        if let Some(n) = upto {
+            prefix.truncate(n);
+        }
+        prefix
+    }
 
-        let file = open_append(&path)?;
-        Ok((
-            Self {
-                id: session_id.to_string(),
-                file: BufWriter::new(file),
-            },
-            messages,
-        ))
+    /// 从已有会话分叉：新建会话文件，首行写 branch 标记。
+    /// 返回 (新Session, 继承的消息列表)。
+    /// upto=None → 取父会话全部消息；Some(n) → 前 n 条（n 超界取全部）。
+    pub fn branch(
+        session_dir: &str,
+        parent_id: &str,
+        upto: Option<usize>,
+    ) -> Result<(Self, Vec<Message>), String> {
+        let parent_path = session_path(session_dir, parent_id);
+        if !parent_path.exists() {
+            return Err(format!("父会话不存在：{parent_id}"));
+        }
+        // 重建父会话消息（含父会话自身的分支前缀），再按 upto 截断
+        let mut visited = HashSet::new();
+        let mut inherited = Self::recover_messages(session_dir, parent_id, None, &mut visited);
+        let effective_upto = match upto {
+            Some(n) if n < inherited.len() => {
+                inherited.truncate(n);
+                n
+            }
+            _ => inherited.len(),
+        };
+        let mut session = Self::create(session_dir)?;
+        session.append(&SessionEntry::branch_marker(parent_id, effective_upto))?;
+        Ok((session, inherited))
     }
 
     /// 追加一条记录。每行立即 flush（崩溃安全：断电最多丢当前行）。
@@ -211,12 +314,16 @@ impl Session {
 /// 会话摘要（sessions 列表用）
 pub struct SessionSummary {
     pub id: String,
-    /// 消息条数（message + tool_result 记录数）
+    /// 消息条数（message + tool_result 记录数，不含继承的父会话前缀）
     pub message_count: usize,
     /// 首条用户消息预览（截断）
     pub first_user_preview: String,
     /// 最后一条记录的时间戳
     pub last_ts: u64,
+    /// 分支来源：父会话 id（非分支会话为 None）
+    pub branch_from: Option<String>,
+    /// 分支截止点：继承父会话前 N 条消息
+    pub branch_upto: Option<usize>,
 }
 
 /// 列出会话目录下的所有会话摘要，按最后活跃时间倒序
@@ -243,6 +350,8 @@ pub fn list_sessions(session_dir: &str) -> Result<Vec<SessionSummary>, String> {
             message_count: 0,
             first_user_preview: String::new(),
             last_ts: 0,
+            branch_from: None,
+            branch_upto: None,
         };
         for line in content.lines() {
             let Ok(entry) = serde_json::from_str::<SessionEntry>(line.trim()) else {
@@ -266,6 +375,15 @@ pub fn list_sessions(session_dir: &str) -> Result<Vec<SessionSummary>, String> {
                     summary.last_ts = summary.last_ts.max(ts);
                 }
                 SessionEntry::Checkpoint { ts, .. } => {
+                    summary.last_ts = summary.last_ts.max(ts);
+                }
+                SessionEntry::Branch {
+                    ref parent_session,
+                    parent_upto,
+                    ts,
+                } => {
+                    summary.branch_from = Some(parent_session.clone());
+                    summary.branch_upto = Some(parent_upto);
                     summary.last_ts = summary.last_ts.max(ts);
                 }
             }
