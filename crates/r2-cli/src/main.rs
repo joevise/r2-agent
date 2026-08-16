@@ -63,9 +63,12 @@ enum Commands {
     },
     /// Web 控制台：axum + WebSocket 壳（R2 Console，浏览器打开即用）
     Web {
-        /// 监听端口（仅绑定 127.0.0.1）
+        /// 监听端口
         #[arg(long, default_value_t = 5290)]
         port: u16,
+        /// 绑定地址：默认 127.0.0.1 仅本机；手机/局域网访问用 --host 0.0.0.0
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
     },
     /// 跨会话记忆管理：list / search / delete / stats / migrate
     #[cfg(feature = "l3-memory")]
@@ -605,8 +608,8 @@ async fn main() -> MainResult<()> {
     }
 
     // web 子命令：起服务时不强制 api_key（浏览器里可先看界面，prompt 时才会用到）
-    if let Some(Commands::Web { port }) = &cli.command {
-        return web::run(config, *port).await;
+    if let Some(Commands::Web { port, host }) = &cli.command {
+        return web::run(config, *port, host.clone()).await;
     }
 
     // memory 子命令（需 l3-memory feature；只做记忆管理，不校验模型 api_key）

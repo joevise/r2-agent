@@ -114,6 +114,26 @@ textarea[readonly]{color:var(--dim)}
 #input{width:100%}
 #toast{position:fixed;top:14px;right:14px;display:none;border:1px solid var(--err);color:var(--err);background:var(--bg);padding:8px 12px;max-width:420px;z-index:9;white-space:pre-wrap}
 #offline{display:none;color:var(--err);font-size:12px}
+/* ---- 手机适配（≤768px）：侧栏变抽屉 ---- */
+#burger{display:none;background:none;border:none;color:var(--fg);font-size:18px;padding:2px 8px;cursor:pointer;line-height:1}
+#overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:5}
+@media (max-width:768px){
+  body{grid-template-columns:1fr}
+  #side{position:fixed;left:0;top:0;bottom:0;width:min(78vw,300px);z-index:6;background:var(--bg);transform:translateX(-100%);transition:transform .18s ease;border-right:1px solid var(--line)}
+  body.side-open #side{transform:translateX(0)}
+  body.side-open #overlay{display:block}
+  #burger{display:inline-block}
+  #brand{letter-spacing:1px}
+  #topbar{gap:8px;padding:0 10px;font-size:12px}
+  #usage{font-size:11px}
+  #sandbox{display:none}          /* 手机屏幕窄，沙箱详情藏到 TOOLS 面板看 */
+  #flow{padding:10px 10px}
+  #inputbar{padding:8px 10px}
+  #input{font-size:16px}          /* ≥16px 防 iOS 聚焦自动放大 */
+  .sess .ops{display:inline-flex;gap:4px;background:transparent;position:static;margin-top:2px} /* 触屏无 hover，fork/删除常显 */
+  #toast{left:10px;right:10px;max-width:none;top:8px}
+  .toolblk .tbody{max-height:240px}
+}
 </style>
 </head>
 <body>
@@ -160,6 +180,7 @@ textarea[readonly]{color:var(--dim)}
 </div>
 <div id="main">
   <div id="topbar">
+    <button id="burger" aria-label="菜单">≡</button>
     <span id="brand">R2 <span id="rundot">●</span></span>
     <span id="model" title="点击输入模型名，如 glm-5.2 / kimi-k3">—</span>
     <span class="sp"></span>
@@ -176,10 +197,23 @@ textarea[readonly]{color:var(--dim)}
     <textarea id="input" rows="1" placeholder="输入消息，Enter 发送 / Shift+Enter 换行 / 拖拽文件上传" spellcheck="false"></textarea>
   </div>
 </div>
+<div id="overlay"></div>
 <div id="toast"></div>
 <script>
 "use strict";
 const $=s=>document.querySelector(s);
+/* 手机抽屉：☰ 开关侧栏（切会话/面板后自动收起） */
+(()=>{
+  const burger=$("#burger"),ov=$("#overlay"),side=$("#side");
+  const close=()=>document.body.classList.remove("side-open");
+  burger.addEventListener("click",()=>document.body.classList.toggle("side-open"));
+  ov.addEventListener("click",close);
+  side.addEventListener("click",e=>{
+    const b=e.target.closest("button");
+    if(b&&(b.dataset.p||b.id==="btn-new"||b.closest(".sess")))
+      setTimeout(close,120);   /* 点击面板切换/新会话/会话项后收起抽屉 */
+  });
+})();
 const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 /* 单一 store */
 const store={model:"",running:false,sessions:[],tools:[],sandbox:null,current:null,

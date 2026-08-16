@@ -618,7 +618,7 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
 // ---------- 启动 ----------
 
 /// r2 web 入口：绑定 127.0.0.1（仅本机，安全默认），起 axum 服务
-pub async fn run(config: Config, port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run(config: Config, port: u16, host: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let session_dir = config::expand_tilde(&config.session.dir);
     let work_dir = config::expand_tilde(&config.agent.work_dir);
     // 没有会话目录也能起服务（首次 new_session 时 Agent 会自动建）
@@ -648,8 +648,11 @@ pub async fn run(config: Config, port: u16) -> Result<(), Box<dyn std::error::Er
         .layer(DefaultBodyLimit::max(MAX_UPLOAD + 1024 * 1024))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    println!("R2 Console → http://127.0.0.1:{port}");
+    let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
+    println!("R2 Console → http://{}:{port}", if host == "0.0.0.0" { "0.0.0.0（本机局域网IP）".to_string() } else { host.clone() });
+    if host == "0.0.0.0" {
+        println!("⚠ 已绑定 0.0.0.0：局域网内设备可访问，注意环境安全");
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }
