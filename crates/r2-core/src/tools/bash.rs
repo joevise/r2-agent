@@ -94,6 +94,34 @@ impl BashTool {
             .process_group(0)
             .kill_on_drop(true);
 
+        // strict 档：namespace 隔离（mount 假根 + pid + net 断网）。
+        // 仅在 namespace 真正可用时启用（root 或 AppArmor 未限制的 userns）；
+        // 不可用则静默走 container 档（rlimits+cgroup 仍生效），warn 由下方 apply 链体现。
+        let mut ns_warn: Option<String> = None;
+        if self.sandbox.level == crate::sandbox::SandboxLevel::Strict {
+            if crate::namespaces::can_namespace() {
+                match crate::namespaces::prepare_min_root(&self.work_dir) {
+                    Ok(root) => unsafe {
+                        crate::namespaces::install_sandbox_pre_exec(
+                            cmd.as_std_mut(),
+                            root,
+                            self.work_dir.clone(),
+                        );
+                    },
+                    Err(e) => {
+                        ns_warn = Some(format!(
+                            "WARN: strict 最小根准备失败，降级 container：{e}"
+                        ));
+                    }
+                }
+            } else {
+                ns_warn = Some(
+                    "WARN: 本机 namespace 不可用（非 root 且 AppArmor 限制 unprivileged userns），strict 降级 container"
+                        .to_string(),
+                );
+            }
+        }
+
         let warn = if use_seccomp {
             self.sandbox.apply(&mut cmd, &self.work_dir)
         } else {
@@ -115,6 +143,11 @@ impl BashTool {
             None
         };
         let warn = match (warn, cgroup_warn) {
+            (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        };
+        let warn = match (ns_warn, warn) {
             (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
             (Some(a), None) => Some(a),
             (None, b) => b,

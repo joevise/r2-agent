@@ -38,6 +38,7 @@ pub mod mcp;
 pub mod memory;
 pub mod model;
 pub mod models;
+pub mod namespaces;
 pub mod rpc;
 pub mod sandbox;
 pub mod session;
