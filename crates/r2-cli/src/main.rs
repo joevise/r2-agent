@@ -1,3 +1,5 @@
+mod web;
+
 use clap::{Parser, Subcommand};
 use r2_core::config::{self, apply_overrides, Config};
 use r2_core::rpc::{self, RpcOutcome, RpcServer};
@@ -58,6 +60,12 @@ enum Commands {
         /// 额外显示每模型的 API 端点与订阅计划说明
         #[arg(long)]
         verbose: bool,
+    },
+    /// Web 控制台：axum + WebSocket 壳（R2 Console，浏览器打开即用）
+    Web {
+        /// 监听端口（仅绑定 127.0.0.1）
+        #[arg(long, default_value_t = 5290)]
+        port: u16,
     },
     /// 跨会话记忆管理：list / search / delete / stats / migrate
     #[cfg(feature = "l3-memory")]
@@ -594,6 +602,11 @@ async fn main() -> MainResult<()> {
     if let Some(Commands::Models { verbose }) = &cli.command {
         print_models(*verbose);
         return Ok(());
+    }
+
+    // web 子命令：起服务时不强制 api_key（浏览器里可先看界面，prompt 时才会用到）
+    if let Some(Commands::Web { port }) = &cli.command {
+        return web::run(config, *port).await;
     }
 
     // memory 子命令（需 l3-memory feature；只做记忆管理，不校验模型 api_key）

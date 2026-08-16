@@ -66,7 +66,9 @@ fn read_layer(path: &str) -> Option<String> {
 
 /// 组装三层 system prompt（见 docs/web-harness-plan.md 第三节）：
 /// 内核核心（不可覆盖）+ config 自定义（显式覆盖，优先）或 SOUL.md + AGENTS.md
-pub(crate) fn build_system_prompt(config: &Config) -> (String, PromptSections) {
+/// 组装三层 system prompt（核心 + SOUL.md + AGENTS.md，可被 config.system_prompt 覆盖）。
+/// 返回 (全文, 分段)；web 壳用分段做 PROMPT 面板展示。
+pub fn build_system_prompt(config: &Config) -> (String, PromptSections) {
     let home = std::env::var("HOME").unwrap_or_default();
     build_system_prompt_with_home(config, &home)
 }

@@ -73,8 +73,8 @@ pub fn error_line(id: Option<u64>, code: i64, message: &str) -> String {
     .to_string()
 }
 
-/// AgentEvent → 通知行（无 id）
-pub fn event_notification(event: &AgentEvent) -> String {
+/// AgentEvent → {"type": ..., "data": ...}（web 壳直接复用，包进 {"t":"event","evt":...}）
+pub fn event_json(event: &AgentEvent) -> Value {
     let (event_type, data) = match event {
         AgentEvent::AgentStart => ("agent_start", json!({})),
         AgentEvent::MessageUpdate(text) => ("message_update", json!({"text": text})),
@@ -93,10 +93,16 @@ pub fn event_notification(event: &AgentEvent) -> String {
         })),
         AgentEvent::Error(message) => ("error", json!({"message": message})),
     };
+    json!({"type": event_type, "data": data})
+}
+
+/// AgentEvent → 通知行（无 id）
+pub fn event_notification(event: &AgentEvent) -> String {
+    let evt = event_json(event);
     json!({
         "jsonrpc": "2.0",
         "method": "event",
-        "params": {"type": event_type, "data": data},
+        "params": evt,
     })
     .to_string()
 }
