@@ -12,7 +12,97 @@ use crate::types::{Role, StreamChunk, UsageStats};
 use futures_util::StreamExt;
 use std::io::Write;
 
-const SYSTEM_PROMPT: &str = "你是 R2，一个极简但可靠的 Rust Agent。";
+pub(crate) const SYSTEM_PROMPT: &str = "你是 R2，一个极简但可靠的 Rust Agent。";
+
+/// 工具使用规范补充段：既定行为说明，跟随内核核心（不可覆盖）
+const TOOL_USAGE_RULES: &str = "\
+工具使用规范：
+- 文件路径优先用相对 work_dir 的相对路径；不越出 work_dir 读写，除非用户明确要求。
+- bash 命令有超时限制（默认 30 秒），长任务请拆分执行。
+- 工具输出可能被截断，关键信息缺失时用更精确的范围重读。
+- 执行有副作用的命令前，先向用户说明影响。
+- 失败的输出也是信息：按错误提示调整策略，不要盲目重试。";
+
+/// 单个人格/上下文文件的最大读取量：超过即截断，防撑爆上下文
+const MAX_LAYER_BYTES: usize = 64 * 1024;
+
+/// system prompt 分层结果（壳展示用）：core 恒有，其余层按命中情况填充
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromptSections {
+    pub core: String,
+    pub soul: Option<String>,
+    pub agents: Option<String>,
+    pub custom: Option<String>,
+}
+
+/// 用给定 home 展开路径开头的 ~（测试可注入假 home，隔离真实 ~/.r2）
+fn expand_with_home(path: &str, home: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else if path == "~" {
+        home.to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+/// 读取一个人格/上下文文件：不存在/读失败/全空白 → None；超 64KB 截断并加提示
+fn read_layer(path: &str) -> Option<String> {
+    let mut content = std::fs::read_to_string(path).ok()?;
+    if content.trim().is_empty() {
+        return None;
+    }
+    if content.len() > MAX_LAYER_BYTES {
+        // 退到最近的 UTF-8 字符边界再截断，避免切坏多字节字符
+        let mut end = MAX_LAYER_BYTES;
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        content.truncate(end);
+        content.push_str("\n…（文件超过 64KB，已截断）");
+    }
+    Some(content)
+}
+
+/// 组装三层 system prompt（见 docs/web-harness-plan.md 第三节）：
+/// 内核核心（不可覆盖）+ config 自定义（显式覆盖，优先）或 SOUL.md + AGENTS.md
+pub(crate) fn build_system_prompt(config: &Config) -> (String, PromptSections) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    build_system_prompt_with_home(config, &home)
+}
+
+fn build_system_prompt_with_home(config: &Config, home: &str) -> (String, PromptSections) {
+    let core = format!("{SYSTEM_PROMPT}\n\n{TOOL_USAGE_RULES}");
+    let mut full = core.clone();
+    let mut sections = PromptSections {
+        core,
+        soul: None,
+        agents: None,
+        custom: None,
+    };
+
+    // config [agent] system_prompt 非空：显式覆盖，SOUL / AGENTS 两层跳过
+    let custom = config.agent.system_prompt.trim();
+    if !custom.is_empty() {
+        full.push_str("\n\n[自定义配置]\n");
+        full.push_str(custom);
+        sections.custom = Some(custom.to_string());
+        return (full, sections);
+    }
+
+    if let Some(soul) = read_layer(&expand_with_home("~/.r2/SOUL.md", home)) {
+        full.push_str("\n\n[SOUL.md 全局人格]\n");
+        full.push_str(&soul);
+        sections.soul = Some(soul);
+    }
+    let work_dir = expand_with_home(&config.agent.work_dir, home);
+    if let Some(agents) = read_layer(&format!("{work_dir}/AGENTS.md")) {
+        full.push_str("\n\n[AGENTS.md 项目上下文]\n");
+        full.push_str(&agents);
+        sections.agents = Some(agents);
+    }
+    (full, sections)
+}
 
 /// R2 Agent：Provider + L1 上下文 + 工具注册表 + 配置 + 会话持久化
 pub struct Agent {
@@ -36,6 +126,8 @@ pub struct Agent {
     quiet: bool,
     /// 会话生命周期的累计用量统计
     usage: UsageStats,
+    /// 组装好的三层 system prompt 全文（壳展示用 effective_system_prompt）
+    system_prompt: String,
 }
 
 impl Agent {
@@ -47,7 +139,8 @@ impl Agent {
         config.resolve_auto_budget();
         let provider = create_provider(&config)?;
         let max_tokens = config.agent.max_total_tokens;
-        let context = ContextManager::new(SYSTEM_PROMPT, max_tokens, config.context.l1_threshold);
+        let (system_prompt, _sections) = build_system_prompt(&config);
+        let context = ContextManager::new(&system_prompt, max_tokens, config.context.l1_threshold);
         let mut tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         tools.connect_mcp(&config.mcp);
@@ -68,6 +161,7 @@ impl Agent {
             steer_rx: None,
             quiet: false,
             usage: UsageStats::default(),
+            system_prompt,
         })
     }
 
@@ -85,8 +179,9 @@ impl Agent {
         // 累计用量一并恢复（取 JSONL 里最后一条 usage 快照）
         let usage = Session::recover_usage(&session_dir, session_id);
         let count = messages.len();
+        let (system_prompt, _sections) = build_system_prompt(&config);
         let context = ContextManager::from_messages(
-            SYSTEM_PROMPT,
+            &system_prompt,
             messages,
             max_tokens,
             config.context.l1_threshold,
@@ -111,6 +206,7 @@ impl Agent {
             steer_rx: None,
             quiet: false,
             usage,
+            system_prompt,
         })
     }
 
@@ -130,8 +226,9 @@ impl Agent {
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         let count = messages.len();
         let new_id = session.id().to_string();
+        let (system_prompt, _sections) = build_system_prompt(&config);
         let context = ContextManager::from_messages(
-            SYSTEM_PROMPT,
+            &system_prompt,
             messages,
             max_tokens,
             config.context.l1_threshold,
@@ -157,6 +254,7 @@ impl Agent {
             quiet: false,
             // 分支会话的用量从头累计（不继承父会话的用量快照）
             usage: UsageStats::default(),
+            system_prompt,
         })
     }
 
@@ -237,7 +335,7 @@ impl Agent {
         self.session =
             Session::create(&crate::config::expand_tilde(&self.config.session.dir)).ok();
         self.context = ContextManager::new(
-            SYSTEM_PROMPT,
+            &self.system_prompt,
             self.config.agent.max_total_tokens,
             self.config.context.l1_threshold,
         );
@@ -248,6 +346,11 @@ impl Agent {
     /// 当前会话的累计用量统计
     pub fn usage(&self) -> &UsageStats {
         &self.usage
+    }
+
+    /// 组装好的三层 system prompt 全文（壳展示用）
+    pub fn effective_system_prompt(&self) -> &str {
+        &self.system_prompt
     }
 
     /// 追加会话记录；失败只告警不中断主流程
@@ -687,6 +790,8 @@ mod tests {
     fn test_agent(tmp: &tempfile::TempDir, gate: tokio::sync::watch::Receiver<bool>) -> Agent {
         let mut config = Config::default_config();
         config.session.dir = tmp.path().to_string_lossy().to_string();
+        // work_dir 也指向临时目录：避免拾取仓库根 AGENTS.md 污染 system prompt 相关断言
+        config.agent.work_dir = tmp.path().to_string_lossy().to_string();
         let mut agent = Agent::new(config).unwrap();
         agent.set_provider(Box::new(MockProvider {
             gate,
@@ -807,6 +912,117 @@ mod tests {
         let mut config = Config::default_config();
         config.model.provider = "unknown".to_string();
         assert!(Agent::new(config).is_err());
+    }
+
+    /// 造一个 work_dir 指向临时目录的配置，home 用另一个临时目录隔离真实 ~/.r2
+    fn prompt_fixture() -> (tempfile::TempDir, tempfile::TempDir, Config) {
+        let home = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let mut config = Config::default_config();
+        config.agent.work_dir = work.path().to_string_lossy().to_string();
+        (home, work, config)
+    }
+
+    #[test]
+    fn test_prompt_core_only() {
+        // 无 SOUL / AGENTS / 自定义配置 → 只有内核核心段
+        let (home, _work, config) = prompt_fixture();
+        let (full, sections) = build_system_prompt_with_home(&config, &home.path().to_string_lossy());
+        assert!(full.starts_with(SYSTEM_PROMPT));
+        assert!(full.contains("工具使用规范"));
+        assert!(!full.contains("[SOUL.md"));
+        assert!(!full.contains("[AGENTS.md"));
+        assert!(!full.contains("[自定义配置]"));
+        assert_eq!(full, sections.core);
+        assert!(sections.soul.is_none() && sections.agents.is_none() && sections.custom.is_none());
+    }
+
+    #[test]
+    fn test_prompt_with_soul() {
+        let (home, _work, config) = prompt_fixture();
+        std::fs::create_dir_all(home.path().join(".r2")).unwrap();
+        std::fs::write(home.path().join(".r2/SOUL.md"), "温和而坚定").unwrap();
+        let (full, sections) = build_system_prompt_with_home(&config, &home.path().to_string_lossy());
+        assert!(full.contains("[SOUL.md 全局人格]\n温和而坚定"));
+        assert_eq!(sections.soul.as_deref(), Some("温和而坚定"));
+        assert!(sections.agents.is_none());
+    }
+
+    #[test]
+    fn test_prompt_with_agents() {
+        let (home, work, config) = prompt_fixture();
+        std::fs::write(work.path().join("AGENTS.md"), "本项目用 Rust").unwrap();
+        let (full, sections) = build_system_prompt_with_home(&config, &home.path().to_string_lossy());
+        assert!(full.contains("[AGENTS.md 项目上下文]\n本项目用 Rust"));
+        assert_eq!(sections.agents.as_deref(), Some("本项目用 Rust"));
+        assert!(sections.soul.is_none());
+    }
+
+    #[test]
+    fn test_prompt_soul_then_agents_order() {
+        // 两层都有：SOUL 在前，AGENTS 在后
+        let (home, work, config) = prompt_fixture();
+        std::fs::create_dir_all(home.path().join(".r2")).unwrap();
+        std::fs::write(home.path().join(".r2/SOUL.md"), "人格").unwrap();
+        std::fs::write(work.path().join("AGENTS.md"), "项目").unwrap();
+        let (full, _) = build_system_prompt_with_home(&config, &home.path().to_string_lossy());
+        let i_soul = full.find("[SOUL.md 全局人格]").unwrap();
+        let i_agents = full.find("[AGENTS.md 项目上下文]").unwrap();
+        assert!(i_soul < i_agents, "SOUL 段应在 AGENTS 段之前：{full}");
+    }
+
+    #[test]
+    fn test_prompt_custom_overrides_layers() {
+        // system_prompt 配置非空：只留 核心+[自定义配置]，SOUL/AGENTS 被跳过
+        let (home, work, mut config) = prompt_fixture();
+        std::fs::create_dir_all(home.path().join(".r2")).unwrap();
+        std::fs::write(home.path().join(".r2/SOUL.md"), "人格").unwrap();
+        std::fs::write(work.path().join("AGENTS.md"), "项目").unwrap();
+        config.agent.system_prompt = "只听我\u{7684}".to_string();
+        let (full, sections) = build_system_prompt_with_home(&config, &home.path().to_string_lossy());
+        assert!(full.contains("[自定义配置]\n只听我\u{7684}"));
+        assert!(!full.contains("[SOUL.md"));
+        assert!(!full.contains("[AGENTS.md"));
+        assert_eq!(sections.custom.as_deref(), Some("只听我\u{7684}"));
+        assert!(sections.soul.is_none() && sections.agents.is_none());
+    }
+
+    #[test]
+    fn test_prompt_layer_truncated_at_64kb() {
+        // 超过 64KB 的文件截断并带提示
+        let (home, work, config) = prompt_fixture();
+        std::fs::write(work.path().join("AGENTS.md"), "a".repeat(100 * 1024)).unwrap();
+        let (full, sections) = build_system_prompt_with_home(&config, &home.path().to_string_lossy());
+        let agents = sections.agents.expect("应有 AGENTS 段");
+        assert!(agents.len() <= MAX_LAYER_BYTES + 64, "截断后超长：{}", agents.len());
+        assert!(agents.ends_with("已截断）"));
+        assert!(full.len() < sections.core.len() + MAX_LAYER_BYTES + 128);
+    }
+
+    #[test]
+    fn test_prompt_work_dir_tilde_expand() {
+        // work_dir = "~/proj" 时用注入的 home 展开并读到 AGENTS.md
+        let (home, _work, mut config) = prompt_fixture();
+        config.agent.work_dir = "~/proj".to_string();
+        std::fs::create_dir_all(home.path().join("proj")).unwrap();
+        std::fs::write(home.path().join("proj/AGENTS.md"), "家目录项目").unwrap();
+        let (full, sections) = build_system_prompt_with_home(&config, &home.path().to_string_lossy());
+        assert!(full.contains("家目录项目"));
+        assert!(sections.agents.is_some());
+        // 纯函数自身的展开行为
+        assert_eq!(expand_with_home("~/x", "/h"), "/h/x");
+        assert_eq!(expand_with_home("~", "/h"), "/h");
+        assert_eq!(expand_with_home("./rel", "/h"), "./rel");
+    }
+
+    #[test]
+    fn test_agent_effective_system_prompt() {
+        // Agent 构造后可通过访问器拿到拼好的全文
+        let tmp = tempfile::tempdir().unwrap();
+        let (_gate_tx, gate_rx) = tokio::sync::watch::channel(true);
+        let agent = test_agent(&tmp, gate_rx);
+        assert!(agent.effective_system_prompt().starts_with(SYSTEM_PROMPT));
+        assert!(agent.effective_system_prompt().contains("工具使用规范"));
     }
 
     #[test]

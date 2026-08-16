@@ -82,6 +82,9 @@ pub struct AgentConfig {
     /// 工作目录
     #[serde(default = "default_work_dir")]
     pub work_dir: String,
+    /// 自定义 system prompt：非空时显式覆盖 SOUL.md / AGENTS.md 两层（默认空）
+    #[serde(default)]
+    pub system_prompt: String,
 }
 
 /// 上下文管理配置
@@ -277,6 +280,7 @@ impl Default for AgentConfig {
             max_turns: default_max_turns(),
             max_total_tokens: default_max_total_tokens(),
             work_dir: default_work_dir(),
+            system_prompt: String::new(),
         }
     }
 }
