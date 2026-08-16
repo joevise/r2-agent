@@ -2,7 +2,7 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <title>R2 Console</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -14,7 +14,7 @@
 html,body{height:100%}
 body{
   background:var(--bg);color:var(--fg);font:13px/1.55 var(--mono);
-  display:grid;grid-template-columns:260px 1fr;height:100vh;overflow:hidden;
+  display:grid;grid-template-columns:260px 1fr;height:100vh;height:100dvh;overflow:hidden;
 }
 ::-webkit-scrollbar{width:8px;height:8px}
 ::-webkit-scrollbar-thumb{background:var(--line)}
@@ -213,6 +213,23 @@ const $=s=>document.querySelector(s);
     if(b&&(b.dataset.p||b.id==="btn-new"||b.closest(".sess")))
       setTimeout(close,120);   /* 点击面板切换/新会话/会话项后收起抽屉 */
   });
+})();
+/* 视口自适应：软键盘弹出/地址栏收度时动态调 body 高度（iOS Safari 与旧安卓兼容 dvh 缺失） */
+(()=>{
+  const fit=()=>{
+    if(window.visualViewport){
+      document.body.style.height=window.visualViewport.height+"px";
+      /* 键盘弹出时保持输入框可见：消息流滚到底 */
+      const f=$("#flow"); if(f) f.scrollTop=f.scrollHeight;
+    }
+  };
+  if(window.visualViewport){
+    window.visualViewport.addEventListener("resize",fit);
+    window.addEventListener("orientationchange",()=>setTimeout(fit,150));
+    fit();
+  }
+  const inp=$("#input");
+  inp.addEventListener("focus",()=>setTimeout(fit,250));  /* iOS 键盘弹出动效后再校一次 */
 })();
 const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 /* 单一 store */
