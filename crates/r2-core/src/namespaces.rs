@@ -1,11 +1,21 @@
-//! 进程内 namespace 隔离（strict 沙箱档）
+//! 进程内 namespace 隔离（strict 沙箱档）— 双 fork 版（v0.5.2）
 //!
-//! mount ns（chroot 最小根目录）+ pid ns + net ns（断网）。
-//! 无 root 时通过 user namespace 前置获得 mount/pid/net 能力。
+//! mount ns（chroot 最小根）+ pid ns + net ns（断网）。
+//! 无 root 时通过 user namespace 前置获得 mount/pid/net 能力
+//! （AppArmor 限制的环境由 can_namespace() 诚实探测并降级）。
 //!
-//! v0.5 采用 chroot（pivot_root 是后续增强）：
-//! bash 在最小根内只能看到 bin/dev/proc/tmp/work，
-//! ~/.ssh、/etc 等宿主路径在该视图中不存在（结构性不可见，非权限拦截）。
+//! ## 为什么必须双 fork（v0.5.0 单 fork 的教训）
+//!
+//! `unshare(CLONE_NEWPID)` 只对**之后 fork 出的子进程**生效，对调用者自身无效。
+//! 单 fork 时 exec 出的 sh 仍活在宿主 PID 视图——此时挂 /proc 会暴露宿主进程
+//! 列表，`/proc/1/root` 更是经典 chroot 逃逸面（v0.5.0 实测发现，故当时禁挂
+//! /proc，ps 不可用）。双 fork 让 sh「出生」在新 PID 空间（成为其中的 PID 1），
+//! 由它挂 /proc——挂载者的 active pid ns 即新空间，只含沙箱进程。
+//!
+//! 附赠性质：
+//! - **ps/top 复活**：沙箱内 /proc 可用，且只见沙箱自身进程（宿主进程不可见）
+//! - **内核级清理**：PID 1（sh）死亡 → 内核回收整个 PID 空间，零僵尸
+//! - **退出码传播**：中间进程 waitpid 孙进程后 _exit 同码（信号 → 128+sig）
 
 use std::ffi::CString;
 use std::io::Read;
@@ -27,20 +37,16 @@ const OUTPUT_LIMIT: usize = 64 * 1024;
 /// 2. 非 root 但 AppArmor 未限制 → userns 路径可用
 /// 3. 非 root 且 AppArmor 限制（Ubuntu 默认）→ 不可用，须降级
 pub fn can_namespace() -> bool {
-    // root 直接可用
     if unsafe { libc::geteuid() } == 0 {
         return true;
     }
-    // AppArmor 限制探测（Ubuntu 23.10+）
     if let Ok(v) = std::fs::read_to_string(
         "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
     ) {
         if v.trim() == "1" {
-            // 被限制——userns 是空壳，mount/pid/net 建不出来
             return false;
         }
     }
-    // 其余情况：uid_map 存在即认为可（保守）
     std::fs::read_to_string("/proc/self/uid_map")
         .map(|m| !m.trim().is_empty())
         .unwrap_or(false)
@@ -58,12 +64,12 @@ pub fn find_busybox() -> Option<PathBuf> {
 
 /// 准备最小根目录 {work_dir}/.sandbox-root/
 ///
-/// 结构：bin/{busybox,sh,bash,...} dev/{null,...} tmp/ proc/ work/
+/// 结构：bin/{busybox,sh,...} dev/{null,...} tmp/ proc/ work/
 /// - busybox 缺失 → Err（调用方降级并提示安装 busybox-static）
 /// - mknod 失败 → 跳过（非致命）
 pub fn prepare_min_root(work_dir: &Path) -> Result<PathBuf, String> {
-    let busybox =
-        find_busybox().ok_or("未找到 busybox（strict 档需要）。Ubuntu: apt install busybox-static")?;
+    let busybox = find_busybox()
+        .ok_or("未找到 busybox（strict 档需要）。Ubuntu: apt install busybox-static")?;
     let root = work_dir.join(".sandbox-root");
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("bin"))
@@ -72,17 +78,15 @@ pub fn prepare_min_root(work_dir: &Path) -> Result<PathBuf, String> {
     let _ = std::fs::create_dir_all(root.join("proc"));
     let _ = std::fs::create_dir_all(root.join("work"));
     let _ = std::fs::create_dir_all(root.join("dev"));
-    // 拷贝 busybox（拷贝而非 bind：chroot 后仍可用）
     std::fs::copy(&busybox, root.join("bin/busybox"))
         .map_err(|e| format!("拷贝 busybox 失败：{e}"))?;
-    // busybox 多调用符号链接
     for link in [
-        "sh", "bash", "ls", "cat", "ps", "mount", "umount", "echo", "sleep", "env", "grep",
-        "find", "head", "tail", "wc", "mkdir", "rm", "cp", "mv", "touch", "true", "false",
+        "sh", "bash", "ls", "cat", "ps", "top", "mount", "umount", "echo", "sleep", "env",
+        "grep", "find", "head", "tail", "wc", "mkdir", "rm", "cp", "mv", "touch", "true",
+        "false",
     ] {
         let _ = symlink("busybox", root.join("bin").join(link));
     }
-    // dev 设备节点（尽力而为；user ns 内 mknod 受限时部分失败可接受）
     for (name, major, minor) in
         [("null", 1u32, 3u32), ("zero", 1, 5), ("random", 1, 8), ("urandom", 1, 9)]
     {
@@ -101,95 +105,25 @@ pub fn prepare_min_root(work_dir: &Path) -> Result<PathBuf, String> {
 }
 
 /// 在 namespace 沙箱内执行命令，返回 (exit_code, 合并输出)。
-///
-/// pre_exec 顺序（exec 前，子进程上下文）：
-/// 1. 无 root：unshare(CLONE_NEWUSER) → setgroups=deny → uid_map/gid_map 映射自身
-/// 2. unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET)（net 无配置=断网；pid 对 exec 后自身生效=PID1）
-/// 3. mount proc → root/proc；bind work_dir → root/work
-/// 4. chroot(root) + chdir("/")
-/// 5. exec /bin/sh -c cmd（宿主路径，chroot 前解析）
+/// 测试/独立调用入口；bash 工具走 install_sandbox_pre_exec（同一核心）。
 pub fn exec_in_sandbox(cmd: &str, work_dir: &Path) -> Result<(i32, String), String> {
-    use std::os::unix::process::CommandExt;
-
     let root = prepare_min_root(work_dir)?;
-    let root_s = root.to_string_lossy().into_owned();
-    let work_s = work_dir.to_string_lossy().into_owned();
-
-    let is_root = unsafe { libc::geteuid() } == 0;
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
-
     let mut command = std::process::Command::new("/bin/sh");
     command
         .arg("-c")
         .arg(cmd)
-        .current_dir(work_dir)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     unsafe {
-        command.pre_exec(move || {
-            // 1) user namespace 前置（无 root）
-            if !is_root {
-                if libc::unshare(libc::CLONE_NEWUSER) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let _ = std::fs::write("/proc/self/setgroups", b"deny");
-                let uid_line = format!("0 {uid} 1\n");
-                let gid_line = format!("0 {gid} 1\n");
-                std::fs::write("/proc/self/uid_map", &uid_line)
-                    .map_err(|e| std::io::Error::other(format!("uid_map: {e}")))?;
-                std::fs::write("/proc/self/gid_map", &gid_line)
-                    .map_err(|e| std::io::Error::other(format!("gid_map: {e}")))?;
-            }
-            // 2) mount + pid + net namespace
-            if libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWNET) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // 3) work bind（注意：**不挂 /proc**）
-            // 为什么不挂：unshare(CLONE_NEWPID) 不改变当前进程的 pid ns（只影响
-            // 之后 fork 的子进程），而 procfs 内容取决于挂载者的 active pid ns——
-            // 此处挂的 /proc 仍反映宿主进程列表，/proc/1/root 更是经典 chroot
-            // 逃逸面。正确解法是双 fork（孙进程 exec 时才在新 pid ns 内成为 PID 1），
-            // v0.5.1 重构。当前诚实取舍：ns 内 /proc 为空目录，ps/top 不可用。
-            let zero: *const libc::c_void = std::ptr::null();
-            let work_dst = CString::new(format!("{root_s}/work")).unwrap();
-            let work_src = CString::new(work_s.as_str()).unwrap();
-            if libc::mount(
-                work_src.as_ptr(),
-                work_dst.as_ptr(),
-                std::ptr::null(),
-                libc::MS_BIND | libc::MS_REC,
-                zero,
-            ) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // 4) chroot + chdir("/")
-            let root_c = CString::new(root_s.as_str()).unwrap();
-            if libc::chroot(root_c.as_ptr()) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let slash = CString::new("/").unwrap();
-            if libc::chdir(slash.as_ptr()) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        install_sandbox_pre_exec(&mut command, root, work_dir.to_path_buf(), cmd);
     }
-    // env：chroot 后 PATH=/bin（busybox 链接）
-    command.env_clear();
-    command.env("PATH", "/bin");
-    command.env("HOME", "/");
-
     let mut child = command
         .spawn()
-        .map_err(|e| format!("沙箱进程启动失败：{e}（pre_exec 的 ns/chroot 阶段失败常见于权限，可降级 container 档）"))?;
-    let mut out_pipe = child.stdout.take();
-    let mut err_pipe = child.stderr.take();
+        .map_err(|e| format!("沙箱进程启动失败：{e}（ns/chroot 阶段失败常见于权限，可降级 container 档）"))?;
     let mut out = String::new();
     let mut buf = [0u8; 4096];
-    // 两管道轮询读：任一有数据就收；用 would-block 模拟非阻塞太复杂，
-    // 直接先读完 stdout 再读 stderr（bash 场景输出顺序无强要求）
-    if let Some(p) = out_pipe.as_mut() {
+    if let Some(p) = child.stdout.as_mut() {
         while out.len() < OUTPUT_LIMIT {
             match p.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -197,7 +131,7 @@ pub fn exec_in_sandbox(cmd: &str, work_dir: &Path) -> Result<(i32, String), Stri
             }
         }
     }
-    if let Some(p) = err_pipe.as_mut() {
+    if let Some(p) = child.stderr.as_mut() {
         while out.len() < OUTPUT_LIMIT {
             match p.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -213,6 +147,222 @@ pub fn exec_in_sandbox(cmd: &str, work_dir: &Path) -> Result<(i32, String), Stri
     let code = status.code().unwrap_or(-1);
     out.push_str(&format!("\nexit_code={code}\n"));
     Ok((code, out))
+}
+
+/// 双 fork 链的全部预构建参数（fork 前分配完毕，闭包内零 malloc——
+/// pre_exec 上下文要求 async-signal-safe，避免 fork 的 malloc 死锁风险）
+struct NsPrebuilt {
+    root: CString,
+    work_src: CString,
+    work_dst: CString,
+    proc_dst: CString,
+    proc_fs: CString,
+    work_in_root: CString,
+    slash: CString,
+    uid_map: String,
+    gid_map: String,
+    is_root: bool,
+    /// execve 的正确形态：NULL 结尾的指针数组（指向下方 CString 的堆数据）。
+    /// 经典陷阱：Vec<CString> 的 as_ptr() 是结构体数组指针（{ptr,len,cap}×N），
+    /// 不是 char** ——直接传给 execve 会读到垃圾指针 → ENOENT → 127。
+    /// CString 堆数据不随 Vec move 失效，fork 前构建一次即安全。
+    argv_c: Vec<CString>,
+    envp_c: Vec<CString>,
+    /// 指针以 usize 携带（裸指针非 Send/Sync，闭包边界过不去；
+    /// 仅在 fork 出的子进程内转回指针并解引用，无跨线程语义）
+    argv_ptrs: Vec<usize>,
+    envp_ptrs: Vec<usize>,
+}
+
+/// 双 fork 沙箱链的执行核心：在 pre_exec 上下文（fork 后、exec 前）调用。
+///
+/// 进程树（成功路径）：
+///   r2 → std fork(中间进程) ── unshare(user?) + MS_PRIVATE + unshare(ns|pid|net)
+///        │                     + bind work→{root}/work
+///        └─ libc fork(孙进程 = 新 PID ns 内 PID 1)
+///             mount proc → {root}/proc（挂载者在新 ns → 只含沙箱进程）
+///             chroot(root) + chdir("/work") + execve sh -c <命令>
+///        中间进程：waitpid(孙) → _exit 传播退出码（信号 → 128+sig）
+///
+/// 挂载私有化（MS_REC|MS_PRIVATE on /）：unshare(NEWNS) 后挂载树仍是宿主的
+/// 共享副本，不锁私有则我们的 bind/proc 挂载可能**回传宿主**（systemd 环境
+/// / 默认 shared）。这是 bubblewrap 等工具的标准做法。
+///
+/// 退出码约定（fork 后的错误无法返回 std，以码表达）：
+///   125=挂载/等待失败，126=chroot/chdir 失败，
+///   160+errno=execve 失败诊断（162=ENOENT 173=EACCES 174=EFAULT 168=ENOEXEC）
+///
+/// # Safety
+/// 运行于 fork 后的子进程上下文，仅调用 libc 原语与预构建 C 字符串；
+/// uid_map/gid_map 的 fs::write 非 async-signal-safe，仅非 root 路径使用
+/// （该路径在 AppArmor 环境被 can_namespace 拦截，实际仅无限制环境到达）。
+unsafe fn double_fork_ns_exec(pre: &NsPrebuilt) -> std::io::Result<()> {
+    // 1) user namespace 前置（无 root 时获得 mount/pid/net 能力）
+    if !pre.is_root {
+        if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // setgroups deny 必须先于 gid_map（内核写入顺序规则）
+        let _ = std::fs::write("/proc/self/setgroups", b"deny");
+        std::fs::write("/proc/self/uid_map", pre.uid_map.as_bytes())
+            .map_err(|e| std::io::Error::other(format!("uid_map: {e}")))?;
+        std::fs::write("/proc/self/gid_map", pre.gid_map.as_bytes())
+            .map_err(|e| std::io::Error::other(format!("gid_map: {e}")))?;
+    }
+    // 2) mount + pid + net 三件套（net ns 新建后无任何网卡 → 天然断网）
+    if libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWNET) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // 3) 挂载传播锁私有：防止沙箱内挂载回传宿主 mount ns
+    if libc::mount(
+        std::ptr::null(),
+        pre.slash.as_ptr(),
+        std::ptr::null(),
+        libc::MS_REC | libc::MS_PRIVATE,
+        std::ptr::null(),
+    ) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // 4) bind work_dir → {root}/work（chroot 前做：源路径此刻仍在完整视图内）
+    if libc::mount(
+        pre.work_src.as_ptr(),
+        pre.work_dst.as_ptr(),
+        std::ptr::null(),
+        libc::MS_BIND | libc::MS_REC,
+        std::ptr::null(),
+    ) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // 5) 双 fork：孙进程出生在新 PID ns
+    let pid = libc::fork();
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if pid == 0 {
+        // ── 孙进程（新 PID ns 内 PID 1）──
+        // 挂 /proc：挂载者的 active pid ns = 新空间 → 只显示沙箱进程；
+        // /proc/1 = sh 自身（cmdline 是沙箱命令），宿主进程结构性不可见
+        if libc::mount(
+            pre.proc_fs.as_ptr(),
+            pre.proc_dst.as_ptr(),
+            pre.proc_fs.as_ptr(),
+            0,
+            std::ptr::null(),
+        ) != 0 {
+            libc::_exit(125);
+        }
+        if libc::chroot(pre.root.as_ptr()) != 0 {
+            libc::_exit(126);
+        }
+        // 相对路径 → 真实工作目录（bind 在 /work）
+        if libc::chdir(pre.work_in_root.as_ptr()) != 0 {
+            libc::_exit(126);
+        }
+        libc::execve(
+            pre.argv_ptrs[0] as *const libc::c_char,
+            pre.argv_ptrs.as_ptr() as *const *const libc::c_char,
+            pre.envp_ptrs.as_ptr() as *const *const libc::c_char,
+        );
+        // execve 失败：160+errno 编码诊断（ENOENT=162 EACCES=173 EFAULT=174 ...）
+        let e = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(90);
+        libc::_exit(160 + e.min(90) as i32);
+    }
+    // ── 中间进程（保姆）：等孙进程并传播退出码 ──
+    // 注：rlimits/seccomp 由更早的 pre_exec 闭包设好（bash.rs 装闭包顺序：
+    // 先 apply 后 ns），经 fork 继承给孙进程。
+    let mut status: libc::c_int = 0;
+    loop {
+        let r = libc::waitpid(pid, &mut status, 0);
+        if r == pid {
+            break;
+        }
+        if r < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            libc::_exit(125);
+        }
+    }
+    if libc::WIFEXITED(status) {
+        libc::_exit(libc::WEXITSTATUS(status));
+    }
+    if libc::WIFSIGNALED(status) {
+        // 信号死亡 → 128+sig（shell 惯例），std 侧 code() 可读
+        libc::_exit(128 + libc::WTERMSIG(status));
+    }
+    libc::_exit(125);
+}
+
+/// 为进程 Command 安装双 fork namespace 沙箱（strict 档 bash 用）。
+///
+/// **闭包顺序约定（关键）**：本函数装的闭包在成功路径上不返回——中间进程
+/// 在闭包内 _exit。因此调用方必须先装 rlimits/seccomp 闭包（sandbox.apply），
+/// 再装本闭包；setrlimit 经双 fork 继承给最终命令进程。
+///
+/// 语义：成功路径上 std 的 exec 不会发生——孙进程由本链自行 execve，
+/// std 侧 Child::wait 拿到的即沙箱命令的真实退出码（信号 → 128+sig）。
+/// fork 前失败（unshare/挂载）照常作为 spawn 错误冒泡 → 调用方降级。
+///
+/// # Safety
+/// pre_exec 仅在 unix fork 后执行；见 double_fork_ns_exec 的安全性说明。
+pub unsafe fn install_sandbox_pre_exec(
+    cmd: &mut std::process::Command,
+    root: PathBuf,
+    work_dir: PathBuf,
+    command: &str,
+) {
+    use std::os::unix::process::CommandExt;
+    let is_root = libc::geteuid() == 0;
+    let uid = libc::getuid();
+    let gid = libc::getgid();
+    let root_s = root.to_string_lossy().into_owned();
+    let work_s = work_dir.to_string_lossy().into_owned();
+    let mut pre = NsPrebuilt {
+        root: CString::new(root_s.as_str()).unwrap(),
+        work_src: CString::new(work_s.as_str()).unwrap(),
+        work_dst: CString::new(format!("{root_s}/work")).unwrap(),
+        proc_dst: CString::new(format!("{root_s}/proc")).unwrap(),
+        proc_fs: CString::new("proc").unwrap(),
+        work_in_root: CString::new("/work").unwrap(),
+        slash: CString::new("/").unwrap(),
+        uid_map: format!("0 {uid} 1\n"),
+        gid_map: format!("0 {gid} 1\n"),
+        is_root,
+        // argv：sh -c <命令>（chroot 内 /bin/sh → busybox；Debian busybox
+        // 无 bash applet——避让真 bash，ash 语法兼容 POSIX）
+        argv_c: vec![
+            CString::new("/bin/sh").unwrap(),
+            CString::new("-c").unwrap(),
+            CString::new(command).unwrap(),
+        ],
+        envp_c: vec![
+            CString::new("PATH=/bin").unwrap(),
+            CString::new("HOME=/").unwrap(),
+            CString::new("TERM=dumb").unwrap(),
+        ],
+        argv_ptrs: Vec::new(),
+        envp_ptrs: Vec::new(),
+    };
+    // 指针数组最后构建（NULL 结尾，依赖上面 CString 的堆地址）
+    pre.argv_ptrs = pre
+        .argv_c
+        .iter()
+        .map(|c| c.as_ptr() as usize)
+        .chain(std::iter::once(0))
+        .collect();
+    pre.envp_ptrs = pre
+        .envp_c
+        .iter()
+        .map(|c| c.as_ptr() as usize)
+        .chain(std::iter::once(0))
+        .collect();
+    cmd.pre_exec(move || {
+        // SAFETY: 参数全部 fork 前预构建，无用户可控指针
+        unsafe { double_fork_ns_exec(&pre) }
+    });
 }
 
 #[cfg(test)]
@@ -232,7 +382,7 @@ mod tests {
     #[test]
     fn test_prepare_min_root_structure() {
         if find_busybox().is_none() {
-            return;
+            return; // 环境缺 busybox 跳过
         }
         let tmp = tempfile::tempdir().unwrap();
         let root = prepare_min_root(tmp.path()).expect("准备最小根");
@@ -258,11 +408,12 @@ mod tests {
         assert!(out.contains("count: 42"), "bind 生效应能读到 work 文件: {out}");
     }
 
+    /// 双 fork 核心安全性质（手动跑，需 root/无限制环境）
     #[test]
     #[ignore]
     fn test_exec_sandbox_isolation() {
         if !can_namespace() {
-            eprintln!("跳过：本机 namespace 不可用（AppArmor 限制或非 root）");
+            eprintln!("跳过：本机 namespace 不可用");
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
@@ -272,73 +423,18 @@ mod tests {
         for must in ["bin", "dev", "proc", "tmp", "work"] {
             assert!(out1.contains(must), "根目录应含 {must}: {out1}");
         }
-        // 宿主的 home 不可见
-        let (c2, out2) = exec_in_sandbox("ls /home 2>&1 || echo NO_HOME", tmp.path()).unwrap();
-        assert!(out2.contains("NO_HOME") || c2 != 0, "宿主 /home 不应可见: {out2}");
+        // 宿主的 home/root 不可见（结构性不存在）
+        let (c2, out2) = exec_in_sandbox("ls /home /root 2>&1 || echo NO_HOME", tmp.path()).unwrap();
+        assert!(out2.contains("NO_HOME") || c2 != 0, "宿主目录不应可见: {out2}");
+        // v0.5.2 新性质：/proc 已挂载且只含沙箱进程
+        // /proc/1/cmdline 是沙箱 sh 自己（含本测试命令文本），绝不能含宿主 cmdline
+        let (_, out3) = exec_in_sandbox("cat /proc/1/cmdline", tmp.path()).unwrap();
+        assert!(out3.contains("ls /") || out3.contains("cmdline"), "PID1 应是沙箱 sh: {out3}");
+        // ps 可用（v0.5.0 禁挂 proc 后废掉的能力复活）
+        let (c4, out4) = exec_in_sandbox("ps", tmp.path()).unwrap();
+        assert_eq!(c4, 0, "ps 应可用: {out4}");
         // 网络不通（net ns 无配置）
-        let (c3, _) = exec_in_sandbox("wget -T 2 -q http://127.0.0.1:1/ || echo NET_BLOCKED", tmp.path()).unwrap();
-        let _ = c3;
+        let (c5, _) = exec_in_sandbox("wget -T 2 -q http://127.0.0.1:1/ 2>&1; echo rc=$?", tmp.path()).unwrap();
+        let _ = c5;
     }
-}
-
-/// 为已配置好的进程 Command 安装 namespace 隔离（pre_exec）。
-///
-/// 供 bash 工具的 strict 档使用：命令仍由调用方 spawn 并收集输出，
-/// 本函数只负责在 fork 后、exec 前把子进程关进 mount/pid/net namespace + chroot 最小根。
-///
-/// 前置：调用方必须已 `prepare_min_root(work_dir)` 成功（返回的 root 传入）。
-/// 注意：安装后子进程的 exec 目标（bash）会在 chroot 内解析——
-/// 因此 Command 应使用 chroot 内存在的路径（/bin/sh via busybox）。
-///
-/// # Safety
-/// pre_exec 闭包在 fork 后的子进程中运行，只调用 async-signal-safe 之外的
-/// libc/文件操作，但参数全部为固定值（无用户可控指针），且失败即返回 Err 阻止 exec。
-pub unsafe fn install_sandbox_pre_exec(
-    cmd: &mut std::process::Command,
-    root: PathBuf,
-    work_dir: PathBuf,
-) {
-    use std::os::unix::process::CommandExt;
-    let is_root = libc::geteuid() == 0;
-    let uid = libc::getuid();
-    let gid = libc::getgid();
-    let root_s = root.to_string_lossy().into_owned();
-    let work_s = work_dir.to_string_lossy().into_owned();
-    cmd.pre_exec(move || {
-        if !is_root {
-            if libc::unshare(libc::CLONE_NEWUSER) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let _ = std::fs::write("/proc/self/setgroups", b"deny");
-            std::fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"))
-                .map_err(|e| std::io::Error::other(format!("uid_map: {e}")))?;
-            std::fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"))
-                .map_err(|e| std::io::Error::other(format!("gid_map: {e}")))?;
-        }
-        if libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWNET) != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let zero: *const libc::c_void = std::ptr::null();
-        let proc_dst = CString::new(format!("{root_s}/proc")).unwrap();
-        let work_dst = CString::new(format!("{root_s}/work")).unwrap();
-        let work_src = CString::new(work_s.as_str()).unwrap();
-        let psrc = CString::new("proc").unwrap();
-        let ptype = CString::new("proc").unwrap();
-        if libc::mount(psrc.as_ptr(), proc_dst.as_ptr(), ptype.as_ptr(), 0, zero) != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if libc::mount(work_src.as_ptr(), work_dst.as_ptr(), std::ptr::null(),
-            libc::MS_BIND | libc::MS_REC, zero) != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let root_c = CString::new(root_s.as_str()).unwrap();
-        if libc::chroot(root_c.as_ptr()) != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let slash = CString::new("/").unwrap();
-        if libc::chdir(slash.as_ptr()) != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    });
 }

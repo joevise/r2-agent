@@ -102,9 +102,20 @@ impl BashTool {
             .process_group(0)
             .kill_on_drop(true);
 
-        // strict 档：namespace 隔离（mount 假根 + pid + net 断网）。
+        // 顺序关键（v0.5.2 双 fork）：先装 rlimits/seccomp 闭包，再装 ns 闭包——
+        // pre_exec 按注册序执行，ns 闭包成功路径会 _exit（中间进程），后装的闭包
+        // 将不再执行；setrlimit 必须在双 fork 之前生效才能被孙进程继承。
+        let warn = if use_seccomp {
+            self.sandbox.apply(&mut cmd, &self.work_dir)
+        } else {
+            self.sandbox.apply_without_seccomp(&mut cmd, &self.work_dir)
+        }
+        .map_err(|e| format!("ERROR: 沙箱应用失败：{e}"))?;
+
+        // strict 档：namespace 双 fork 隔离（mount 假根 + pid + net 断网 + /proc）。
         // 仅在 namespace 真正可用时启用（root 或 AppArmor 未限制的 userns）；
-        // 不可用则静默走 container 档（rlimits+cgroup 仍生效），warn 由下方 apply 链体现。
+        // 不可用则静默走 container 档（rlimits+cgroup 仍生效）。
+        let mut ns_installed = false;
         let mut ns_warn: Option<String> = None;
         if use_ns && self.sandbox.level == crate::sandbox::SandboxLevel::Strict {
             if crate::namespaces::can_namespace() {
@@ -114,7 +125,9 @@ impl BashTool {
                             cmd.as_std_mut(),
                             root,
                             self.work_dir.clone(),
+                            command,
                         );
+                        ns_installed = true;
                     },
                     Err(e) => {
                         ns_warn = Some(format!(
@@ -130,13 +143,6 @@ impl BashTool {
             }
         }
 
-        let warn = if use_seccomp {
-            self.sandbox.apply(&mut cmd, &self.work_dir)
-        } else {
-            self.sandbox.apply_without_seccomp(&mut cmd, &self.work_dir)
-        }
-        .map_err(|e| format!("ERROR: 沙箱应用失败：{e}"))?;
-
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return Err(format!("ERROR: 启动进程失败：{e}")),
@@ -144,7 +150,13 @@ impl BashTool {
         let pid = child.id();
         // cgroup v2 pids 硬限：spawn 后立即把子进程挂入 r2 组（后代继承组）。
         // 失败仅告警降级，不影响执行
-        let cgroup_warn = if self.sandbox.cgroup && self.sandbox.level != crate::sandbox::SandboxLevel::Off
+        // ns 路径不重复挂组：孙进程在 pre_exec 双 fork 中诞生（早于本处），
+        // 单独迁移中间进程会把它与孙进程拆进不同组（cgroup 迁移不带后代）。
+        // 孙进程树留在 r2 所在组：supervisor 场景=会话组（R2_CGROUP_JOIN，整树核算✓）；
+        // 独立场景=r2 自身组。fork 炸弹硬限由 rlimits（NPROC）+ 会话组兜底。
+        let cgroup_warn = if self.sandbox.cgroup
+            && self.sandbox.level != crate::sandbox::SandboxLevel::Off
+            && !ns_installed
         {
             pid.and_then(|p| crate::sandbox::attach_child_to_cgroup(self.sandbox.max_processes, p))
         } else {
