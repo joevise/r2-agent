@@ -52,6 +52,18 @@ fn config_snapshot(state: &WebState) -> Config {
     state.config.lock().expect("config 锁中毒").clone()
 }
 
+/// 新会话专用配置快照：从源文件刷新 mcp 段（agent 可用 mcp 工具装 server，
+/// 写盘后新建会话即连接），其余段保留运行时状态（模型切换不被文件覆盖）。
+fn config_snapshot_fresh_mcp(state: &WebState) -> Config {
+    let mut cfg = config_snapshot(state);
+    if let Some(p) = cfg.source_path.clone() {
+        if let Ok(fresh) = Config::load_from_file(&p) {
+            cfg.mcp = fresh.mcp;
+        }
+    }
+    cfg
+}
+
 /// 向单个 WS 客户端发消息
 async fn ws_send(sink: &WsSink, v: Value) {
     let mut s = sink.lock().await;
@@ -158,7 +170,7 @@ fn state_json(state: &WebState) -> Value {
 /// 启动时构造工具清单快照（与 Agent 同源的注册表，含 MCP 连接）
 fn build_tool_list(config: &Config) -> Vec<Value> {
     let work_dir = config::expand_tilde(&config.agent.work_dir);
-    let Ok(mut registry) = ToolRegistry::new_default(&work_dir, &config.sandbox) else {
+    let Ok(mut registry) = ToolRegistry::new_default(&work_dir, &config.sandbox, config.source_path.as_deref()) else {
         return Vec::new();
     };
     registry.connect_mcp(&config.mcp);
@@ -473,7 +485,7 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
                     return;
                 };
                 if guard.is_none() {
-                    let config = config_snapshot(&st);
+                    let config = config_snapshot_fresh_mcp(&st);
                     match AgentSession::new(config) {
                         Ok(s) => install_session(&st, &mut guard, s),
                         Err(e) => {
@@ -510,7 +522,7 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
             }
         }
         ClientMsg::NewSession => {
-            let config = config_snapshot(state);
+            let config = config_snapshot_fresh_mcp(state);
             let mut guard = state.agent.lock().await;
             match AgentSession::new(config) {
                 Ok(s) => {

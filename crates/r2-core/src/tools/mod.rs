@@ -2,6 +2,7 @@
 
 mod bash;
 mod edit;
+mod mcp_admin;
 mod read;
 mod write;
 
@@ -34,6 +35,7 @@ impl ToolRegistry {
     pub fn new_default(
         work_dir: &str,
         sandbox_cfg: &crate::config::SandboxConfig,
+        config_path: Option<&str>,
     ) -> Result<Self, String> {
         let sandbox = crate::sandbox::Sandbox::from_config(sandbox_cfg)?;
         Ok(Self {
@@ -47,6 +49,7 @@ impl ToolRegistry {
                     sandbox,
                     sandbox_cfg.bash_restrict_workdir,
                 )),
+                Box::new(mcp_admin::McpAdminTool::new(config_path)),
             ],
         })
     }
@@ -150,7 +153,7 @@ mod tests {
             level: "off".to_string(),
             ..Default::default()
         };
-        ToolRegistry::new_default(dir.to_str().unwrap(), &cfg).unwrap()
+        ToolRegistry::new_default(dir.to_str().unwrap(), &cfg, None).unwrap()
     }
 
     #[tokio::test]
@@ -180,16 +183,17 @@ mod tests {
     }
 
     #[test]
-    fn test_schemas_contains_four_tools() {
+    fn test_schemas_contains_core_tools() {
         let tmp = tempfile::tempdir().unwrap();
         let reg = make_registry(tmp.path());
         let schemas = reg.schemas();
-        assert_eq!(schemas.len(), 4);
+        assert_eq!(schemas.len(), 5);
         let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"read"));
         assert!(names.contains(&"write"));
         assert!(names.contains(&"edit"));
         assert!(names.contains(&"bash"));
+        assert!(names.contains(&"mcp"));
         for s in &schemas {
             assert!(s.parameters["type"] == "object");
         }

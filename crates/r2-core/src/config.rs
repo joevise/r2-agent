@@ -8,6 +8,9 @@ pub type ConfigResult<T> = Result<T, Box<dyn std::error::Error>>;
 /// 顶层配置
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
+    /// 本配置的来源文件路径（运行时元数据：mcp 工具写回/Console 热刷新用）
+    #[serde(skip)]
+    pub source_path: Option<String>,
     /// 模型配置
     #[serde(default)]
     pub model: ModelConfig,
@@ -359,6 +362,7 @@ impl Config {
     /// 生成默认配置
     pub fn default_config() -> Self {
         Self {
+            source_path: None,
             model: ModelConfig::default(),
             agent: AgentConfig::default(),
             context: ContextConfig::default(),
@@ -372,6 +376,7 @@ impl Config {
     pub fn load_from_file(path: &str) -> ConfigResult<Self> {
         let content = std::fs::read_to_string(path)?;
         let mut config: Config = toml::from_str(&content)?;
+        config.source_path = Some(path.to_string());
         config.post_process()?;
         Ok(config)
     }
