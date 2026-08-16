@@ -82,8 +82,16 @@ impl BashTool {
         command: &str,
         timeout_secs: u64,
         use_seccomp: bool,
+        use_ns: bool,
     ) -> Result<RunOutcome, String> {
-        let mut cmd = Command::new("bash");
+        // strict+ns 模式下 chroot 内只有 busybox——Debian/Ubuntu 的 busybox 不含 bash
+        // applet（避免与真 bash 冲突），故用 sh（busybox 的 ash，POSIX 语法兼容）
+        let program = if use_ns && self.sandbox.level == crate::sandbox::SandboxLevel::Strict {
+            "sh"
+        } else {
+            "bash"
+        };
+        let mut cmd = Command::new(program);
         cmd.arg("-c")
             .arg(command)
             .current_dir(&self.work_dir)
@@ -98,7 +106,7 @@ impl BashTool {
         // 仅在 namespace 真正可用时启用（root 或 AppArmor 未限制的 userns）；
         // 不可用则静默走 container 档（rlimits+cgroup 仍生效），warn 由下方 apply 链体现。
         let mut ns_warn: Option<String> = None;
-        if self.sandbox.level == crate::sandbox::SandboxLevel::Strict {
+        if use_ns && self.sandbox.level == crate::sandbox::SandboxLevel::Strict {
             if crate::namespaces::can_namespace() {
                 match crate::namespaces::prepare_min_root(&self.work_dir) {
                     Ok(root) => unsafe {
@@ -232,7 +240,27 @@ impl Tool for BashTool {
             .unwrap_or(self.default_timeout_secs)
             .min(MAX_TIMEOUT_SECS);
 
-        let outcome = match self.spawn_and_wait(command, timeout_secs, true).await {
+        // strict 首试带 ns；容器/受限环境 unshare 被拦（EPERM）→ 摘 ns 重试（降级链闭合）
+        if self.sandbox.level == crate::sandbox::SandboxLevel::Strict {
+            match self.spawn_and_wait(command, timeout_secs, true, true).await {
+                Ok(o) => {
+                    return match o.warn {
+                        Some(w) => format!("{w}\n{}", format_output(&o.output)),
+                        None => format_output(&o.output),
+                    };
+                }
+                Err(e) if e.contains("Operation not permitted") || e.contains("os error 1") => {
+                    const NS_RETRY_WARN: &str =
+                        "WARN: namespace 被 seccomp/容器策略拦截（EPERM），降级 container 档";
+                    return match self.spawn_and_wait(command, timeout_secs, true, false).await {
+                        Ok(o) => format!("{NS_RETRY_WARN}\n{}", format_output(&o.output)),
+                        Err(e2) => format!("{NS_RETRY_WARN}\n{e2}"),
+                    };
+                }
+                Err(e) => return format!("ERROR: {e}"),
+            }
+        }
+        let outcome = match self.spawn_and_wait(command, timeout_secs, true, false).await {
             Ok(o) => o,
             Err(e) => return e,
         };
@@ -245,7 +273,7 @@ impl Tool for BashTool {
         if self.sandbox.strict && cfg!(feature = "sandbox-strict") && killed_silently {
             const RETRY_WARN: &str =
                 "WARN: seccomp 白名单疑似不完整（进程被静默杀死），本次已降级跳过 seccomp";
-            return match self.spawn_and_wait(command, timeout_secs, false).await {
+            return match self.spawn_and_wait(command, timeout_secs, false, false).await {
                 Ok(o) => format!("{RETRY_WARN}\n{}", format_output(&o.output)),
                 Err(e) => format!("{RETRY_WARN}\n{e}"),
             };

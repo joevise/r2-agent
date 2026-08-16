@@ -1,3 +1,4 @@
+mod sandbox_cmd;
 mod web;
 
 use clap::{Parser, Subcommand};
@@ -70,11 +71,37 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
     },
+    /// 自孵化沙箱会话（v0.5）：每会话一个隔离子进程（cgroup+env清洗+strict bash）
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxAction,
+    },
     /// 跨会话记忆管理：list / search / delete / stats / migrate
     #[cfg(feature = "l3-memory")]
     Memory {
         #[command(subcommand)]
         action: MemoryAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SandboxAction {
+    /// 运行一次性沙箱会话（隔离环境跑完即回收）
+    Run {
+        /// 会话提示词
+        prompt: String,
+        /// 会话内存上限 MB（cgroup memory.max，0=不限；OOM 内核直接杀）
+        #[arg(long, default_value_t = 0)]
+        memory: u64,
+        /// 会话进程树上限（cgroup pids.max）
+        #[arg(long, default_value_t = 256)]
+        pids: u32,
+        /// 会话结束后删除会话目录（产物不保留）
+        #[arg(long)]
+        ephemeral: bool,
+        /// 会话超时秒数（0=不限）
+        #[arg(long, default_value_t = 0)]
+        timeout: u64,
     },
 }
 
@@ -589,6 +616,27 @@ async fn main() -> MainResult<()> {
     apply_overrides(&mut config, cli.model.as_deref(), cli.work_dir.as_deref());
 
     // sessions 子命令（无子命令 = 列出全部）
+    if let Some(Commands::Sandbox { action }) = &cli.command {
+        let source_path = cli.config.clone().or_else(|| {
+            let p = config::expand_tilde("~/.r2/config.toml");
+            std::path::Path::new(&p).exists().then(|| p)
+        });
+        return match action {
+            SandboxAction::Run { prompt, memory, pids, ephemeral, timeout } => {
+                sandbox_cmd::run_sandbox(
+                    &config,
+                    source_path.as_deref(),
+                    sandbox_cmd::SandboxRunArgs {
+                        prompt: prompt.clone(),
+                        memory_mb: *memory,
+                        pids: *pids,
+                        ephemeral: *ephemeral,
+                        timeout_secs: *timeout,
+                    },
+                )
+            }
+        };
+    }
     if let Some(Commands::Sessions { action }) = &cli.command {
         return match action {
             None => print_sessions(&config),

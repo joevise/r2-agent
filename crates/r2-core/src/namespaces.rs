@@ -145,16 +145,15 @@ pub fn exec_in_sandbox(cmd: &str, work_dir: &Path) -> Result<(i32, String), Stri
             if libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWNET) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            // 3) proc + work bind
+            // 3) work bind（注意：**不挂 /proc**）
+            // 为什么不挂：unshare(CLONE_NEWPID) 不改变当前进程的 pid ns（只影响
+            // 之后 fork 的子进程），而 procfs 内容取决于挂载者的 active pid ns——
+            // 此处挂的 /proc 仍反映宿主进程列表，/proc/1/root 更是经典 chroot
+            // 逃逸面。正确解法是双 fork（孙进程 exec 时才在新 pid ns 内成为 PID 1），
+            // v0.5.1 重构。当前诚实取舍：ns 内 /proc 为空目录，ps/top 不可用。
             let zero: *const libc::c_void = std::ptr::null();
-            let proc_dst = CString::new(format!("{root_s}/proc")).unwrap();
             let work_dst = CString::new(format!("{root_s}/work")).unwrap();
             let work_src = CString::new(work_s.as_str()).unwrap();
-            let psrc = CString::new("proc").unwrap();
-            let ptype = CString::new("proc").unwrap();
-            if libc::mount(psrc.as_ptr(), proc_dst.as_ptr(), ptype.as_ptr(), 0, zero) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
             if libc::mount(
                 work_src.as_ptr(),
                 work_dst.as_ptr(),

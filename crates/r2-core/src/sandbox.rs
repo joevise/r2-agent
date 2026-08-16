@@ -36,6 +36,9 @@ impl SandboxLevel {
 /// 环境变量白名单：其余（含 API key 类）全部剔除
 const ENV_WHITELIST: &[&str] = &[
     "PATH", "LANG", "LC_ALL", "LC_CTYPE", "HOME", "TERM", "TMPDIR", "PWD",
+    // supervisor 注入的会话 cgroup 路径：子 r2 的 bash 树直接入会话组，
+    // 使会话级 pids/memory 限额覆盖整棵子树（层级计数是内核语义）
+    "R2_CGROUP_JOIN",
 ];
 
 /// 清洗后的 PATH：防止用户 PATH 注入
@@ -209,6 +212,16 @@ fn attach_to_cgroup_at(root: &Path, max_processes: u32, pid: u32) -> Result<(), 
 /// 返回 Some(warn) 表示降级（非 root / 非 v2 / 只读等），None 表示成功。
 /// 清理说明：临时组不主动删除——systemd 会回收空组，主动删与进程退出有竞态。
 pub fn attach_child_to_cgroup(max_processes: u32, pid: u32) -> Option<String> {
+    // supervisor 场景：直接入会话组（会话级 pids/memory 统一核算整棵子树）
+    if let Ok(group) = std::env::var("R2_CGROUP_JOIN") {
+        let path = std::path::PathBuf::from(&group);
+        if path.join("cgroup.procs").exists() {
+            return match std::fs::write(path.join("cgroup.procs"), pid.to_string()) {
+                Ok(()) => None,
+                Err(e) => Some(format!("[sandbox] 加入会话组失败（{e}），独立核算")),
+            };
+        }
+    }
     let Some(dir) = current_cgroup_dir() else {
         return Some("[sandbox] cgroup 无可用层级（systemd 锁定），降级 rlimits".to_string());
     };
@@ -216,6 +229,47 @@ pub fn attach_child_to_cgroup(max_processes: u32, pid: u32) -> Option<String> {
         Ok(()) => None,
         Err(e) => Some(format!("[sandbox] cgroup 不可用（{e}），降级 rlimits")),
     }
+}
+
+/// supervisor 专用：创建会话 cgroup 组（pids.max + 可选 memory.max）并放入子进程。
+/// 返回 (warn, 组路径)——路径用于注入 R2_CGROUP_JOIN 环境变量给子 r2，
+/// 使其后代 bash 直接入组，实现会话级资源核算。
+/// 内存说明：memory.max 对整棵子树生效（含 bash 后代）；OOM 时内核直接 SIGKILL，
+/// 因此默认不限（0），由调用方按需设置（云场景建议 512M+）。
+pub fn create_session_cgroup(
+    name_pid: u32,
+    max_processes: u32,
+    memory_limit_mb: u64,
+) -> (Option<String>, Option<std::path::PathBuf>) {
+    let Some(dir) = current_cgroup_dir() else {
+        return (
+            Some("[sandbox] cgroup 无可用层级，会话资源限额降级 rlimits".to_string()),
+            None,
+        );
+    };
+    // 组名用 supervisor 的 pid（spawn 前可知）→ 可先注入子进程 env（R2_CGROUP_JOIN）
+    let group = dir.join(format!("{CGROUP_AGENT_DIR}-sess-{name_pid}"));
+    if !group.exists() {
+        if let Err(e) = std::fs::create_dir(&group) {
+            return (
+                Some(format!("[sandbox] 会话组创建失败（{e}），降级 rlimits")),
+                None,
+            );
+        }
+    }
+    if let Err(e) = std::fs::write(group.join("pids.max"), pids_max_value(max_processes)) {
+        return (Some(format!("[sandbox] 会话 pids.max 写入失败（{e}）")), None);
+    }
+    let mem_warn = if memory_limit_mb > 0 {
+        let bytes = memory_limit_mb * 1024 * 1024;
+        std::fs::write(group.join("memory.max"), bytes.to_string())
+            .err()
+            .map(|e| format!("[sandbox] 会话 memory.max 写入失败（{e}），内存仅 rlimits"))
+    } else {
+        None
+    };
+    // 注意：不写 cgroup.procs——子进程 pid 在 spawn 后才知，由 supervisor 写入
+    (mem_warn, Some(group))
 }
 
 /// 环境变量清洗：只保留白名单，PATH 重设为固定值
@@ -513,7 +567,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("cgroup.controllers"), "pids").unwrap();
         attach_to_cgroup_at(tmp.path(), 64, 12345).unwrap();
-        let group = tmp.path().join(CGROUP_AGENT_DIR).join("12345");
+        // v0.4.1 起单层组结构：r2-agent-{pid}（两层结构有 subtree_control 竞态）
+        let group = tmp.path().join(format!("{CGROUP_AGENT_DIR}-12345"));
         assert_eq!(std::fs::read_to_string(group.join("pids.max")).unwrap(), "64");
         assert_eq!(
             std::fs::read_to_string(group.join("cgroup.procs")).unwrap(),
