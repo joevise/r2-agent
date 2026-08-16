@@ -9,7 +9,7 @@
 //!（`apply` 的 `work_dir` 参数即为 v0.2 预留）。
 
 use crate::config::SandboxConfig;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// 沙箱级别
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +54,8 @@ pub struct Sandbox {
     pub max_file_size_mb: u32,
     /// level == Strict
     pub strict: bool,
+    /// cgroup v2 pids 限制开关（失败自动降级 rlimits，不影响执行）
+    pub cgroup: bool,
 }
 
 impl Sandbox {
@@ -67,6 +69,7 @@ impl Sandbox {
             cpu_time_secs: cfg.cpu_time_secs,
             max_file_size_mb: cfg.max_file_size_mb,
             strict: level == SandboxLevel::Strict,
+            cgroup: cfg.cgroup,
         })
     }
 
@@ -111,6 +114,107 @@ impl Sandbox {
             None
         };
         Ok(warn)
+    }
+}
+
+/// cgroup v2 unified 挂载点
+const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
+
+/// r2 专属 cgroup 组名（建在进程当前 cgroup 之下——用户级 systemd 委派场景
+/// 不能在挂载点根目录建组，必须在自己所在的组内建子组）
+const CGROUP_AGENT_DIR: &str = "r2-agent";
+
+/// 找到"可以建组"的最近 cgroup 层：从当前进程所在组逐层向上，
+/// 在每层试探建组+写 pids.max（立即清理），首个成功者即返回。
+/// 为什么要向上：systemd nsdelegate 严格模式下，进程所在的深层 service/scope
+/// 不允许内部建组，但其父层（如 user@1000.service）允许建"兄弟组"——
+/// 跨层把 bash 进程写入父层新建组完全合法。
+/// 全部失败返回 None（降级 rlimits）。
+fn current_cgroup_dir() -> Option<PathBuf> {
+    let Ok(content) = std::fs::read_to_string("/proc/self/cgroup") else {
+        return None;
+    };
+    let cur = content.lines().find_map(|l| l.strip_prefix("0::"))?;
+    let cur = cur.trim_start_matches('/');
+    if cur.is_empty() {
+        return None;
+    }
+    let mut node = PathBuf::from(CGROUP_MOUNT).join(cur);
+    let mount = PathBuf::from(CGROUP_MOUNT);
+    for _ in 0..12 {
+        if is_cgroup_v2(&node) {
+            let probe = node.join("r2-probe");
+            if std::fs::create_dir(&probe).is_ok() {
+                // domain threaded 层下子组 type 为 "domain invalid"/"threaded"——
+                // 不接受进程迁移（写 cgroup.procs 报 EOPNOTSUPP），必须跳过
+                let ty = std::fs::read_to_string(probe.join("cgroup.type"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let type_ok = ty == "domain";
+                let write_ok = type_ok && std::fs::write(probe.join("pids.max"), "2").is_ok();
+                std::fs::remove_dir(&probe).ok();
+                if write_ok {
+                    return Some(node);
+                }
+            }
+        }
+        match node.parent() {
+            Some(p) if *p != mount => node = p.to_path_buf(),
+            _ => break,
+        }
+    }
+    None
+}
+
+/// 检测 root 是否为 cgroup v2 unified 挂载点（存在 cgroup.controllers）
+fn is_cgroup_v2(root: &Path) -> bool {
+    root.join("cgroup.controllers").exists()
+}
+
+/// pids.max 的写入值：0 = 不限（写 "max"）
+fn pids_max_value(max_processes: u32) -> String {
+    if max_processes == 0 {
+        "max".to_string()
+    } else {
+        max_processes.to_string()
+    }
+}
+
+/// 把 pid 挂入 r2 专属 cgroup 并写入 pids.max（root 参数便于测试注入 mock fs）。
+/// 任一步失败返回 Err，调用方降级为 rlimits，不影响命令执行。
+fn attach_to_cgroup_at(root: &Path, max_processes: u32, pid: u32) -> Result<(), String> {
+    if !is_cgroup_v2(root) {
+        return Err(format!("{} 非 cgroup v2 unified 挂载", root.display()));
+    }
+    // 单层结构：直接在最近可用层下建 r2-agent-{pid} 组。
+    // 为什么不做 r2-agent/{pid} 父子两层：子组要生效 pids 控制器需要父组先开
+    // subtree_control，而"内部已有进程的组不能再改 subtree_control"（内核规则），
+    // 在 systemd 委派场景下父层往往已含进程导致静默失败。单层组直接继承所在层
+    // 的控制器可用性，实测稳定。
+    // 组名带 pid：每次 bash 调用一个组，进程退出后 systemd 回收空组。
+    let group = root.join(format!("{CGROUP_AGENT_DIR}-{pid}"));
+    if !group.exists() {
+        std::fs::create_dir(&group).map_err(|e| format!("创建 {} 失败：{e}", group.display()))?;
+    }
+    std::fs::write(group.join("pids.max"), pids_max_value(max_processes))
+        .map_err(|e| format!("写 pids.max 失败：{e}"))?;
+    // 子进程一旦进组，其全部后代继承该组，fork 炸弹被 pids.max 掐死
+    std::fs::write(group.join("cgroup.procs"), pid.to_string())
+        .map_err(|e| format!("写 cgroup.procs 失败：{e}"))?;
+    Ok(())
+}
+
+/// bash 子进程 spawn 后立即调用：挂入 cgroup 限 pids。
+/// 返回 Some(warn) 表示降级（非 root / 非 v2 / 只读等），None 表示成功。
+/// 清理说明：临时组不主动删除——systemd 会回收空组，主动删与进程退出有竞态。
+pub fn attach_child_to_cgroup(max_processes: u32, pid: u32) -> Option<String> {
+    let Some(dir) = current_cgroup_dir() else {
+        return Some("[sandbox] cgroup 无可用层级（systemd 锁定），降级 rlimits".to_string());
+    };
+    match attach_to_cgroup_at(&dir, max_processes, pid) {
+        Ok(()) => None,
+        Err(e) => Some(format!("[sandbox] cgroup 不可用（{e}），降级 rlimits")),
     }
 }
 
@@ -310,6 +414,7 @@ mod tests {
             max_memory_mb: 256,
             cpu_time_secs: 30,
             max_file_size_mb: 50,
+            ..Default::default()
         };
         let sbx = Sandbox::from_config(&cfg).unwrap();
         assert_eq!(sbx.level, SandboxLevel::Strict);
@@ -383,6 +488,63 @@ mod tests {
             "预期大量 fork 失败：code={:?} stderr={stderr}",
             out.status.code()
         );
+    }
+
+    #[test]
+    fn test_cgroup_v2_detection() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 无 cgroup.controllers：非 v2
+        assert!(!is_cgroup_v2(tmp.path()));
+        // 模拟 v2 挂载点
+        std::fs::write(tmp.path().join("cgroup.controllers"), "cpu io pids").unwrap();
+        assert!(is_cgroup_v2(tmp.path()));
+    }
+
+    #[test]
+    fn test_pids_max_value() {
+        assert_eq!(pids_max_value(0), "max");
+        assert_eq!(pids_max_value(64), "64");
+        assert_eq!(pids_max_value(256), "256");
+    }
+
+    #[test]
+    fn test_attach_mock_v2_success() {
+        // mock v2 挂载点：建组 + pids.max + cgroup.procs 全链路成功
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("cgroup.controllers"), "pids").unwrap();
+        attach_to_cgroup_at(tmp.path(), 64, 12345).unwrap();
+        let group = tmp.path().join(CGROUP_AGENT_DIR).join("12345");
+        assert_eq!(std::fs::read_to_string(group.join("pids.max")).unwrap(), "64");
+        assert_eq!(
+            std::fs::read_to_string(group.join("cgroup.procs")).unwrap(),
+            "12345"
+        );
+        // 幂等：同 pid 再挂一次复用已有组
+        attach_to_cgroup_at(tmp.path(), 0, 12345).unwrap();
+        assert_eq!(std::fs::read_to_string(group.join("pids.max")).unwrap(), "max");
+    }
+
+    #[test]
+    fn test_attach_non_v2_errors_not_panics() {
+        // 非 v2 根（空目录）→ Err 降级，不 panic
+        let tmp = tempfile::tempdir().unwrap();
+        let err = attach_to_cgroup_at(tmp.path(), 64, 1).unwrap_err();
+        assert!(err.contains("非 cgroup v2"), "got: {err}");
+    }
+
+    #[test]
+    fn test_attach_readonly_fs_degrades() {
+        // mock 只读 fs：v2 文件存在但目录不可写 → Err 降级（root 下权限位失效，跳过）
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("cgroup.controllers"), "pids").unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = attach_to_cgroup_at(tmp.path(), 64, 1);
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "只读 fs 应降级：{result:?}");
     }
 
     #[cfg(feature = "sandbox-strict")]

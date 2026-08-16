@@ -146,6 +146,12 @@ pub struct SandboxConfig {
     /// 单文件写入上限（MB，RLIMIT_FSIZE，防写爆磁盘）
     #[serde(default = "default_max_file_size_mb")]
     pub max_file_size_mb: u32,
+    /// cgroup v2 pids 限制开关（默认开；无 root / 非 v2 / 只读时自动降级回 rlimits）
+    #[serde(default = "default_cgroup")]
+    pub cgroup: bool,
+    /// bash 高危命令启发式拦截（默认关，向后兼容；开启后拦截 rm -rf / 等明显逃逸模式）
+    #[serde(default)]
+    pub bash_restrict_workdir: bool,
 }
 
 /// 会话存储配置
@@ -234,6 +240,10 @@ fn default_cpu_time_secs() -> u32 {
 fn default_max_file_size_mb() -> u32 {
     100
 }
+fn default_cgroup() -> bool {
+    // 默认开：cgroup v2 可用时硬限 pids（fork 炸弹真空填补）；不可用自动降级不失败
+    true
+}
 fn default_session_dir() -> String {
     "~/.r2/sessions".to_string()
 }
@@ -317,6 +327,8 @@ impl Default for SandboxConfig {
             max_memory_mb: default_max_memory_mb(),
             cpu_time_secs: default_cpu_time_secs(),
             max_file_size_mb: default_max_file_size_mb(),
+            cgroup: default_cgroup(),
+            bash_restrict_workdir: false,
         }
     }
 }
@@ -632,6 +644,26 @@ provider = "anthropic"
         apply_overrides(&mut config, None, Some("~/proj"));
         let home = std::env::var("HOME").unwrap();
         assert_eq!(config.agent.work_dir, format!("{home}/proj"));
+    }
+
+    #[test]
+    fn test_sandbox_new_fields_defaults() {
+        // 旧配置（无 cgroup / bash_restrict_workdir 字段）向后兼容
+        let config = Config::load_from_str(FULL_TOML).unwrap();
+        assert!(config.sandbox.cgroup);
+        assert!(!config.sandbox.bash_restrict_workdir);
+    }
+
+    #[test]
+    fn test_sandbox_new_fields_parse() {
+        let toml_str = r#"
+[sandbox]
+cgroup = false
+bash_restrict_workdir = true
+"#;
+        let config = Config::load_from_str(toml_str).unwrap();
+        assert!(!config.sandbox.cgroup);
+        assert!(config.sandbox.bash_restrict_workdir);
     }
 
     #[test]

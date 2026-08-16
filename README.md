@@ -82,10 +82,12 @@ l3_enabled = false                # 跨会话记忆（需 --features l3-memory �
 [sandbox]
 level = "container"               # off | container | strict
 bash_timeout_secs = 30            # bash 默认超时（上限 120s）
-max_processes = 10                # RLIMIT_NPROC（生产建议 64+）
+max_processes = 0                 # NPROC + cgroup pids.max；0=不限，生产独占 uid 建议 64-256
 max_memory_mb = 512               # RLIMIT_AS
 cpu_time_secs = 60                # RLIMIT_CPU
 max_file_size_mb = 100            # RLIMIT_FSIZE
+cgroup = true                     # cgroup v2 pids 硬限（不可用时自动降级 rlimits）
+bash_restrict_workdir = false     # 高危命令启发式拦截（rm -rf /、| sh 等，软层）
 
 [session]
 dir = "~/.r2/sessions"            # 会话 JSONL 存储目录（支持 ~ 展开）
@@ -101,7 +103,7 @@ r2-agent/
 │   ├── context.rs          # L1 工作记忆 + L2 压缩摘要
 │   ├── memory.rs           # L3 跨会话记忆（feature: l3-memory，rusqlite）
 │   ├── session.rs          # JSONL 持久化 + 崩溃恢复
-│   ├── sandbox.rs          # 三级沙箱：rlimits + 环境清洗 + seccomp
+│   ├── sandbox.rs          # 三级沙箱：rlimits + cgroup pids + 环境清洗 + seccomp
 │   ├── config.rs           # TOML 配置 + 校验 + ~ 展开
 │   ├── types.rs            # Message / ToolCall / StreamChunk 等核心类型
 │   ├── model/              # ModelProvider trait + 双 provider
@@ -136,13 +138,26 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 
 ## 沙箱
 
+三级级别 × 四层防护，逐层叠加、逐层可降级：
+
+| 层 | 机制 | 说明 |
+|---|---|---|
+| rlimits | NPROC / AS / CPU / FSIZE | `container` 起生效。注意 RLIMIT_NPROC 按真实 uid 全部线程计数，桌面/共享 uid 机器勿设小值 |
+| cgroup v2 pids | `pids.max` 硬限 | fork 炸弹的真正硬隔离（NPROC 堵不住的真空）。`cgroup = true` 默认开；无 root / 非 v2 / 只读时自动降级回 rlimits 并告警，不失败 |
+| 启发式拦截 | 高危命令模式匹配 | `bash_restrict_workdir = true` 开启（默认关）。拦截 `rm -rf /`、`mkfs`、`\| sh` 注入等 ~19 个高危模式。软层，防误操作/防注入常见路径；硬隔离需 namespace（v0.5 规划） |
+| seccomp | syscall 白名单（~65 个） | 仅 `strict` 级，需 `--features sandbox-strict` 编译且安装 libseccomp-dev；未编译时降级为 container 并告警 |
+
 | 级别 | 能力 |
 |---|---|
 | `off` | 不做任何隔离 |
-| `container`（默认） | rlimits（NPROC/AS/CPU/FSIZE）+ 环境变量白名单清洗（API Key 不进子进程）+ PATH 重置 |
-| `strict` | container + seccomp 系统调用白名单（~65 个，需 `--features sandbox-strict` 编译且安装 libseccomp-dev；未编译时降级为 container 并告警） |
+| `container`（默认） | rlimits + cgroup pids + 环境变量白名单清洗（API Key 不进子进程）+ PATH 重置 |
+| `strict` | container + seccomp 系统调用白名单 |
 
-`max_processes` 默认 10 对交互使用足够；**生产/CI 环境建议 64+**（编译器、管道等会 fork 较多进程）。
+降级链：`strict`（无 seccomp 编译）→ `container`；cgroup 不可写 → 仅 rlimits；全程不 panic、命令照常执行并附 WARN。
+
+**生产建议**：`max_processes = 64-256` + `cgroup = true`（独占 uid 容器部署）；桌面交互使用保持 `max_processes = 0`（不限）。
+
+**seccomp 编译说明**（`strict` 级才需要）：默认 feature 不含 seccomp（避免系统缺 libseccomp 时构建失败）。启用：`apt install libseccomp-dev` 后 `cargo build --features sandbox-strict`。
 
 ## 测试
 
