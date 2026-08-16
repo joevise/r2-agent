@@ -178,3 +178,22 @@ python3 tests/e2e/l3_memory_suite.py
 ## License
 
 MIT
+
+## R2 Console（Web UI）
+
+```bash
+r2 web                    # 本机访问 http://127.0.0.1:5290
+r2 web --host 0.0.0.0     # 局域网/手机访问（注意安全）
+```
+
+黑白终端美学的 Web Playground：对话流式、工具调用展示、**运行中 steer 转向**、
+会话分支树 + fork、三层 system prompt 编辑（核心/SOUL.md/AGENTS.md）、
+MCP 工具面板、沙箱状态、文件拖拽上传、成本实时显示。单文件内嵌 UI，
+零 npm 依赖，手机自适应（抽屉式侧栏）。
+
+## 自定义 Agent 人格与项目上下文
+
+```bash
+~/.r2/SOUL.md          # 全局人格（所有项目生效）
+{work_dir}/AGENTS.md   # 项目上下文（行业标准文件名，Cursor/Codex 通用）
+```
