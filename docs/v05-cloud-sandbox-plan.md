@@ -23,9 +23,9 @@
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  外层：每会话沙箱实例（主防线——边界在实例级）           │
+│  外层：r2 自孵化 supervisor（主防线——每会话一个隔离子进程）  │
 │  ┌─────────────────────────────────────────────┐    │
-│  │  Docker 容器（v0.5）→ Firecracker 微虚机（v0.6+） │    │
+│  │  子 r2 进程（cgroup 会话组：pids+memory）        │    │
 │  │  ┌─────────────────────────────────────┐    │    │
 │  │  │  内层：r2 进程内 namespace（纵深兜底）  │    │    │
 │  │  │  mount ns：假根目录（只有 work_dir）    │    │    │
@@ -33,9 +33,9 @@
 │  │  │  net ns：断网或白名单                  │    │    │
 │  │  │  + cgroup pids（已有）+ rlimits（已有） │    │    │
 │  │  └─────────────────────────────────────┘    │    │
-│  │  沙箱内：r2 serve（2MB）+ JSONL 会话 + 临时文件  │    │
+│  │  会话内：r2 --once/serve + JSONL + work 文件     │    │
 │  └─────────────────────────────────────────────┘    │
-│  用完即毁：会话结束 → 容器销毁 → 一切痕迹消失           │
+│  用完即毁：进程退出 → ns 内核回收 → cgroup systemd 回收  │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -78,33 +78,49 @@ level = "strict"     → 以上全部 + mount/pid/net namespace（升级点）
 - 集成（root 环境，CI 跳过标记）：strict 下 `ls /` 只见最小根、`ps` 只见自己、`curl` 不通（DNS/路由不存在）、work_dir 读写正常、逃逸尝试（`/proc/1/root` 访问）被 ns 阻断
 - 降级路径：伪造无权限环境验证 warn + 行为回退
 
-### 模块 B：每会话沙箱编排（外层，~700行）
+### 模块 B：r2 自孵化 Supervisor（外层主防线，~400行）【8/16 方向修正】
 
-**B1. `r2 sandbox` 命令（编排器原型）**
-```
-r2 sandbox run [--image r2-runtime:latest] [--memory 512m] [--cpus 1] [--net off]
-  - 起 Docker 容器（最小镜像：busybox + r2 二进制 + ca-certificates）
-  - 容器内执行 r2 serve --host 0.0.0.0 --port 7443
-  - 宿主编排器通过 docker exec 或端口映射建立 JSON-RPC 通道
-  - 会话结束（EOF/shutdown）→ 容器强制销毁（docker rm -f）
-```
+> 原方案为 Docker 每会话编排。修正原因：Docker 的隔离本体就是 namespace+cgroup+seccomp
+> ——这三个内核原语 R2 已全部自实现。Docker 模式=雇 200MB 管家调用我们已会调的内核接口。
+> 自孵化方案：每会话开销 ~15-25MB（纯进程）vs Docker ~40-60MB（shim+容器）；
+> 启动 <100ms vs 1-2s；零外部依赖 vs Docker daemon 常驻。隔离强度相同（同内核原语）。
+> Docker 版降级为附录参考（运维托管/K8s 生态对接时再考虑）。
 
-**B2. Dockerfile.runtime（沙箱镜像，~30行）**
-```dockerfile
-FROM busybox:stable
-COPY r2 /usr/local/bin/r2
-ENTRYPOINT ["r2", "serve", "--host", "0.0.0.0", "--port", "7443"]
+**B1. `r2 sandbox run` 子命令（supervisor 入口）**
 ```
-- 镜像目标 <20MB（busybox 5MB + r2 2.6MB + 证书）
+r2 sandbox run [--memory MB] [--pids N] [--ephemeral] "prompt"
+```
+流程：
+1. 建会话目录 r2-sessions/sess-{时间戳}-{pid}/
+2. 从当前配置生成会话配置（model 段含密钥**整段文件到文件复制**，0600 权限；
+   work_dir=会话目录；sandbox.level=**strict**；max_processes=--pids）
+3. 建会话 cgroup（pids.max + 可选 memory.max，复用 v0.4.1 层级探测）
+4. spawn 子 r2（--once --config 会话配置）：
+   - 子进程入会话 cgroup（env R2_CGROUP_JOIN 注入，bash 树统一核算）
+   - env_clear：只留 PATH/HOME=会话目录/TERM——宿主环境零泄漏
+   - rlimits 继承（CPU/AS/FSIZE）
+5. 子 r2 的 bash 走 strict 档（模块A namespace：假根/pid隔离/断网）
+6. 会话结束：进程退出→cgroup 空组被 systemd 自动回收→namespace 内核自动销毁
+   （--ephemeral 时连会话目录一起删）
 
-**B3. 会话生命周期**
-- create（起容器）→ attach（JSON-RPC 桥）→ teardown（销毁 + 会话文件留宿主卷）
-- work_dir 用 docker volume 映射（会话产物持久化，容器本身无状态）
-- 资源限额：`--memory --cpus --pids-limit`（Docker 原生，外层兜底）
+**B2. cgroup 会话级核算**
+- attach_child_to_cgroup 扩展：检测 R2_CGROUP_JOIN 环境变量→直接入会话组
+  （会话组 pids.max/memory.max 对**整个子树**生效——含 bash 后代，层级计数是内核语义）
+- 独立 r2（无 supervisor）行为不变：自建 r2-agent-{pid} 组
+
+**B3. 安全性质（自孵化 vs Docker 等价性声明）**
+- mount/pid/net ns：同内核原语，同强度 ✓
+- 资源限额：cgroup pids/memory + rlimits，同强度 ✓
+- 镜像/卷泄漏点：自孵化**更少**（无镜像层/orphan 容器/shim 残留）
+- 内核逃逸：两者同样共享宿主内核，同样不防（诚实边界，Firecracker 是 v0.6+）
+- 密钥边界：API 密钥经配置文件进子进程；bash 断网（net ns）→ 密钥无法经 bash 外传
 
 **B4. 测试**
-- 编排器单元：参数拼装、容器名/卷名生成
-- 集成（需 Docker）：完整生命周期（起容器→prompt 往返→销毁→卷内文件存在）、异常路径（容器崩溃→编排器清理）、并发 2 会话互不可见（T2 验证）
+- 单元：会话配置生成（strict 注入/密钥段复制/0600）、目录命名
+- 本机 E2E（降级链）：GLM 真实调用跑通 sandbox run（本机 AppArmor→自动降级 container）
+- **Docker 内 root E2E（全链路）**：ubuntu 容器跑 r2 sandbox run，
+  验证 ls / 只见最小根、宿主文件不可见、网络断——模块A+模块B 内外层闭环
+- 并发两会话互不可见（各自 mount ns + 独立会话目录）
 
 ### 模块 C：文档与安全声明
 - README 沙箱章节升级为完整威胁模型表
@@ -126,8 +142,8 @@ B1 编排器 ◄── B2 镜像 ── B3 生命周期 ──► B4 测试 ◄�
 | A1 mount ns + 最小根 | 1天 | 无 |
 | A2+A3 pid+net ns | 0.5天 | A1 |
 | A4+A5 分级集成+测试 | 0.5天 | A2A3 |
-| B2 镜像 | 0.5天 | 无（可并行） |
-| B1+B3 编排器 | 1天 | B2 |
+| B2 cgroup 会话核算 | 0.5天 | A |
+| B1 sandbox run | 1天 | B2 |
 | B4+C 测试+文档 | 0.5天 | 全部 |
 | **合计** | **~3.5天** | |
 
@@ -143,14 +159,15 @@ B1 编排器 ◄── B2 镜像 ── B3 生命周期 ──► B4 测试 ◄�
 - [ ] 无 root 权限环境自动降级 + warn（不失败）
 - [ ] 155+ 既有测试不回归
 
-### 模块 B（沙箱编排）
-- [ ] `r2 sandbox run` 一条命令起完整会话（容器+serve+桥接）
-- [ ] prompt → GLM 真实回复 → 工具调用 → 文件写入 volume 全链路
-- [ ] 会话结束容器销毁（docker ps 无残留）
-- [ ] volume 内会话文件/作品保留（容器毁数据不毁）
-- [ ] 并发 2 个沙箱会话：A 读不到 B 的任何文件（横向越权验证）
-- [ ] 容器 OOM/崩溃 → 编排器正确清理
-- [ ] 镜像 <20MB
+### 模块 B（自孵化 supervisor）
+- [ ] `r2 sandbox run` 一条命令完整会话（spawn+隔离+输出+回收）
+- [ ] GLM 真实回复 → bash 工具 → 文件写入会话目录全链路
+- [ ] 子进程 env 只有 PATH/HOME/TERM（env 零泄漏验证）
+- [ ] 会话 cgroup 创建且 bash 树入组（pids/memory 会话级核算）
+- [ ] Docker 容器内（root）：模块A namespace 全链路生效（ls / 最小根/断网/宿主不可见）
+- [ ] 并发 2 个 sandbox 会话互不可见
+- [ ] --ephemeral 会话目录清理
+- [ ] 159+ 既有测试不回归
 
 ### 整体
 - [ ] 公网部署检查清单（SECURITY.md）覆盖 host 绑定/沙箱档位/密钥环境变量隔离
