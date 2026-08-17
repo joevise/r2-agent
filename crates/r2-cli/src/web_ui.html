@@ -94,6 +94,13 @@ textarea[readonly]{color:var(--dim)}
 .msg-err{color:var(--err);margin:6px 0;white-space:pre-wrap}
 .msg-note{color:var(--dim);margin:6px 0;font-size:12px}
 .toolblk{margin:6px 0 6px 0;border-left:1px solid var(--line);padding-left:10px}
+.thinkblk{margin:6px 0;border-left:1px dashed var(--line);padding-left:10px}
+.thinkblk .thead{cursor:pointer;color:var(--dim);font-style:italic}
+.thinkblk .thead:hover{color:var(--fg)}
+.thinkblk .tbody{color:var(--dim);font-style:italic;font-size:12px;white-space:pre-wrap;margin:4px 0 2px;max-height:260px;overflow-y:auto}
+.thinkblk .arrow::before{content:"▾ "}
+.thinkblk.closed .tbody{display:none}
+.thinkblk.closed .arrow::before{content:"▸ "}
 .toolblk .thead{cursor:pointer;color:var(--dim)}
 .toolblk .thead:hover{color:var(--fg)}
 .toolblk .thead .tn{color:var(--fg)}
@@ -477,19 +484,40 @@ function renderHistory(h){
   }
   endAI();toolCur=null;scrollBottom();
 }
+/* 思考块（GLM reasoning 流式展示） */
+let thinkCur=null;
+function thinkAppend(text){
+  if(!thinkCur){
+    thinkCur=document.createElement("div");thinkCur.className="thinkblk";
+    thinkCur.innerHTML='<div class="thead"><span class="arrow"></span>💭 思考中…</div><div class="tbody"></div>';
+    thinkCur.querySelector(".thead").onclick=()=>thinkCur.classList.toggle("closed");
+    flow.appendChild(thinkCur);scrollBottom();
+  }
+  thinkCur.querySelector(".tbody").appendChild(document.createTextNode(text));
+  const tb=thinkCur.querySelector(".tbody");tb.scrollTop=tb.scrollHeight;
+  scrollBottom();
+}
+function thinkDone(){
+  if(thinkCur){
+    thinkCur.classList.add("closed");
+    thinkCur.querySelector(".thead").innerHTML='<span class="arrow"></span>💭 思考过程（点击展开）';
+    thinkCur=null;
+  }
+}
 /* ---------- 事件处理 ---------- */
 function onEvent(evt){
   const d=evt.data||{};
   switch(evt.type){
-    case"agent_start":setRunning(true);endAI();break;
-    case"message_update":aiAppend(d.text||"");break;
-    case"tool_call":onToolCall(d.name||"?",d.arguments);break;
+    case"agent_start":setRunning(true);endAI();thinkCur=null;break;
+    case"thinking":thinkAppend(d.text||"");break;
+    case"message_update":thinkDone();aiAppend(d.text||"");break;
+    case"tool_call":thinkDone();onToolCall(d.name||"?",d.arguments);break;
     case"tool_result":onToolResult(d.name||"?",d.output);break;
     case"steered":addLine("msg-sys","⌁ steer: "+esc(d.instruction||""));break;
     case"usage_update":
       store.usage={input:d.input_tokens||0,output:d.output_tokens||0};renderUsage();break;
-    case"done":endAI();setRunning(false);break;
-    case"error":addLine("msg-err","✗ "+esc(d.message||""));endAI();setRunning(false);break;
+    case"done":thinkDone();endAI();setRunning(false);break;
+    case"error":thinkDone();addLine("msg-err","✗ "+esc(d.message||""));endAI();setRunning(false);break;
   }
 }
 /* ---------- WebSocket ---------- */

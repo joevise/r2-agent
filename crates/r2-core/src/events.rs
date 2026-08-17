@@ -9,6 +9,8 @@ pub enum AgentEvent {
     AgentStart,
     /// 文本增量（流式）
     MessageUpdate(String),
+    /// 模型思考增量（流式；GLM reasoning_content，仅展示不入历史）
+    Thinking(String),
     /// 工具调用开始：名称 + 参数
     ToolCall { name: String, arguments: String },
     /// 工具执行结果

@@ -114,6 +114,12 @@ fn parse_data_payload(payload: &str) -> ModelResult<Vec<StreamChunk>> {
             chunks.push(StreamChunk::Delta(content.to_string()));
         }
     }
+    // 思考阶段增量（GLM 5.x reasoning_content；与正文分离，仅展示）
+    if let Some(r) = delta["reasoning_content"].as_str() {
+        if !r.is_empty() {
+            chunks.push(StreamChunk::Reasoning(r.to_string()));
+        }
+    }
     if let Some(tool_calls) = delta["tool_calls"].as_array() {
         for tc in tool_calls {
             let index = tc["index"].as_u64().unwrap_or(0) as usize;
@@ -286,6 +292,7 @@ impl ModelProvider for OpenAiCompatProvider {
         for chunk in chunks {
             match chunk {
                 StreamChunk::Delta(s) => text.push_str(s),
+                StreamChunk::Reasoning(_) => {} // 思考不进正文（仅展示/用量，agent 层已计）
                 StreamChunk::ToolCallDelta {
                     index,
                     id,

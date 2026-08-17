@@ -506,12 +506,22 @@ impl Agent {
                 tokio::select! {
                     item = stream.next() => match item {
                         Some(Ok(chunk)) => {
-                            if let StreamChunk::Delta(ref s) = chunk {
-                                if !self.quiet {
-                                    print!("{s}");
-                                    let _ = std::io::stdout().flush();
+                            match &chunk {
+                                StreamChunk::Delta(s) => {
+                                    if !self.quiet {
+                                        print!("{s}");
+                                        let _ = std::io::stdout().flush();
+                                    }
+                                    self.emit(AgentEvent::MessageUpdate(s.clone()));
                                 }
-                                self.emit(AgentEvent::MessageUpdate(s.clone()));
+                                // 思考流：不打印 stdout（保持 CLI 干净），广播事件给壳层展示，
+                                // 并计入输出用量（思考 token 是计费的）
+                                StreamChunk::Reasoning(s) => {
+                                    self.usage.output_tokens +=
+                                        crate::context::estimate_tokens(s) as u64;
+                                    self.emit(AgentEvent::Thinking(s.clone()));
+                                }
+                                _ => {}
                             }
                             chunks.push(chunk);
                         }

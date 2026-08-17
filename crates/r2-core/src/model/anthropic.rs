@@ -368,6 +368,7 @@ impl ModelProvider for AnthropicProvider {
         for chunk in chunks {
             match chunk {
                 StreamChunk::Delta(s) => text.push_str(s),
+                StreamChunk::Reasoning(_) => {} // 思考不进正文（仅展示/用量，agent 层已计）
                 StreamChunk::ToolCallDelta {
                     index,
                     id,

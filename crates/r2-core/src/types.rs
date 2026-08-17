@@ -64,6 +64,8 @@ pub enum StreamChunk {
         name: Option<String>,
         arguments_delta: String,
     },
+    /// 模型思考增量（GLM reasoning_content 等；不计入正文，仅展示/用量）
+    Reasoning(String),
     /// 流结束
     Done,
 }
