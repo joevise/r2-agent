@@ -381,7 +381,7 @@ async function loadSkills(){
   const box=$("#skilllist");
   try{
     const r=await fetch("/skills");const list=await r.json();
-    if(!list.length){box.innerHTML='<div class="empty">~/.r2/skills/*/SKILL.md</div>';return}
+    if(!list.length){box.innerHTML='<div class="empty">~/.r2/skills 或 ~/.agents/skills 下无 SKILL.md</div>';return}
     for(const s of list){
       const d=document.createElement("div");d.className="skill";
       d.innerHTML='<div class="nm">'+esc(s.name)+'</div><div class="d1">'+esc(s.first_line||"")+'</div>'+
@@ -395,11 +395,12 @@ async function loadSkills(){
         }catch(e){toast("预览失败")}
       };
       d.querySelector("[data-ref]").onclick=()=>{
-        insertAtCursor("（请先阅读并遵循 skills/"+s.name+"/SKILL.md 的流程）");
+        const p=s.path||("~/.agents/skills/"+s.name);
+        insertAtCursor("（请先用 bash 执行 cat "+p+"/SKILL.md 阅读该技能的完整流程并遵循执行）");
       };
       box.appendChild(d);
     }
-  }catch(e){box.innerHTML='<div class="empty">~/.r2/skills/*/SKILL.md（后端不可达）</div>'}
+  }catch(e){box.innerHTML='<div class="empty">skills 加载失败（后端不可达）</div>'}
 }
 /* ---------- 消息流 ---------- */
 const flow=$("#flow");

@@ -349,28 +349,70 @@ async fn put_prompt_file(
 }
 
 /// GET /skills：列 ~/.r2/skills/*\/SKILL.md 的名称 + 首行（目录不存在返回空数组）
+/// skills 搜索路径（壳层惯例：专属目录优先，生态目录兜底）。
+/// ~/.r2/skills = R2 专属；~/.agents/skills = 跨 agent 生态标准位（lark 系等）。
+fn skills_dirs() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from(config::expand_tilde("~/.r2/skills")),
+        PathBuf::from(config::expand_tilde("~/.agents/skills")),
+    ]
+}
+
+/// 从 SKILL.md 提取描述：优先 YAML frontmatter 的 description，
+/// 回退正文第一条非空行（剥 markdown 标题符）。
+fn skill_description(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    // frontmatter：首行 --- 到下一个 --- 之间
+    if lines.first().map(|l| l.trim()) == Some(&"---") {
+        if let Some(end) = lines[1..].iter().position(|l| l.trim() == "---") {
+            for l in &lines[1..=end] {
+                let t = l.trim();
+                if let Some(v) = t.strip_prefix("description:") {
+                    let v = v.trim().trim_matches('"').trim_matches('\'');
+                    if !v.is_empty() {
+                        return v.to_string();
+                    }
+                }
+            }
+        }
+    }
+    // 回退：frontmatter 之后的第一条非空行
+    let start = if lines.first().map(|l| l.trim()) == Some(&"---") {
+        lines.iter().position(|l| l.trim() == "---").map(|p| p + 1).unwrap_or(0)
+    } else {
+        0
+    };
+    lines[start..]
+        .iter()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .trim_start_matches('#')
+        .trim()
+        .to_string()
+}
+
 async fn list_skills() -> Json<Value> {
-    let dir = config::expand_tilde("~/.r2/skills");
     let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path().join("SKILL.md");
-            let Ok(content) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            // 首行：第一条非空行，剥掉 markdown 标题符号
-            let first_line = content
-                .lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty())
-                .unwrap_or("")
-                .trim_start_matches('#')
-                .trim()
-                .to_string();
-            out.push(json!({
-                "name": entry.file_name().to_string_lossy(),
-                "first_line": first_line,
-            }));
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for dir in skills_dirs() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !seen.insert(name.clone()) {
+                    continue; // 专属目录优先，生态目录去重
+                }
+                let path = entry.path().join("SKILL.md");
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                out.push(json!({
+                    "name": name,
+                    "first_line": skill_description(&content),
+                    // 真实绝对路径（引用按钮插给 agent，用 bash cat 读取）
+                    "path": entry.path().to_string_lossy(),
+                }));
+            }
         }
     }
     out.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
@@ -392,9 +434,17 @@ async fn skill_preview(Query(q): Query<HashMap<String, String>>) -> (StatusCode,
     if !valid_name(name) {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "非法 skill 名"})));
     }
-    let path = Path::new(&config::expand_tilde("~/.r2/skills"))
-        .join(name)
-        .join("SKILL.md");
+    let mut path = None;
+    for dir in skills_dirs() {
+        let p = dir.join(name).join("SKILL.md");
+        if p.exists() {
+            path = Some(p);
+            break;
+        }
+    }
+    let Some(path) = path else {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": format!("skill 不存在：{name}")})));
+    };
     match std::fs::read_to_string(&path) {
         Ok(content) => (StatusCode::OK, Json(json!({"name": name, "content": content}))),
         Err(_) => (StatusCode::NOT_FOUND, Json(json!({"error": format!("skill 不存在：{name}")}))),
