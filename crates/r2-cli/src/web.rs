@@ -196,6 +196,7 @@ fn state_json(state: &WebState) -> Value {
             "core": sections.core,
             "soul": sections.soul,
             "agents": sections.agents,
+            "skills": sections.skills,
             "custom": sections.custom,
         },
         "running": running,

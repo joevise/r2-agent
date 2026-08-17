@@ -164,6 +164,10 @@ textarea[readonly]{color:var(--dim)}
       <details open><summary>核心 · 内置（只读）</summary>
         <div class="body"><textarea id="pf-core" readonly></textarea></div>
       </details>
+      <details>
+        <summary>已安装技能（动态）</summary>
+        <div class="body"><textarea id="pf-skills" readonly></textarea></div>
+      </details>
       <details><summary>SOUL.md <span class="dot" id="dot-soul"></span></summary>
         <div class="body">
           <textarea id="pf-soul" spellcheck="false"></textarea>
@@ -351,6 +355,7 @@ function applyState(st){
   store.sessions=st.sessions||[];store.current=st.current_session||null;
   store.tools=st.tools||[];store.sandbox=st.sandbox||null;
   $("#pf-core").value=(st.prompt_sections&&st.prompt_sections.core)||"";
+  $("#pf-skills").value=(st.prompt_sections&&st.prompt_sections.skills)||"（~/.r2/skills 为空）";
   renderSessions();renderTools();renderSandbox();renderUsage();
   setRunning(!!st.running);
 }

@@ -33,6 +33,8 @@ pub struct PromptSections {
     pub soul: Option<String>,
     pub agents: Option<String>,
     pub custom: Option<String>,
+    /// 已安装技能清单（动态扫描 ~/.r2/skills，每次构建 prompt 时刷新）
+    pub skills: Option<String>,
 }
 
 /// 用给定 home 展开路径开头的 ~（测试可注入假 home，隔离真实 ~/.r2）
@@ -73,6 +75,67 @@ pub fn build_system_prompt(config: &Config) -> (String, PromptSections) {
     build_system_prompt_with_home(config, &home)
 }
 
+
+/// 扫描 ~/.r2/skills/*/SKILL.md → 技能清单文本（system prompt 注入用）。
+/// 每个技能一行：名字 + frontmatter description（无则正文首行）。
+fn scan_skills_layer(home: &str) -> Option<String> {
+    let dir = format!("{home}/.r2/skills");
+    let entries = std::fs::read_dir(&dir).ok()?;
+    let mut lines = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path().join("SKILL.md");
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        let desc = skill_frontmatter_desc(&content);
+        lines.push(format!("- {name}：{desc}"));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "以下技能已安装（目录 ~/.r2/skills）。任务匹配时主动使用：\n\
+         先 bash 执行 cat ~/.r2/skills/<名字>/SKILL.md 阅读完整流程，再遵循执行。\n\
+         安装新技能：写到 ~/.r2/skills/<名字>/SKILL.md（frontmatter 带 name/description）。\n\
+         {}",
+        lines.join("\n")
+    ))
+}
+
+/// 提取 SKILL.md 描述：frontmatter description 优先，回退正文首条非空行
+fn skill_frontmatter_desc(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.first().map(|l| l.trim()) == Some(&"---") {
+        if let Some(end) = lines[1..].iter().position(|l| l.trim() == "---") {
+            for l in &lines[1..=end] {
+                let t = l.trim();
+                if let Some(v) = t.strip_prefix("description:") {
+                    let v = v.trim().trim_matches('"').trim_matches('\'');
+                    if !v.is_empty() {
+                        return v.chars().take(120).collect();
+                    }
+                }
+            }
+        }
+    }
+    let start = if lines.first().map(|l| l.trim()) == Some(&"---") {
+        lines.iter().position(|l| l.trim() == "---").map(|p| p + 1).unwrap_or(0)
+    } else {
+        0
+    };
+    lines[start..]
+        .iter()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .trim_start_matches('#')
+        .trim()
+        .chars()
+        .take(120)
+        .collect()
+}
+
 fn build_system_prompt_with_home(config: &Config, home: &str) -> (String, PromptSections) {
     let core = format!("{SYSTEM_PROMPT}\n\n{TOOL_USAGE_RULES}");
     let mut full = core.clone();
@@ -81,7 +144,18 @@ fn build_system_prompt_with_home(config: &Config, home: &str) -> (String, Prompt
         soul: None,
         agents: None,
         custom: None,
+        skills: None,
     };
+
+    // 技能层：动态扫描 ~/.r2/skills（装了自动可见，删了自动消失，零维护）。
+    // 放最前且不受 custom 覆盖——能力感知必须始终可见，
+    // 否则 agent 装了 skill 也不知道去哪找（实测病灶：去翻 ~/.claude/skills）。
+    let skills = scan_skills_layer(home);
+    if let Some(ref s) = skills {
+        full.push_str("\n\n[已安装技能]\n");
+        full.push_str(s);
+        sections.skills = Some(s.clone());
+    }
 
     // config [agent] system_prompt 非空：显式覆盖，SOUL / AGENTS 两层跳过
     let custom = config.agent.system_prompt.trim();
