@@ -195,6 +195,11 @@ impl ContextManager {
     /// 摘要消息用 role=System：OpenAI 兼容多条 system 消息；
     /// Anthropic 侧 messages_to_anthropic 会把所有 system 消息合并进顶层 system 字段，
     /// 两家都不会报错，比 role=User 伪装更贴近语义。
+    /// 当前对话历史（chat 回放用；不含 system prompt / L2 摘要层）
+    pub fn history(&self) -> &[Message] {
+        &self.messages
+    }
+
     pub fn build(&self) -> Vec<Message> {
         let extra = if self.l2_summary.is_some() { 2 } else { 1 };
         let mut msgs = Vec::with_capacity(self.messages.len() + extra);

@@ -322,6 +322,11 @@ impl Agent {
     }
 
     /// 当前会话 ID（用于提示用户如何恢复）
+    /// 会话历史消息（Console 切换/分叉后的 UI 回放用）
+    pub fn messages(&self) -> &[crate::types::Message] {
+        self.context.history()
+    }
+
     pub fn session_id(&self) -> Option<&str> {
         self.session.as_ref().map(|s| s.id())
     }

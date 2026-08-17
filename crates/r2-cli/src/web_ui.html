@@ -340,6 +340,7 @@ function renderTools(){
 /* ---------- prompt ---------- */
 function applyState(st){
   store.model=st.model||"";$("#model").textContent=store.model||"—";
+  if(st.history)renderHistory(st.history);
   store.sessions=st.sessions||[];store.current=st.current_session||null;
   store.tools=st.tools||[];store.sandbox=st.sandbox||null;
   $("#pf-core").value=(st.prompt_sections&&st.prompt_sections.core)||"";
@@ -452,6 +453,30 @@ function clearFlow(note){
   flow.innerHTML="";aiCur=null;toolCur=null;
   if(note)addLine("msg-note",esc(note));
 }
+/* 会话历史回放（切换/分叉/浏览器刷新） */
+function renderHistory(h){
+  clearFlow();
+  const msgs=(h&&h.messages)||[];
+  const blocks={};
+  for(const m of msgs){
+    if(m.kind==="user"){addUser(m.text||"")}
+    else if(m.kind==="assistant"){
+      (m.tool_calls||[]).forEach(c=>{
+        onToolCall(c.name,c.arguments);
+        if(toolCur)blocks[c.id]=toolCur;
+      });
+      if(m.text&&m.text.trim()){aiAppend(m.text);endAI()}
+    }
+    else if(m.kind==="tool_result"){
+      const blk=blocks[m.call_id];
+      if(blk){
+        const sp=blk.querySelector(".spin");if(sp)sp.remove();
+        blk.querySelector(".tbody").textContent=m.text||"";
+      }else{addLine("msg-note",esc((m.text||"").slice(0,200)))}
+    }
+  }
+  endAI();toolCur=null;scrollBottom();
+}
 /* ---------- 事件处理 ---------- */
 function onEvent(evt){
   const d=evt.data||{};
@@ -496,7 +521,8 @@ function connect(){
         if(j.session_id){store.current=j.session_id}
         break;
       case"model_changed":store.model=j.model||"";$("#model").textContent=store.model;renderUsage();break;
-      case"forked":if(j.id){store.current=j.id;clearFlow("已 fork 新会话 "+j.id)}break;
+      case"forked":if(j.id){store.current=j.id}break;
+      case"session_history":renderHistory(j.history);break;
       case"error":toast(j.message||"错误");addLine("msg-err","✗ "+esc(j.message||""));break;
     }
   };

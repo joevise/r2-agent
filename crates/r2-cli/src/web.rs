@@ -132,6 +132,35 @@ fn summary_json(s: &SessionSummary) -> Value {
 }
 
 /// 组装完整状态快照（GET /api/state 与 WS init 共用）
+
+/// 会话历史 → 前端回放 JSON（Switch/Fork/恢复时随 sessions 一起发）
+/// 工具调用还原成 toolblk 结构（thead=名称+参数摘要 / tbody=结果），与实时流一致
+fn session_history_json(s: &AgentSession) -> Value {
+    use r2_core::types::Role;
+    let items: Vec<Value> = s
+        .messages()
+        .iter()
+        .filter(|m| m.role != Role::System)
+        .map(|m| match m.role {
+            Role::User => json!({"kind": "user", "text": m.content}),
+            Role::Assistant => json!({
+                "kind": "assistant",
+                "text": m.content,
+                "tool_calls": m.tool_calls.clone().unwrap_or_default().iter().map(|c| json!({
+                    "id": c.id, "name": c.name, "arguments": c.arguments,
+                })).collect::<Vec<_>>(),
+            }),
+            Role::Tool => json!({
+                "kind": "tool_result",
+                "call_id": m.tool_call_id.clone().unwrap_or_default(),
+                "text": m.content,
+            }),
+            Role::System => unreachable!(),
+        })
+        .collect();
+    json!({"messages": items})
+}
+
 fn state_json(state: &WebState) -> Value {
     let cfg = config_snapshot(state);
     let sessions = session::list_sessions(&state.session_dir).unwrap_or_default();
@@ -144,8 +173,14 @@ fn state_json(state: &WebState) -> Value {
         Err(_) => (true, None),
     };
     let (_full, sections) = r2_core::agent::build_system_prompt(&cfg);
+    // 当前会话的历史（浏览器刷新/重连时回放画面；prompt 运行中则跳过）
+    let history = match state.agent.try_lock() {
+        Ok(g) => g.as_ref().map(session_history_json),
+        Err(_) => None,
+    };
     json!({
         "model": cfg.current_model(),
+        "history": history,
         "current_session": current,
         "sessions": sessions.iter().map(summary_json).collect::<Vec<_>>(),
         "tools": state.tools,
@@ -545,8 +580,10 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
             let mut guard = state.agent.lock().await;
             match AgentSession::resume(config, &id) {
                 Ok(s) => {
+                    let hist = session_history_json(&s);
                     install_session(state, &mut guard, s);
                     drop(guard);
+                    ws_send(sink, json!({"t": "session_history", "history": hist})).await;
                     broadcast_sessions(state);
                 }
                 Err(e) => {
@@ -565,9 +602,11 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
             match AgentSession::branch_from(config, &parent, upto) {
                 Ok(s) => {
                     let new_id = s.session_id().map(String::from);
+                    let hist = session_history_json(&s);
                     install_session(state, &mut guard, s);
                     drop(guard);
                     ws_send(sink, json!({"t": "forked", "id": new_id})).await;
+                    ws_send(sink, json!({"t": "session_history", "history": hist})).await;
                     broadcast_sessions(state);
                 }
                 Err(e) => {
