@@ -8,7 +8,7 @@ use crate::memory::{EmbeddingProvider, MemoryStore};
 use crate::model::{create_provider, ModelProvider, ModelResult};
 use crate::session::{Session, SessionEntry};
 use crate::tools::ToolRegistry;
-use crate::types::{Role, StreamChunk, UsageStats};
+use crate::types::{Role, StreamChunk, ToolCall, UsageStats};
 use futures_util::StreamExt;
 use std::io::Write;
 
@@ -549,6 +549,13 @@ impl Agent {
                 .provider
                 .parse_response(&chunks)
                 .map_err(|e| format!("解析模型响应失败：{e}"))?;
+            // 空响应守卫（v0.5.3）：流被提前掐断时正文与工具调用双空。
+            // 已知触发：GLM 内容审查（code 1301）在思考阶段掐流——HTTP 200、
+            // reasoning_content 正常流动、无 finish_reason 直接 EOF；工具结果
+            // （如新闻检索）含敏感内容时必触发，且该内容留在会话历史里会
+            // 持续触发。不拦截的话回合循环会静默写空消息结束——用户侧表现为
+            // "调了工具但不回复"。
+            validate_turn_output(&text, &tool_calls)?;
             // 用量统计：输出 = 回复文本 + 工具调用参数
             self.usage.output_tokens += crate::context::estimate_tokens(&text) as u64;
             for tc in &tool_calls {
@@ -725,8 +732,54 @@ impl Agent {
     }
 }
 
+/// 空响应守卫：正文与工具调用双空 = 流被掐断的显式错误（不静默成功）。
+/// 已知触发：GLM 内容审查（1301）在思考阶段掐流——HTTP 200、reasoning 正常、
+/// 无 finish_reason 直接 EOF；工具结果（如新闻检索）含敏感内容时必触发，
+/// 且该内容留在会话历史会持续触发。不拦截则回合循环静默写空消息——
+/// 用户侧表现为"调了工具但不回复"。
+fn validate_turn_output(
+    text: &str,
+    tool_calls: &[ToolCall],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if text.trim().is_empty() && tool_calls.is_empty() {
+        return Err(
+            "模型返回空响应（正文与工具调用均为空）。常见原因：\n\
+             1) 内容审查拦截（如 GLM 1301：会话上下文可能含敏感内容，例如新闻/检索结果——新建会话即可恢复，旧会话历史会持续触发）\n\
+             2) 流被网络中断提前掐断（直接重试即可）"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_validate_turn_output_empty_rejected() {
+        // 双空 = 掐流，必须显式报错（不静默）
+        let r = validate_turn_output("", &[]);
+        assert!(r.is_err(), "双空必须报错");
+        let msg = r.unwrap_err().to_string();
+        assert!(
+            msg.contains("内容审查") && msg.contains("新建会话"),
+            "错误信息要给出路：{msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_turn_output_valid_passes() {
+        // 有正文 / 有工具调用 / 两者都有 → 均通过
+        assert!(validate_turn_output("你好", &[]).is_ok());
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        assert!(validate_turn_output("", std::slice::from_ref(&call)).is_ok());
+        // 纯空白正文 + 无调用 = 仍算空
+        assert!(validate_turn_output("   \n  ", &[]).is_err());
+    }
+
     use super::*;
     use crate::model::ChunkStream;
     use crate::types::{Message, ToolCall, ToolSchema};
