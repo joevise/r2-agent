@@ -1069,7 +1069,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "r2-cli"
-version = "0.5.7"
+version = "0.5.8"
 dependencies = [
  "axum",
  "clap",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "r2-core"
-version = "0.5.7"
+version = "0.5.8"
 dependencies = [
  "async-trait",
  "bytes",

@@ -349,13 +349,12 @@ async fn put_prompt_file(
 }
 
 /// GET /skills：列 ~/.r2/skills/*\/SKILL.md 的名称 + 首行（目录不存在返回空数组）
-/// skills 搜索路径（壳层惯例：专属目录优先，生态目录兜底）。
-/// ~/.r2/skills = R2 专属；~/.agents/skills = 跨 agent 生态标准位（lark 系等）。
+/// skills 搜索路径：~/.r2/skills —— R2 唯一的 skill 家。
+/// 归属原则（用户拍板）：各 agent 管各自的目录，不扫别人的
+/// （~/.agents/skills 属于 OpenClaw 生态，与 R2 无关）。
+/// 安装约定：agent 装新 skill 一律写到 ~/.r2/skills/<name>/SKILL.md。
 fn skills_dirs() -> Vec<PathBuf> {
-    vec![
-        PathBuf::from(config::expand_tilde("~/.r2/skills")),
-        PathBuf::from(config::expand_tilde("~/.agents/skills")),
-    ]
+    vec![PathBuf::from(config::expand_tilde("~/.r2/skills"))]
 }
 
 /// 从 SKILL.md 提取描述：优先 YAML frontmatter 的 description，
