@@ -488,9 +488,12 @@ function renderHistory(h){
 let thinkCur=null;
 function thinkAppend(text){
   if(!thinkCur){
-    thinkCur=document.createElement("div");thinkCur.className="thinkblk";
-    thinkCur.innerHTML='<div class="thead"><span class="arrow"></span>💭 思考中…</div><div class="tbody"></div>';
-    thinkCur.querySelector(".thead").onclick=()=>thinkCur.classList.toggle("closed");
+    // 闭包必须捕获元素自身（d），不能捕获全局 thinkCur——
+    // thinkDone() 会把 thinkCur 置 null，捕获全局会导致点击空指针静默失败
+    const d=document.createElement("div");d.className="thinkblk";
+    d.innerHTML='<div class="thead"><span class="arrow"></span>💭 思考中…</div><div class="tbody"></div>';
+    d.querySelector(".thead").onclick=()=>d.classList.toggle("closed");
+    thinkCur=d;
     flow.appendChild(thinkCur);scrollBottom();
   }
   thinkCur.querySelector(".tbody").appendChild(document.createTextNode(text));
