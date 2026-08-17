@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>R2 Agent 整体架构 — 内部分享</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+:root{--bg:#0d0d0d;--fg:#e8e8e8;--dim:#9a9a9a;--line:#2a2a2a;--accent:#7ab0ff;--green:#7ad0a0;--warn:#e0b070;--red:#e08080}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font-family:'Noto Sans SC',system-ui,sans-serif;line-height:1.75;max-width:1080px;margin:0 auto;padding:40px 28px 80px}
+h1{font-size:30px;margin-bottom:6px;letter-spacing:1px}
+h1 .sub{font-size:14px;color:var(--dim);font-weight:normal;margin-left:12px}
+h2{font-size:22px;margin:52px 0 16px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+h2 .no{color:var(--accent);font-family:ui-monospace,monospace;margin-right:10px}
+h3{font-size:17px;margin:28px 0 10px;color:var(--accent)}
+p{margin:10px 0;color:var(--fg)}
+.meta{color:var(--dim);font-size:13px;margin-bottom:28px}
+.hero{background:linear-gradient(135deg,#161616,#0d0d0d);border:1px solid var(--line);border-radius:10px;padding:22px 26px;margin:24px 0}
+.hero .nums{display:flex;flex-wrap:wrap;gap:26px;margin-top:14px}
+.hero .num b{font-size:26px;font-family:ui-monospace,monospace;color:var(--accent)}
+.hero .num span{display:block;font-size:12px;color:var(--dim)}
+code{background:#1a1a1a;border:1px solid var(--line);border-radius:4px;padding:1px 6px;font-family:ui-monospace,monospace;font-size:13px;color:var(--green)}
+pre{background:#141414;border:1px solid var(--line);border-radius:8px;padding:16px;overflow-x:auto;margin:14px 0}
+pre code{background:none;border:none;padding:0;color:var(--fg);font-size:13px;line-height:1.7}
+table{border-collapse:collapse;width:100%;margin:14px 0;font-size:14px}
+th,td{border:1px solid var(--line);padding:8px 12px;text-align:left}
+th{background:#161616;color:var(--dim);font-weight:normal}
+td code{font-size:12px}
+.mermaid{background:#111;border:1px solid var(--line);border-radius:8px;padding:18px;margin:18px 0;text-align:center;overflow-x:auto}
+.tag{display:inline-block;border:1px solid var(--line);border-radius:20px;padding:1px 12px;font-size:12px;color:var(--dim);margin:2px 4px 2px 0}
+.tag.hl{color:var(--green);border-color:#2d4a3a}
+.note{border-left:3px solid var(--accent);background:#12161c;padding:12px 18px;border-radius:0 8px 8px 0;margin:16px 0;font-size:14px;color:var(--dim)}
+.note b{color:var(--fg)}
+.quote{border-left:3px solid var(--green);background:#101710;padding:12px 18px;border-radius:0 8px 8px 0;margin:16px 0;font-size:15px}
+ul{margin:10px 0 10px 22px}li{margin:5px 0}
+.small{font-size:13px;color:var(--dim)}
+</style>
+</head>
+<body>
+
+<h1>R2 Agent 整体架构<span class="sub">内部技术分享 · 2026-08</span></h1>
+<div class="meta">v0.6.0 · github.com/joevise/r2-agent · 3 天从零到 15 个 tag</div>
+
+<div class="hero">
+<b>2.5MB 单二进制 Rust Agent Runtime</b>——内核产生能力，壳只做观察和交互。
+<div class="nums">
+<div class="num"><b>~13k</b><span>行 Rust</span></div>
+<div class="num"><b>188</b><span>单元测试（0 fail）</span></div>
+<div class="num"><b>15</b><span>版本 tag</span></div>
+<div class="num"><b>2</b><span>真实 LLM Provider 验证</span></div>
+<div class="num"><b>4+1</b><span>内置工具</span></div>
+<div class="num"><b>0</b><span>运行时外部依赖</span></div>
+</div>
+</div>
+
+<!-- ═══════════════ 一、设计哲学 ═══════════════ -->
+<h2><span class="no">01</span>设计哲学：三条公理</h2>
+
+<div class="quote">R2 的每一行代码都必须能映射到这三条公理——映射不上的代码不存在。</div>
+
+<table>
+<tr><th>公理</th><th>含义</th><th>活案例</th></tr>
+<tr><td><b>内核产生能力，壳做观察与交互</b></td><td>能力=模型能调用的工具；一切展示/编排都在壳层</td><td>技能系统：内核零改动，只是 prompt 注入 + 文件扫描</td></tr>
+<tr><td><b>先用法后造法</b></td><td>没有真实使用场景的功能不写；bash 能解决的先不造专用原语</td><td>子 Agent 孵化：bash 自孵化验证够用后，spawn 原语搁置</td></tr>
+<tr><td><b>诚实降级</b></td><td>环境受限时 warn + 降级，绝不静默失败</td><td>沙箱三级降级链；GLM 审查掐流显式报错（v0.5.3）</td></tr>
+</table>
+
+<h3>能力边界的推导</h3>
+<p>Agent 需要什么能力？——<b>读写文件、执行命令、跨会话记忆、被嵌入</b>。除此之外的一切（MCP、技能、Console）都是这四件事的组合或包装，都在壳层：</p>
+<ul>
+<li><b>skill 不需要框架</b>：技能 = 磁盘上的 SKILL.md 文件 + agent 的 read/bash。动态扫描注入 prompt（v0.6.0），装了就会用，内核 0 行改动</li>
+<li><b>MCP 是生态适配器</b>：不是新能力，是"借别人能力"的标准接口，住在壳层配置里</li>
+<li><b>沙箱是使用许可</b>：能力不变，改变的是能力的边界</li>
+</ul>
+
+<!-- ═══════════════ 二、整体架构 ═══════════════ -->
+<h2><span class="no">02</span>整体架构：一个 Workspace，一个内核，四种形态</h2>
+
+<div class="mermaid">
+flowchart TB
+    subgraph CLI["crates/r2-cli — 壳（二进制 r2，2.5MB）"]
+        direction TB
+        A1["main.rs<br/>CLI 交互 / --once 一次性"]
+        A2["web.rs + web_ui.html<br/>R2 Console（Web Harness）"]
+        A3["sandbox_cmd.rs<br/>自孵化 Supervisor"]
+        A4["serve 模式<br/>JSON-RPC 2.0 · 任何语言嵌入"]
+    end
+
+    subgraph CORE["crates/r2-core — 内核（库）"]
+        direction TB
+        subgraph LOOP["回合循环 agent.rs"]
+            B1["AgentSession<br/>会话门面（事件流+steer）"]
+            B2["ContextManager<br/>L1 上下文 / L2 压缩"]
+            B3["空响应守卫<br/>（审查掐流检测）"]
+        end
+        subgraph TOOLS["工具系统（内核能力的全部）"]
+            C1["read / write / edit<br/>路径校验锁 work_dir"]
+            C2["bash<br/>三级沙箱"]
+            C3["mcp<br/>MCP 安装持久化"]
+            C4["MCP 连接器<br/>mcp_{name}_{tool}"]
+        end
+        subgraph MODEL["模型层"]
+            D1["openai_compat<br/>GLM 等（SSE 流式）"]
+            D2["anthropic<br/>Kimi 等"]
+            D3["models 注册表<br/>38 模型·实时价·预算"]
+        end
+        subgraph PERSIST["持久化"]
+            E1["Session<br/>JSONL 追加 + 分支树"]
+            E2["MemoryStore<br/>L3 跨会话记忆"]
+        end
+        subgraph SAFE["隔离 namespaces.rs + sandbox.rs"]
+            F1["rlimits + env 清洗"]
+            F2["cgroup v2 pids"]
+            F3["namespace 双 fork"]
+        end
+    end
+
+    A1 --> B1
+    A2 --> B1
+    A3 --> B1
+    A4 --> B1
+    B1 --> B2
+    B1 --> D1 & D2
+    B1 --> C1 & C2 & C3
+    C4 --> B1
+    B1 --> E1
+    B1 --> E2
+    C2 --> F1 & F2 & F3
+</div>
+
+<p class="small">依赖方向严格单向：壳 → 内核。内核不知道 Console 的存在（通过事件广播解耦，<code>AgentSession::subscribe()</code>）。</p>
+
+<!-- ═══════════════ 三、一次对话的生命周期 ═══════════════ -->
+<h2><span class="no">03</span>核心业务逻辑：一次对话的生命周期</h2>
+
+<div class="mermaid">
+sequenceDiagram
+    participant U as 用户（Console/CLI）
+    participant S as AgentSession
+    participant A as Agent 回合循环
+    participant P as Provider（GLM SSE 流）
+    participant T as 工具
+
+    U->>S: prompt(input)
+    S->>A: 转发（steer 通道同时挂载）
+
+    loop 最多 max_turns 轮
+        A->>A: 组装消息<br/>system(三层+技能) + L2摘要 + L3记忆 + 历史
+        A->>P: chat_stream
+        loop SSE 分片
+            P-->>A: reasoning_content（思考）
+            A-->>U: 💭 Thinking 事件（思考流展示）
+            P-->>A: content 增量
+            A-->>U: 📝 MessageUpdate（流式正文）
+        end
+        alt 模型要求调工具
+            P-->>A: tool_calls
+            A-->>T: 执行（read/write/edit/bash/mcp）
+            T-->>A: 结果（截断至 64KB）
+            A->>A: 结果入上下文 → 下一轮
+        else 模型给出最终回答
+            P-->>A: finish
+        end
+        opt 空响应守卫
+            A-->>U: 显式报错（审查掐流/断流诊断）
+        end
+        opt 用户中途转向
+            U->>A: steer(新指令)<br/>当前流被抛弃，带部分输出进入下一轮
+        end
+    end
+
+    A->>A: L1 超限检查 → L2 压缩<br/>（摘要模型折叠旧消息）
+    A-->>S: final_text
+    S-->>U: done + 用量统计（含思考 token）
+    S->>S: JSONL 追加落盘（崩溃可恢复）
+</div>
+
+<h3>关键设计点</h3>
+<ul>
+<li><b>思考流与正文分离</b>：GLM 的 <code>reasoning_content</code> 单独解析成 Thinking 事件——思考 token 计入用量（计费诚实），不进正文，不入会话历史</li>
+<li><b>steer 不等回合结束</b>：<code>tokio::select!</code> 同时监听模型流和转向通道，转向即时生效（当前流被抛弃，上下文保留）</li>
+<li><b>崩溃恢复零丢失</b>：每条消息即时 fs 到 JSONL，<code>kill -9</code> 后 <code>recover()</code> 逐行重放（实测验证）</li>
+</ul>
+
+<!-- ═══════════════ 四、system prompt 三层 ═══════════════ -->
+<h2><span class="no">04</span>System Prompt：三层人格 + 动态技能层</h2>
+
+<div class="mermaid">
+flowchart LR
+    subgraph INJECT["每次会话构建时注入"]
+        K["内核核心<br/>身份+工具规则<br/>（不可覆盖）"]
+        SK["技能层<br/>扫描 ~/.r2/skills<br/>（动态·不受覆盖）"]
+        SO["~/.r2/SOUL.md<br/>全局人格"]
+        AG["{work_dir}/AGENTS.md<br/>项目上下文<br/>（Cursor/Codex 同标准）"]
+    end
+    K --> FULL["完整 system prompt"]
+    SK --> FULL
+    SO --> FULL
+    AG --> FULL
+    CUST["config system_prompt<br/>（显式覆盖 SOUL/AGENTS 两层）"] -.->|可选| FULL
+</div>
+
+<p><b>技能层是 v0.6.0 的关键决策</b>：每次会话启动动态扫描 <code>~/.r2/skills/*/SKILL.md</code>，把「已装技能清单 + 使用约定（cat 读全文 → 遵循执行）」注入 prompt。装了自动可见、删了自动消失、零维护清单。技能层放在自定义覆盖之外——能力感知必须始终可见。</p>
+
+<!-- ═══════════════ 五、三级沙箱 ═══════════════ -->
+<h2><span class="no">05</span>三级沙箱：从防误操作到结构性隔离</h2>
+
+<div class="mermaid">
+flowchart TB
+    subgraph L0["level = off"]
+        O["无隔离<br/>（本机信任环境）"]
+    end
+    subgraph L1["level = container（默认）"]
+        R1["rlimits：CPU / AS / FSIZE / NPROC"]
+        R2["环境变量清洗（白名单+PATH 重设）"]
+        R3["cgroup v2 pids：fork 炸弹内核级拦截<br/>（智能选层·跳过 domain-threaded）"]
+        R4["高危命令启发式（可选·防误操作）"]
+    end
+    subgraph L2["level = strict"]
+        R5["container 全部"]
+        R6["mount ns：chroot busybox 最小根<br/>宿主路径结构性不存在"]
+        R7["pid ns：双 fork·/proc 只见自己"]
+        R8["net ns：断网（反弹 shell 不可能）"]
+    end
+    L0 --> L1 --> L2
+</div>
+
+<h3>降级链（诚实原则的活用）</h3>
+<div class="mermaid">
+flowchart LR
+    S["strict 请求"] --> C1{"can_namespace()?()<br/>root 或 AppArmor 未限制"}
+    C1 -- 否 --> W1["warn 降级 container<br/>（Ubuntu 24.04 空壳 userns 探测）"]
+    C1 -- 是 --> T["尝试双 fork namespace"]
+    T --> C2{"unshare EPERM?<br/>（容器 seccomp 拦截）"}
+    C2 -- 是 --> W2["warn 摘除 ns 重试<br/>降级 container"]
+    C2 -- 否 --> OK["✓ namespace 生效"]
+    W1 --> CT["container：<br/>rlimits + cgroup 照常"]
+    W2 --> CT
+    CT --> C3{"cgroup 可用?"}
+    C3 -- 否 --> W3["warn 降级 rlimits"]
+    C3 -- 是 --> OK2["✓ cgroup pids 生效"]
+</div>
+
+<h3>双 fork 进程树（v0.5.2）——沙箱最精妙的一段</h3>
+<div class="mermaid">
+flowchart TB
+    R2["r2 主进程"] --> MID["中间进程（保姆）<br/>unshare(user? + mount/pid/net ns)<br/>MS_PRIVATE 锁挂载传播<br/>bind work → 最小根/work"]
+    MID --> SUN["孙进程 = 新 PID ns 内的 PID 1<br/>挂 /proc（只含沙箱进程）<br/>chroot 最小根 + chdir(/work)<br/>execve sh -c 命令"]
+    MID -.->|waitpid 传播退出码<br/>（信号→128+sig）| SUN
+    SUN -.->|PID 1 死亡 → 内核回收<br/>整个进程空间·零僵尸| X["💀"]
+</div>
+<p class="small">为什么必须双 fork：<code>unshare(CLONE_NEWPID)</code> 只对之后 fork 的子进程生效。单 fork 时挂 /proc 会暴露宿主进程列表，<code>/proc/1/root</code> 更是经典 chroot 逃逸面——v0.5.0 实测发现后禁挂 /proc，v0.5.2 双 fork 彻底解决：孙进程"出生"在新 PID 空间，由它挂的 /proc 天然只见沙箱自身。</p>
+
+<!-- ═══════════════ 六、上下文与记忆 ═══════════════ -->
+<h2><span class="no">06</span>上下文管理：L1 / L2 / L3</h2>
+
+<table>
+<tr><th>层</th><th>对象</th><th>机制</th><th>持久化</th></tr>
+<tr><td><b>L1</b></td><td>当前上下文窗口</td><td>token 预算监控（模型注册表自动推导窗口）</td><td>—</td></tr>
+<tr><td><b>L2</b></td><td>会话内压缩</td><td>超阈值时旧消息交摘要模型折叠成 system 摘要，近期消息保留</td><td>会话 JSONL</td></tr>
+<tr><td><b>L3</b></td><td>跨会话记忆</td><td>智谱 embedding-3（2048 维）语义检索 + 时间衰减打分，新会话自动召回相关记忆</td><td>SQLite memory.db</td></tr>
+</table>
+
+<div class="note"><b>L3 是对 Pi/MCP 生态的差异化武器</b>：别的 Agent 重启即失忆，R2 记得上次装的 MCP、上次聊的决策。检索是语义级的（embedding 相似度），不是关键词匹配——问法变了也能召回。</div>
+
+<!-- ═══════════════ 七、会话与分支 ═══════════════ -->
+<h2><span class="no">07</span>会话持久化：JSONL 追加 + 分支树</h2>
+
+<div class="mermaid">
+flowchart LR
+    subgraph SESSIONS["~/.r2/sessions/"]
+        S1["sess-A.jsonl<br/>user→asst→tool→…"]
+        S2["sess-B.jsonl<br/>（branch_from: A, upto: 5）"]
+        S3["sess-C.jsonl<br/>（branch_from: A, upto: 3）"]
+    end
+    S1 -->|"fork(parent=A, upto=5)<br/>恢复 A 前 5 条消息<br/>新文件独立追加"| S2
+    S1 -->|"fork(parent=A, upto=3)"| S3
+</div>
+
+<ul>
+<li><b>追加式 JSONL</b>：每条消息一行（type/role/content/ts），永不重写，崩溃后逐行重放即恢复</li>
+<li><b>SessionTree</b>：分叉只存父引用+upto 断点，共享前缀零拷贝；循环引用防御（visited set）+ 断链降级</li>
+<li><b>Console 的切换/回放</b>：resume 时按父链拼出完整历史（v0.5.4），UI 回放含工具块还原</li>
+</ul>
+
+<!-- ═══════════════ 八、四种嵌入形态 ═══════════════ -->
+<h2><span class="no">08</span>同一内核，四种形态</h2>
+
+<div class="mermaid">
+flowchart TB
+    CORE(("r2-core<br/>AgentSession 库"))
+    CORE --> F1["💻 CLI<br/>r2 --once '任务' / 交互式<br/>脚本化·管道友好"]
+    CORE --> F2["🔌 JSON-RPC serve<br/>stdin/stdout 行分隔<br/>Python/Node/Go/任何语言宿主"]
+    CORE --> F3["🌐 R2 Console<br/>r2 web --port 5290<br/>axum+WS·手机适配·公网"]
+    CORE --> F4["🛡 自孵化 Supervisor<br/>r2 sandbox run '任务'<br/>每会话一个隔离子进程"]
+</div>
+
+<table>
+<tr><th>形态</th><th>命令</th><th>定位</th><th>关键能力</th></tr>
+<tr><td>CLI</td><td><code>r2 --once "…"</code></td><td>开发者日常</td><td>成本核算·会话管理·models 列表</td></tr>
+<tr><td>serve</td><td><code>r2 serve</code></td><td>嵌入任何语言</td><td>JSON-RPC 2.0·initialize 可覆盖配置·事件流</td></tr>
+<tr><td>Console</td><td><code>r2 web</code></td><td>人人可用的界面</td><td>思考流·会话切换/分叉·技能 tab·模型切换·文件上传·三层 prompt 编辑</td></tr>
+<tr><td>Supervisor</td><td><code>r2 sandbox run</code></td><td>云端多租户预备</td><td>会话 cgroup 整树核算·env 清洗·密钥 0600 文件传递·--ephemeral 用完即毁</td></tr>
+</table>
+
+<div class="note"><b>自孵化 vs Docker（方向修正案例）</b>：原计划每会话一个 Docker 容器。后来想通——Docker 的隔离本体就是 namespace+cgroup+seccomp，这三个内核原语 R2 已全部自实现。自孵化方案每会话开销 15-25MB（纯进程）vs Docker 40-60MB（shim+容器），启动 &lt;100ms vs 1-2s，零外部依赖。隔离强度相同，泄漏点更少。这是"不能映射到公理的代码不存在"的架构级应用。</div>
+
+<!-- ═══════════════ 九、技能与 MCP ═══════════════ -->
+<h2><span class="no">09</span>扩展机制：技能（自有）+ MCP（生态）</h2>
+
+<div class="mermaid">
+flowchart LR
+    subgraph SKILL["技能系统（自有·零框架）"]
+        K1["~/.r2/skills/*/SKILL.md"] --> K2["会话启动动态扫描"]
+        K2 --> K3["清单+使用约定<br/>注入 system prompt"]
+        K3 --> K4["agent: cat 读全文<br/>→ 遵循执行"]
+        K4 --> K5["装新 skill 也写到该目录<br/>（agent 自己可完成）"]
+    end
+    subgraph MCP["MCP（生态适配器）"]
+        M1["config.toml<br/>[[mcp.servers]]"] --> M2["启动时 stdio 握手<br/>列出工具"]
+        M2 --> M3["mcp_{name}_{tool}<br/>像内置工具一样调用"]
+        M4["内置 mcp 工具<br/>add/list/remove"] --> M1
+    end
+</div>
+
+<ul>
+<li><b>技能闭环</b>：装了就会用（v0.6.0 实测：agent 第一动作就是 cat SKILL.md）；技能教 agent 装 skill（writing-skills 技能自己就在技能目录里）——自举</li>
+<li><b>MCP 闭环</b>：对话中说"帮我装个 tavily"→ agent 调 mcp 工具写配置 → 新会话自动连接（文本手术写入，保注释/字段序）</li>
+<li><b>边界清晰</b>：技能=自有知识（文件+prompt 注入）；MCP=外部能力（进程+协议）。都不在内核</li>
+</ul>
+
+<!-- ═══════════════ 十、模型层 ═══════════════ -->
+<h2><span class="no">10</span>模型层：双 Provider + 注册表</h2>
+
+<ul>
+<li><b>openai_compat</b>：GLM-5.2 等（SSE 流式，reasoning_content 思考流解析）；<b>anthropic</b>：Kimi coding plan 等——两家真实跑通，切换只改 config</li>
+<li><b>models 注册表</b>（38 模型）：上下文窗口自动预算（未知模型 128K 兜底）、输入/输出参考价（国际走 OpenRouter 实时 API，国内走官方定价）、coding plan 标注——成本核算有据可依</li>
+<li><b>建连重试</b>：429/5xx 指数退避（1s/2s/4s），流开始后不重试（幂等性诚实）</li>
+</ul>
+
+<!-- ═══════════════ 十一、时间线 ═══════════════ -->
+<h2><span class="no">11</span>三天演进时间线</h2>
+
+<table>
+<tr><th>版本</th><th>主题</th><th>核心内容</th></tr>
+<tr><td>v0.1.0</td><td>内核</td><td>双 Provider / 4 工具 / 崩溃恢复 / L2 压缩 / L3 记忆 / 沙箱一级 / fuzz 加固</td></tr>
+<tr><td>v0.2.x</td><td>控制力</td><td>AgentSession 嵌入库 / Steering 中途转向 / SessionTree 分支 / L3 neural embedding</td></tr>
+<tr><td>v0.3.x</td><td>互操作</td><td>JSON-RPC serve（任何语言）/ MCP 适配器 / Provider 注册表（38 模型）</td></tr>
+<tr><td>v0.4.0</td><td>Console</td><td>Web Harness（axum+WS）/ 三层 prompt / 手机适配 / 公网隧道</td></tr>
+<tr><td>v0.4.1</td><td>沙箱硬化</td><td>cgroup v2 pids（fork 炸弹内核拦截·智能选层）/ 高危命令启发式</td></tr>
+<tr><td>v0.5.0</td><td>云沙箱</td><td>namespace 隔离（mount 假根+断网+逃逸面消除）/ 自孵化 Supervisor</td></tr>
+<tr><td>v0.5.1</td><td>MCP 闭环</td><td>mcp 内置工具（安装持久化）/ Console 新会话配置刷新</td></tr>
+<tr><td>v0.5.2</td><td>沙箱完型</td><td>双 fork PID ns（沙箱内 ps 复活·宿主不可见·零僵尸）</td></tr>
+<tr><td>v0.5.3~5.9</td><td>Console 打磨</td><td>审查掐流显式报错 / 会话历史回放 / 思考流 / 技能 tab / 拼音组字保护</td></tr>
+<tr><td>v0.6.0</td><td>技能感知</td><td>动态扫描注入（装了就会用）——技能闭环完成</td></tr>
+</table>
+
+<!-- ═══════════════ 十二、教训 ═══════════════ -->
+<h2><span class="no">12</span>踩坑实录（值得内部分享的硬知识）</h2>
+
+<table>
+<tr><th>坑</th><th>根因</th><th>修复</th></tr>
+<tr><td>cgroup 组建在 systemd 环境失败</td><td>domain-threaded 层下子组 type=domain invalid，写 procs 报 EOPNOTSUPP</td><td>逐层向上探测，读 cgroup.type 只认 domain 层</td></tr>
+<tr><td>Ubuntu 24.04 无 root 跑不了 ns</td><td>AppArmor 空壳 userns：unshare 成功但 uid_map 写入 EPERM</td><td>can_namespace() 诚实探测 + 自动降级</td></tr>
+<tr><td>双 fork 首测全部 exit 127</td><td>execve 的 argv 必须是 NULL 结尾 char**——Vec&lt;CString&gt;.as_ptr() 是结构体数组指针</td><td>fork 前预构建独立指针数组（usize 携带过闭包边界）</td></tr>
+<tr><td>GLM 搜索新闻后永久失灵</td><td>内容审查 1301 在流式下不报错而是掐流；敏感内容留在历史持续触发</td><td>空响应守卫：双空=显式错误+诊断出路</td></tr>
+<tr><td>pkill 误杀自己</td><td>-f 模式匹配到执行 wrapper 自身的命令行</td><td>锚定模式 ^./target/release/r2</td></tr>
+</table>
+
+<div class="quote" style="margin-top:36px">R2 的下一步：OpenClaw↔R2 对接（内核替换验证）→ 公网多租户（会话沙箱池）→ Firecracker 微虚机（规模化隔离）。内核只有 2.5MB，但它的公理是完整的。</div>
+
+<p class="small" style="margin-top:30px">R2 Agent · docs/architecture.html · 2026-08-17 · 生成于 v0.6.0</p>
+
+<script>mermaid.initialize({startOnLoad:true,theme:'dark',themeVariables:{fontSize:'14px',primaryColor:'#1a2332',primaryTextColor:'#e8e8e8',primaryBorderColor:'#3a5070',lineColor:'#4a6080',secondaryColor:'#1a2a20',tertiaryColor:'#241a20'}});</script>
+</body>
+</html>
