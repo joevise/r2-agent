@@ -572,8 +572,18 @@ function autoHeight(){
   const line=20;input.style.height=Math.min(input.scrollHeight,line*8)+"px";
 }
 input.addEventListener("input",autoHeight);
+/* IME 组字保护（拼音/注音等中文输入法）：
+   组字中按回车 = 选字上屏，绝不能发送——否则半截拼音直接飞出去。
+   三重检测兜底各平台：composition 事件标志 / keydown 自带 isComposing /
+   keyCode 229（部分安卓输入法只报这个） */
+let composing=false;
+input.addEventListener("compositionstart",()=>{composing=true});
+input.addEventListener("compositionend",()=>{composing=false});
 input.addEventListener("keydown",e=>{
-  if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendInput()}
+  if(e.key==="Enter"&&!e.shiftKey){
+    if(composing||e.isComposing||e.keyCode===229)return;
+    e.preventDefault();sendInput()
+  }
 });
 function insertAtCursor(text){
   const s=input.selectionStart??input.value.length;
