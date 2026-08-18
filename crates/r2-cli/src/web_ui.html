@@ -74,6 +74,12 @@ textarea[readonly]{color:var(--dim)}
 .gevh .gk{color:var(--fg)}
 .gevc{font-size:13px;margin:3px 0}
 .geve{font-size:11px;color:var(--dim);border-top:1px dashed var(--line);padding-top:2px;margin-top:2px}
+.gskl{border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:10px;max-height:180px;overflow-y:auto}
+.gsk{font-size:12.5px;padding:2px 0}
+.gb{font-size:10.5px;border:1px solid var(--line);border-radius:10px;padding:0 6px;margin-left:4px}
+.gb.trial{color:var(--dim)}
+.gb.promoted{color:var(--fg);border-color:#3a6045}
+.gdecay{border:1px dashed #6a5535;border-radius:8px;padding:8px 12px;margin-bottom:10px;font-size:12.5px;color:#e0b070}
 /* skills */
 .skill{padding:5px 4px;border-bottom:1px solid var(--line)}
 .skill .nm{cursor:pointer}
@@ -438,6 +444,22 @@ async function loadGrowth(){
           :'<div class="ggoal dim">未设置目标 · 写入 ~/.r2/GOAL.md 启用定向成长</div>';
     h+='<div class="gstats">技能 <b>'+g.skills_count+'</b> · 教训(7天) <b>'+g.lessons_7d+'</b> · 进化事件 <b>'+g.total_events+'</b></div>';
     h+='</div>';
+    // 技能清单（带生命周期徽章 + 使用统计）
+    const sks=g.skills||[];
+    if(sks.length){
+      h+='<div class="gskl">';
+      for(const s of sks){
+        const badge=s.status==="trial"?"🧪 试用":s.status==="promoted"?"⭐ 转正":"";
+        const use=s.used?(" · 用过"+s.used+"次"+(s.success_rate!=null?" · 成功率"+s.success_rate+"%":"")):"";
+        h+='<div class="gsk">'+esc(s.name)+(badge?' <span class="gb '+esc(s.status)+'">'+badge+'</span>':'')+'<span class="dim">'+use+'</span></div>';
+      }
+      h+='</div>';
+    }
+    // 衰退预警（90天未命中）
+    const dc=g.decayed||[];
+    if(dc.length){
+      h+='<div class="gdecay">🍂 衰退预警（90天未用）：'+dc.map(d=>esc(d.name)).join("、")+'<br><span class="dim">建议清理或合并——技能层注入有预算成本</span></div>';
+    }
     // 时间线
     const evs=g.events||[];
     if(!evs.length){
@@ -448,7 +470,7 @@ async function loadGrowth(){
         const e=evs[i];
         const t=new Date((e.ts||0)*1000);
         const dt=(t.getMonth()+1)+"/"+t.getDate()+" "+String(t.getHours()).padStart(2,"0")+":"+String(t.getMinutes()).padStart(2,"0");
-        const kindBadge={"lesson":"📖 教训","skill_draft":"✏️ 技能起草","skill_promoted":"⭐ 技能转正","goal_set":"🎯 目标","mcp_installed":"🔌 MCP","decay":"🍂 衰退"}[e.kind]||e.kind;
+        const kindBadge={"lesson":"📖 教训","skill_draft":"✏️ 技能起草","skill_promoted":"⭐ 技能转正","skill_archived":"🗄️ 技能归档","goal_set":"🎯 目标","mcp_installed":"🔌 MCP","decay":"🍂 衰退"}[e.kind]||e.kind;
         h+='<div class="gev"><div class="gevh"><span class="gk">'+kindBadge+'</span><span class="gt">'+dt+'</span></div>';
         h+='<div class="gevc">'+esc(e.content)+'</div>';
         h+='<div class="geve">证据：'+esc(e.evidence)+'</div></div>';

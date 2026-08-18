@@ -500,6 +500,46 @@ impl Agent {
         }
     }
 
+    /// 同族教训 ≥3 条 → LLM 合成 SKILL.md 草稿（trial 状态）→ 事件 + git 快照。
+    /// 每轮最多起草 1 个（防突发成批）；名字冲突 = 已在成长中，跳过。
+    async fn maybe_draft_skill(&mut self) {
+        let clusters = crate::evolution::detect_lesson_clusters(3);
+        let Some(lessons) = clusters.first() else { return };
+        let msgs = crate::evolution::draft_messages(lessons);
+        let Ok(mut stream) = self.provider.chat_stream(&msgs, &[]).await else {
+            return;
+        };
+        let mut chunks = Vec::new();
+        use futures_util::StreamExt;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(c) => chunks.push(c),
+                Err(_) => return,
+            }
+        }
+        let Ok((text, _)) = self.provider.parse_response(&chunks) else {
+            return;
+        };
+        let Some(name) = crate::evolution::parse_draft_name(&text) else {
+            return;
+        };
+        if crate::evolution::write_draft_skill(&name, &text).is_ok() {
+            let n = lessons.len();
+            let _ = crate::evolution::append_event(&crate::evolution::EvolutionEvent {
+                ts: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                kind: "skill_draft".into(),
+                content: format!("同族教训 ×{n} 自动合成技能「{name}」（试用中）"),
+                evidence: lessons.first().cloned().unwrap_or_default(),
+                session_id: self.session_id().unwrap_or("unknown").to_string(),
+            });
+            let _ = crate::evolution::snapshot_self(&format!("draft skill {name}"));
+            self.emit(AgentEvent::Evolved(format!("✏️ 教训攒够 {n} 条，自动起草技能 {name}（试用）")));
+        }
+    }
+
     async fn summarize(&mut self, old_msgs: &[crate::types::Message]) -> ModelResult<String> {
         // 把待压缩消息转成可读对话文本
         let mut dialogue = String::new();
@@ -722,6 +762,10 @@ impl Agent {
                     arguments: call.arguments.clone(),
                 });
                 let result = self.tools.execute(call).await;
+                // 技能使用追踪：引用即记，成败入统计（晋升/衰退原料）
+                if let Some(sk) = crate::evolution::detect_skill_reference(&call.name, &call.arguments) {
+                    crate::evolution::record_skill_use(&sk, !result.starts_with("ERROR"));
+                }
                 // 硬信号采集：ERROR 前缀 = 工具失败；曾失败的工具成功 = 重试爬出
                 if result.starts_with("ERROR") {
                     let preview_e: String = result.chars().take(160).collect();
@@ -803,6 +847,9 @@ impl Agent {
         // 反思钩子：Done 之后跑（用户已见到回复），教训落进化流
         let task_summary: String = user_input.chars().take(200).collect();
         self.reflect_and_record(&task_summary).await;
+        // 聚类检查（无条件）：种子教训可能来自历史会话，不能只靠"新教训落流"触发；
+        // 幂等保护 = 同名技能已存在时 write_draft_skill 拒绝（E2E 实测发现的 gap）
+        self.maybe_draft_skill().await;
         Ok(final_text)
     }
 

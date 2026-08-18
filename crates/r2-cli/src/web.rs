@@ -481,13 +481,41 @@ async fn api_growth() -> Json<Value> {
         }
     }
     let lessons_7d = events.iter().filter(|e| e.kind == "lesson" && e.ts >= week_ago).count();
+    // 技能状态徽章 + 使用统计 + 衰退预警（阶段2/3）
+    let usage = r2_core::evolution::read_usage();
+    let skills_with_status: Vec<Value> = skills
+        .into_iter()
+        .map(|mut s| {
+            let name = s["name"].as_str().unwrap_or("").to_string();
+            let status = r2_core::evolution::read_skill_status(&name);
+            s["status"] = match status.as_deref() {
+                Some("trial") => json!("trial"),
+                Some("promoted") => json!("promoted"),
+                _ => json!("native"), // 手写技能
+            };
+            if let Some(u) = usage.get(&name) {
+                s["used"] = json!(u.count);
+                s["success_rate"] = if u.count > 0 {
+                    json!(u.success * 100 / (u.success + u.fail))
+                } else {
+                    json!(null)
+                };
+            }
+            s
+        })
+        .collect();
+    let decayed: Vec<Value> = r2_core::evolution::decayed_skills()
+        .into_iter()
+        .map(|(name, last)| json!({"name": name, "last_used": last}))
+        .collect();
     Json(json!({
         "goal": r2_core::evolution::read_goal(),
-        "skills": skills,
-        "skills_count": skills.len(),
+        "skills": skills_with_status,
+        "skills_count": skills_with_status.len(),
         "events": events_json,
         "lessons_7d": lessons_7d,
         "total_events": events.len(),
+        "decayed": decayed,
     }))
 }
 
