@@ -516,6 +516,7 @@ async fn api_growth() -> Json<Value> {
         "lessons_7d": lessons_7d,
         "total_events": events.len(),
         "decayed": decayed,
+        "tasks": r2_core::tasks::load_store().tasks,
     }))
 }
 
@@ -537,6 +538,11 @@ enum ClientMsg {
     Fork { parent: String, upto: Option<usize> },
     DeleteSession(String),
     SetModel(String),
+    TaskApprove(String),
+    TaskReject(String),
+    TaskPause(String),
+    TaskResume(String),
+    TaskDelete(String),
 }
 
 /// 取字符串字段的辅助
@@ -570,6 +576,11 @@ fn parse_client_msg(text: &str) -> Result<ClientMsg, String> {
             Ok(ClientMsg::Fork { parent, upto })
         }
         "delete_session" => Ok(ClientMsg::DeleteSession(get_str(&v, "id")?.to_string())),
+    "task_approve" => Ok(ClientMsg::TaskApprove(get_str(&v, "id")?.to_string())),
+    "task_reject" => Ok(ClientMsg::TaskReject(get_str(&v, "id")?.to_string())),
+    "task_pause" => Ok(ClientMsg::TaskPause(get_str(&v, "id")?.to_string())),
+    "task_resume" => Ok(ClientMsg::TaskResume(get_str(&v, "id")?.to_string())),
+    "task_delete" => Ok(ClientMsg::TaskDelete(get_str(&v, "id")?.to_string())),
         "set_model" => Ok(ClientMsg::SetModel(get_str(&v, "model")?.to_string())),
         other => Err(format!("未知消息类型：{other}")),
     }
@@ -756,6 +767,67 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
                 Err(e) => ws_error(sink, &format!("删除失败：{e}")).await,
             }
         }
+        ClientMsg::TaskApprove(id) => {
+            // 签字权：唯一的 pending→active 通道（工具永远到不了这里）
+            let mut store = r2_core::tasks::load_store();
+            let tz = r2_core::tasks::local_tz_offset_secs();
+            match r2_core::tasks::transition(&mut store, &id, "active") {
+                Ok(()) => {
+                    if let Some(t) = store.tasks.iter_mut().find(|t| t.id == id) {
+                        t.next_due = r2_core::tasks::next_run(&t.schedule, r2_core::tasks::now_ts(), tz);
+                    }
+                    let _ = r2_core::tasks::save_store(&store);
+                    let _ = state.event_tx.send(json!({"t": "task_state", "id": id, "state": "active"}));
+                    let _ = state.event_tx.send(tasks_broadcast_payload());
+                }
+                Err(e) => { ws_error(sink, &format!("批准失败：{e}")).await; }
+            }
+        }
+        ClientMsg::TaskReject(id) => {
+            let mut store = r2_core::tasks::load_store();
+            match r2_core::tasks::transition(&mut store, &id, "rejected") {
+                Ok(()) => {
+                    let _ = r2_core::tasks::save_store(&store);
+                    let _ = state.event_tx.send(json!({"t": "task_state", "id": id, "state": "rejected"}));
+                    let _ = state.event_tx.send(tasks_broadcast_payload());
+                }
+                Err(e) => { ws_error(sink, &format!("拒绝失败：{e}")).await; }
+            }
+        }
+        ClientMsg::TaskPause(id) => {
+            let mut store = r2_core::tasks::load_store();
+            match r2_core::tasks::transition(&mut store, &id, "paused") {
+                Ok(()) => {
+                    let _ = r2_core::tasks::save_store(&store);
+                    let _ = state.event_tx.send(tasks_broadcast_payload());
+                }
+                Err(e) => { ws_error(sink, &format!("暂停失败：{e}")).await; }
+            }
+        }
+        ClientMsg::TaskResume(id) => {
+            let mut store = r2_core::tasks::load_store();
+            let tz = r2_core::tasks::local_tz_offset_secs();
+            match r2_core::tasks::transition(&mut store, &id, "active") {
+                Ok(()) => {
+                    if let Some(t) = store.tasks.iter_mut().find(|t| t.id == id) {
+                        t.next_due = r2_core::tasks::next_run(&t.schedule, r2_core::tasks::now_ts(), tz);
+                    }
+                    let _ = r2_core::tasks::save_store(&store);
+                    let _ = state.event_tx.send(tasks_broadcast_payload());
+                }
+                Err(e) => { ws_error(sink, &format!("恢复失败：{e}")).await; }
+            }
+        }
+        ClientMsg::TaskDelete(id) => {
+            let mut store = r2_core::tasks::load_store();
+            match r2_core::tasks::remove_task(&mut store, &id) {
+                Ok(()) => {
+                    let _ = r2_core::tasks::save_store(&store);
+                    let _ = state.event_tx.send(tasks_broadcast_payload());
+                }
+                Err(e) => { ws_error(sink, &format!("删除失败：{e}")).await; }
+            }
+        }
         ClientMsg::SetModel(model) => {
             {
                 let mut cfg = state.config.lock().expect("config 锁中毒");
@@ -787,6 +859,114 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
 // ---------- 启动 ----------
 
 /// r2 web 入口：绑定 127.0.0.1（仅本机，安全默认），起 axum 服务
+
+// ═══ 定时任务调度器（v0.8 后台成长）═══
+
+/// 每日后台运行上限（预算护栏：无人值守的烧钱上限）
+const BG_MAX_PER_DAY: u64 = 12;
+/// 后台任务超时（秒）
+const BG_TIMEOUT_SECS: u64 = 600;
+
+fn tasks_broadcast_payload() -> Value {
+    let store = r2_core::tasks::load_store();
+    json!({"t": "tasks", "tasks": store.tasks})
+}
+
+/// 执行一个到期的后台任务：独立 AgentSession（不碰前台会话锁），
+/// 事件桥接到全局广播，结果摘要回写任务表
+async fn run_background_task(state: &Arc<WebState>, task: &mut r2_core::tasks::Task) {
+    let cfg = config_snapshot_fresh_mcp(state);
+    let Ok(mut session) = AgentSession::new(cfg) else {
+        task.last_result = Some("ERROR: 后台会话创建失败".into());
+        return;
+    };
+    // 事件桥：后台会话 → 全局 WS 广播（前端实时看到它在学什么）
+    let mut rx = session.subscribe();
+    let tx = state.event_tx.clone();
+    let bg_name = task.name.clone();
+    let fwd = tokio::spawn(async move {
+        while let Ok(e) = rx.recv().await {
+            let _ = tx.send(json!({"t": "event", "evt": rpc::event_json(&e), "bg": bg_name}));
+        }
+    });
+    let _ = state.event_tx.send(json!({
+        "t": "bg_started", "name": task.name, "prompt_preview":
+        task.prompt.chars().take(120).collect::<String>(),
+    }));
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(BG_TIMEOUT_SECS),
+        session.prompt(&task.prompt),
+    )
+    .await;
+    fwd.abort();
+    let summary = match result {
+        Ok(Ok(text)) => {
+            let s: String = text.chars().take(300).collect();
+            format!("✅ {s}")
+        }
+        Ok(Err(e)) => format!("❌ {e}"),
+        Err(_) => format!("⏱ 超时（{}s）", BG_TIMEOUT_SECS),
+    };
+    task.last_result = Some(summary.clone());
+    let _ = state.event_tx.send(json!({
+        "t": "bg_done", "name": task.name,
+        "result_preview": summary.chars().take(200).collect::<String>(),
+    }));
+}
+
+/// 调度循环：每 20 秒一拍。①新起草任务 → 推审批卡 ②到期 active 任务 → 执行。
+/// 挂在 Console 进程内（不加新常驻进程——方案C 核心）。
+fn spawn_scheduler(state: Arc<WebState>) {
+    tokio::spawn(async move {
+        let tz = r2_core::tasks::local_tz_offset_secs();
+        let mut known_pending: std::collections::HashSet<String> = r2_core::tasks::load_store()
+            .tasks
+            .iter()
+            .filter(|t| t.state == "pending")
+            .map(|t| t.id.clone())
+            .collect();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            let mut store = r2_core::tasks::load_store();
+            // ① 新 pending → 广播审批卡（含启动时已有的：首次也会推一遍）
+            for t in store.tasks.iter().filter(|t| t.state == "pending") {
+                if known_pending.insert(t.id.clone()) {
+                    let _ = state.event_tx.send(json!({"t": "task_pending", "task": t}));
+                }
+            }
+            known_pending.retain(|id| {
+                store.tasks.iter().any(|t| &t.id == id && t.state == "pending")
+            });
+            // ② 到期执行
+            let now = r2_core::tasks::now_ts();
+            let due: Vec<String> = store
+                .tasks
+                .iter()
+                .filter(|t| t.state == "active" && t.next_due.map(|d| d <= now).unwrap_or(false))
+                .map(|t| t.id.clone())
+                .collect();
+            for id in due {
+                // 预算闸先行（独占可变借用），再取任务借用——两段借用不重叠
+                if r2_core::tasks::budget_gate(&mut store, BG_MAX_PER_DAY).is_err() {
+                    if let Some(task) = store.tasks.iter_mut().find(|t| t.id == id) {
+                        task.last_result = Some("⏭ 今日预算已满，跳过（明日恢复）".into());
+                        task.next_due = r2_core::tasks::next_run(&task.schedule, now, tz);
+                    }
+                    continue;
+                }
+                let Some(task) = store.tasks.iter_mut().find(|t| t.id == id) else {
+                    continue;
+                };
+                run_background_task(&state, task).await;
+                task.last_run = Some(now);
+                task.next_due = r2_core::tasks::next_run(&task.schedule, now, tz);
+            }
+            let _ = r2_core::tasks::save_store(&store);
+            let _ = state.event_tx.send(tasks_broadcast_payload());
+        }
+    });
+}
+
 pub async fn run(config: Config, port: u16, host: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let session_dir = config::expand_tilde(&config.session.dir);
     let work_dir = config::expand_tilde(&config.agent.work_dir);
@@ -805,6 +985,8 @@ pub async fn run(config: Config, port: u16, host: String) -> Result<(), Box<dyn 
         tools,
     });
 
+    // 调度器先克隆再建路由（with_state 会 move state）
+    spawn_scheduler(state.clone());
     let app = Router::new()
         .route("/", get(index))
         .route("/upload", post(upload))

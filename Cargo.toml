@@ -3,7 +3,7 @@ members = ["crates/r2-core", "crates/r2-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.7.2"
+version = "0.8.0"
 edition = "2021"
 license = "MIT"
 description = "R2 Agent — Small droid, big jobs. A minimal Rust Agent runtime."

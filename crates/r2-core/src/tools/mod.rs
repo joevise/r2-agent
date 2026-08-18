@@ -4,6 +4,7 @@ mod bash;
 mod edit;
 mod mcp_admin;
 mod read;
+mod task_tool;
 mod write;
 
 use crate::types::{ToolCall, ToolSchema};
@@ -50,6 +51,7 @@ impl ToolRegistry {
                     sandbox_cfg.bash_restrict_workdir,
                 )),
                 Box::new(mcp_admin::McpAdminTool::new(config_path)),
+                Box::new(task_tool::TaskTool::new()),
             ],
         })
     }

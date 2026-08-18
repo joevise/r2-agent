@@ -63,6 +63,22 @@ textarea[readonly]{color:var(--dim)}
 .dot{display:inline-block;width:7px;height:7px;border-radius:1px;background:var(--line)}
 .dot.yes{background:var(--ok)}
 .hint{font-size:11px;color:var(--dim);margin-top:6px}
+/* tasks（定时任务审批卡） */
+.taskcard{border:1px solid #3a5070;border-radius:8px;padding:10px 14px;margin:8px 0;background:#151d29}
+.taskcard .tname{font-weight:bold}
+.taskcard .tmeta{font-size:12px;color:var(--dim);margin:4px 0}
+.taskcard .tprompt{font-size:12.5px;color:var(--fg);border-left:2px solid var(--line);padding-left:8px;margin:6px 0}
+.taskcard .tbtns{display:flex;gap:8px;margin-top:6px}
+.taskcard button{cursor:pointer;border:1px solid var(--line);background:transparent;color:var(--fg);border-radius:6px;padding:4px 14px;font-size:12.5px}
+.taskcard button.ok{border-color:#3a6045;color:#7ad0a0}
+.taskcard button.no{border-color:#6a3535;color:#e08080}
+.taskcard button:hover{background:#1a2332}
+.gtask{border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:8px;font-size:12.5px}
+.gtask .st{font-size:11px;border:1px solid var(--line);border-radius:10px;padding:0 6px;margin-left:6px}
+.gtask .st.active{color:#7ad0a0;border-color:#3a6045}
+.gtask .st.pending{color:#e0b070;border-color:#6a5535}
+.gtask .st.paused{color:var(--dim)}
+.gtask .gres{color:var(--dim);font-size:11.5px;margin-top:3px;border-top:1px dashed var(--line);padding-top:3px}
 /* growth */
 .gcard{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:10px}
 .ggoal{font-size:13px;line-height:1.6}
@@ -444,6 +460,25 @@ async function loadGrowth(){
           :'<div class="ggoal dim">未设置目标 · 写入 ~/.r2/GOAL.md 启用定向成长</div>';
     h+='<div class="gstats">技能 <b>'+g.skills_count+'</b> · 教训(7天) <b>'+g.lessons_7d+'</b> · 进化事件 <b>'+g.total_events+'</b></div>';
     h+='</div>';
+    // 定时任务区（后台成长）
+    const tk=(g.tasks)||store.tasks||[];
+    if(tk.length){
+      h+='<div class="gskl" id="gtasks"><div style="color:var(--dim);font-size:11px;letter-spacing:1px;margin-bottom:4px">⏰ 定时任务</div>';
+      for(const t of tk){
+        const st=t.state==="active"?"✅生效中":t.state==="pending"?"⏳待批准":t.state==="paused"?"⏸已暂停":t.state==="rejected"?"❌已拒绝":t.state;
+        const own=t.owner==="agent"?"🤖":"👤";
+        const next=t.next_due?new Date(t.next_due*1000).toLocaleString("zh-CN",{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"}):"—";
+        h+='<div class="gtask"><b>'+esc(t.name)+'</b><span class="st '+esc(t.state)+'">'+st+'</span> '+own+' · '+esc(t.schedule)+' · 下次 '+next
+          +(t.last_result?'<div class="gres">'+esc(t.last_result).slice(0,120)+'</div>':'')
+          +'<div style="margin-top:3px">'
+          +(t.state==="pending"?'<button onclick="wsSend({t:'task_approve',id:''+t.id+''})">批准</button> <button onclick="wsSend({t:'task_reject',id:''+t.id+''})">拒绝</button>':'')
+          +(t.state==="active"?' <button onclick="wsSend({t:'task_pause',id:''+t.id+''})">暂停</button>':'')
+          +(t.state==="paused"?' <button onclick="wsSend({t:'task_resume',id:''+t.id+''})">恢复</button>':'')
+          +' <button onclick="wsSend({t:'task_delete',id:''+t.id+''})">删除</button>'
+          +'</div></div>';
+      }
+      h+='</div>';
+    }
     // 技能清单（带生命周期徽章 + 使用统计）
     const sks=g.skills||[];
     if(sks.length){
@@ -539,6 +574,19 @@ function clearFlow(note){
   flow.innerHTML="";aiCur=null;toolCur=null;
   if(note)addLine("msg-note",esc(note));
 }
+/* 定时任务审批卡（聊天流内联） */
+function renderTaskCard(t){
+  if(!t)return;
+  const owner=t.owner==="agent"?"🤖 自提议":"👤 用户";
+  const d=document.createElement("div");d.className="taskcard";
+  d.innerHTML='<div class="tname">⏳ 定时任务待批准</div>'
+    +'<div class="tmeta">'+owner+' · '+esc(t.schedule)+' · '+esc(t.name)+'</div>'
+    +'<div class="tprompt">'+esc(t.prompt)+'</div>'
+    +'<div class="tbtns"><button class="ok">✅ 批准</button><button class="no">拒绝</button></div>';
+  d.querySelector(".ok").onclick=()=>{wsSend({t:"task_approve",id:t.id});d.querySelector(".tname").textContent="✅ 已批准生效";d.querySelector(".tbtns").remove()};
+  d.querySelector(".no").onclick=()=>{wsSend({t:"task_reject",id:t.id});d.querySelector(".tname").textContent="已拒绝";d.querySelector(".tbtns").remove()};
+  flow.appendChild(d);scrollBottom();
+}
 /* 会话历史回放（切换/分叉/浏览器刷新） */
 function renderHistory(h){
   clearFlow();
@@ -597,6 +645,8 @@ function onEvent(evt){
     case"tool_result":onToolResult(d.name||"?",d.output);break;
     case"steered":addLine("msg-sys","⌁ steer: "+esc(d.instruction||""));break;
     case"evolved":addLine("msg-sys","🌱 "+esc(d.text||""));break;
+    case"bg_started":addLine("msg-sys","🔄 后台任务「"+esc(j.name||"")+"」开始（"+esc(j.prompt_preview||"")+"…）");break;
+    case"bg_done":addLine("msg-sys","✅ 后台任务「"+esc(j.name||"")+"」完成："+esc(j.result_preview||""));break;
     case"usage_update":
       store.usage={input:d.input_tokens||0,output:d.output_tokens||0};renderUsage();break;
     case"done":thinkDone();endAI();setRunning(false);break;
@@ -634,6 +684,9 @@ function connect(){
       case"model_changed":store.model=j.model||"";$("#model").textContent=store.model;renderUsage();break;
       case"forked":if(j.id){store.current=j.id}break;
       case"session_history":renderHistory(j.history);break;
+      case"task_pending":renderTaskCard(j.task);break;
+      case"tasks":store.tasks=j.tasks||[];if(store.tab==="growth")loadGrowth();break;
+      case"task_state":toast(j.state==="active"?"✅ 任务已批准生效":"任务状态已更新");break;
       case"error":toast(j.message||"错误");addLine("msg-err","✗ "+esc(j.message||""));break;
     }
   };

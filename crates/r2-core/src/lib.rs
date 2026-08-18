@@ -42,6 +42,7 @@ pub mod models;
 pub mod namespaces;
 pub mod rpc;
 pub mod sandbox;
+pub mod tasks;
 pub mod session;
 mod session_api;
 pub mod tools;
