@@ -180,6 +180,7 @@ fn state_json(state: &WebState) -> Value {
     };
     json!({
         "model": cfg.current_model(),
+        "tasks": r2_core::tasks::load_store().tasks,
         "history": history,
         "current_session": current,
         "sessions": sessions.iter().map(summary_json).collect::<Vec<_>>(),

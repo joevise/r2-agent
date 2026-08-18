@@ -112,6 +112,12 @@ textarea[readonly]{color:var(--dim)}
 #rundot.run{color:var(--white);animation:blink 1s steps(2) infinite}
 @keyframes blink{50%{opacity:0.15}}
 #model{color:var(--fg);cursor:pointer;border:1px solid var(--line);padding:2px 8px}
+#taskbadge{color:var(--dim);border:1px solid var(--line);padding:2px 8px;border-radius:10px}
+#taskbadge .pend{color:#e0b070}
+#taskbadge .act{color:#7ad0a0}
+#taskbadge .run{display:inline-block;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+#taskbadge:hover{border-color:var(--white)}
 #model:hover{border-color:var(--white)}
 #topbar .sp{flex:1}
 #usage{color:var(--dim);font-size:12px}
@@ -231,6 +237,7 @@ textarea[readonly]{color:var(--dim)}
     <button id="burger" aria-label="菜单">≡</button>
     <span id="brand">R2 <span id="rundot">●</span></span>
     <span id="model" title="点击输入模型名，如 glm-5.2 / kimi-k3">—</span>
+  <span id="taskbadge" title="定时任务状态，点击查看" style="display:none;cursor:pointer;font-size:12px"></span>
     <span class="sp"></span>
     <span id="offline">[连接断开，重连中…]</span>
     <span id="usage">¥0.00 · 0 tok</span>
@@ -389,6 +396,7 @@ function renderTools(){
 /* ---------- prompt ---------- */
 function applyState(st){
   store.model=st.model||"";$("#model").textContent=store.model||"—";
+  store.tasks=st.tasks||[];renderTaskBadge();
   if(st.history)renderHistory(st.history);
   store.sessions=st.sessions||[];store.current=st.current_session||null;
   store.tools=st.tools||[];store.sandbox=st.sandbox||null;
@@ -574,6 +582,20 @@ function clearFlow(note){
   flow.innerHTML="";aiCur=null;toolCur=null;
   if(note)addLine("msg-note",esc(note));
 }
+/* 顶栏任务徽章：⏳待审(黄) ✅生效(绿) 🔄运行中；点击跳 GROWTH */
+function renderTaskBadge(){
+  const b=$("#taskbadge");if(!b)return;
+  const ts=store.tasks||[];
+  if(!ts.length){b.style.display="none";return}
+  const pend=ts.filter(t=>t.state==="pending").length;
+  const act=ts.filter(t=>t.state==="active").length;
+  if(!pend&&!act){b.style.display="none";return}
+  b.style.display="inline";
+  b.innerHTML=(pend?'<span class="pend">⏳'+pend+'待审</span> ':'')+'<span class="act">✅'+act+'生效</span>';
+}
+$("#taskbadge").onclick=()=>{
+  document.querySelector('#tabs button[data-p="growth"]').click();
+};
 /* 任务按钮事件委托：一次绑定，动态渲染的按钮共用（零内联 onclick——
    内联引号嵌套是这次语法错误的根因，永绝后患） */
 $("#growth-box").addEventListener("click",e=>{
@@ -694,7 +716,7 @@ function connect(){
       case"forked":if(j.id){store.current=j.id}break;
       case"session_history":renderHistory(j.history);break;
       case"task_pending":renderTaskCard(j.task);break;
-      case"tasks":store.tasks=j.tasks||[];if(store.tab==="growth")loadGrowth();break;
+      case"tasks":store.tasks=j.tasks||[];renderTaskBadge();if(store.tab==="growth")loadGrowth();break;
       case"task_state":toast(j.state==="active"?"✅ 任务已批准生效":"任务状态已更新");break;
       case"error":toast(j.message||"错误");addLine("msg-err","✗ "+esc(j.message||""));break;
     }
