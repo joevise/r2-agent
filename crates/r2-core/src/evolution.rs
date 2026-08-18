@@ -335,6 +335,10 @@ fn write_skill_status(name: &str, status: &str) -> Result<(), String> {
     std::fs::write(&path, out).map_err(|e| e.to_string())
 }
 
+pub fn now_ts_pub() -> u64 {
+    now_ts()
+}
+
 fn now_ts() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -626,6 +630,23 @@ pub fn write_draft_skill(name: &str, content: &str) -> Result<(), String> {
     }
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     std::fs::write(format!("{dir}/SKILL.md"), content).map_err(|e| e.to_string())
+}
+
+
+/// 技能名清单（成长变化检测的基线）
+pub fn list_skill_names() -> Vec<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(format!("{home}/.r2/skills")) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.starts_with('.') && e.path().join("SKILL.md").exists() {
+                out.push(name);
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 #[cfg(test)]

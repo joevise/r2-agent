@@ -156,6 +156,19 @@ fn build_system_prompt_with_home(config: &Config, home: &str) -> (String, Prompt
         full.push_str(s);
         sections.skills = Some(s.clone());
     }
+    // 成长系统自我认知层（v0.7.2）：没有这段，agent 不知道自己的进化机制存在
+    // （实测病灶：用户口述目标，它只能塞进工作目录笔记；学完的东西不沉淀）。
+    // 宪法保护 = 语义约束（不得自行更改目标），而非文件权限——代笔权给 agent。
+    full.push_str("\n\n[成长系统]\n");
+    full.push_str(
+        "你有自我成长机制，用户口头表达时请主动使用：\n\
+         · 目标代笔：用户说出目标/身份/期望（如「我希望你成为…」）时，把原话忠实写入 ~/.r2/GOAL.md\n\
+           （用 bash 写入），写入前先向用户复述确认。未经用户明确表达，绝不创建或修改目标。\n\
+         · 学习沉淀：完成有意义的学习（方法论/框架/流程/领域知识）后，主动蒸馏成技能文件\n\
+           写入 ~/.r2/skills/<名字>/SKILL.md（frontmatter 含 name 和 description），\n\
+           下次会话自动生效——学习不沉淀等于白学。\n\
+         · 你的目标与技能会出现在成长档案里，持续积累成为你的一部分。",
+    );
 
     // config [agent] system_prompt 非空：显式覆盖，SOUL / AGENTS 两层跳过
     let custom = config.agent.system_prompt.trim();
@@ -204,6 +217,10 @@ pub struct Agent {
     usage: UsageStats,
     /// 本轮 run 的硬信号采集（反思钩子原料）
     turn_signals: crate::evolution::TurnSignals,
+    /// 本轮开始时的目标快照（结尾 diff → goal_set 记账）
+    turn_start_goal: Option<String>,
+    /// 本轮开始时的技能名快照（结尾 diff → 沉淀记账）
+    turn_start_skills: Vec<String>,
     /// 本轮失败过的工具名（重试成功的检测依据）
     failed_tools: std::collections::HashSet<String>,
     /// 组装好的三层 system prompt 全文（壳展示用 effective_system_prompt）
@@ -242,6 +259,8 @@ impl Agent {
             quiet: false,
             usage: UsageStats::default(),
             turn_signals: crate::evolution::TurnSignals::default(),
+            turn_start_goal: None,
+            turn_start_skills: Vec::new(),
             failed_tools: std::collections::HashSet::new(),
             system_prompt,
         })
@@ -289,6 +308,8 @@ impl Agent {
             quiet: false,
             usage,
             turn_signals: crate::evolution::TurnSignals::default(),
+            turn_start_goal: None,
+            turn_start_skills: Vec::new(),
             failed_tools: std::collections::HashSet::new(),
             system_prompt,
         })
@@ -339,6 +360,8 @@ impl Agent {
             // 分支会话的用量从头累计（不继承父会话的用量快照）
             usage: UsageStats::default(),
             turn_signals: crate::evolution::TurnSignals::default(),
+            turn_start_goal: None,
+            turn_start_skills: Vec::new(),
             failed_tools: std::collections::HashSet::new(),
             system_prompt,
         })
@@ -500,6 +523,49 @@ impl Agent {
         }
     }
 
+
+    /// 成长变化记账：本轮内目标被设定/修改、技能被沉淀 → 事件流 + git 快照 + 广播。
+    /// 与反思钩子互补：反思管"教训"，这里管"自我档案的变化"。
+    async fn record_growth_changes(&mut self) {
+        let now = crate::evolution::now_ts_pub();
+        // 目标 diff
+        let goal_after = crate::evolution::read_goal();
+        let goal_changed = match (&self.turn_start_goal, &goal_after) {
+            (None, Some(g)) => Some(format!("目标已设定：{}", truncate_str(g, 80))),
+            (Some(a), Some(b)) if a != b => Some(format!("目标已更新：{}", truncate_str(b, 80))),
+            _ => None,
+        };
+        if let Some(content) = goal_changed {
+            let _ = crate::evolution::append_event(&crate::evolution::EvolutionEvent {
+                ts: now,
+                kind: "goal_set".into(),
+                content,
+                evidence: "用户口述 · agent 代笔".into(),
+                session_id: self.session_id().unwrap_or("unknown").to_string(),
+            });
+            let _ = crate::evolution::snapshot_self("goal updated");
+            self.emit(AgentEvent::Evolved("🎯 目标已记录".into()));
+        }
+        // 技能 diff（新增 = 沉淀；删除不记账——归档机制已有自己的事件）
+        let after = crate::evolution::list_skill_names();
+        let added: Vec<&String> = after.iter().filter(|n| !self.turn_start_skills.contains(n)).collect();
+        if let Some(first) = added.first() {
+            // 只对非 auto- 前缀记账（auto 起草有自己的 skill_draft 事件，避免双记）
+            if !first.starts_with("auto-") {
+                let names: Vec<String> = added.iter().map(|s| s.to_string()).collect();
+                let _ = crate::evolution::append_event(&crate::evolution::EvolutionEvent {
+                    ts: now,
+                    kind: "skill_created".into(),
+                    content: format!("学习沉淀为技能：{}", names.join("、")),
+                    evidence: "agent 主动蒸馏（成长系统注入指引）".into(),
+                    session_id: self.session_id().unwrap_or("unknown").to_string(),
+                });
+                let _ = crate::evolution::snapshot_self(&format!("skill沉淀 {names:?}"));
+                self.emit(AgentEvent::Evolved(format!("⭐ 学习沉淀：{}", names.join("、"))));
+            }
+        }
+    }
+
     /// 同族教训 ≥3 条 → LLM 合成 SKILL.md 草稿（trial 状态）→ 事件 + git 快照。
     /// 每轮最多起草 1 个（防突发成批）；名字冲突 = 已在成长中，跳过。
     async fn maybe_draft_skill(&mut self) {
@@ -624,6 +690,9 @@ impl Agent {
         // 硬信号采集开始（每轮独立）
         self.turn_signals = crate::evolution::TurnSignals::default();
         self.failed_tools.clear();
+        // 成长变化基线：本轮开始时的目标与技能（结尾 diff 记账）
+        self.turn_start_goal = crate::evolution::read_goal();
+        self.turn_start_skills = crate::evolution::list_skill_names();
         // 排空上一轮残留的 steer 消息——非运行时注入的指令不应影响本轮
         if let Some(rx) = self.steer_rx.as_mut() {
             while rx.try_recv().is_ok() {}
@@ -850,6 +919,8 @@ impl Agent {
         // 聚类检查（无条件）：种子教训可能来自历史会话，不能只靠"新教训落流"触发；
         // 幂等保护 = 同名技能已存在时 write_draft_skill 拒绝（E2E 实测发现的 gap）
         self.maybe_draft_skill().await;
+        // 成长变化记账：目标被设定/修改、技能被沉淀 → 事件流 + git 快照
+        self.record_growth_changes().await;
         Ok(final_text)
     }
 
@@ -934,6 +1005,11 @@ impl Agent {
             tool_call_id: None,
         })
     }
+}
+
+
+fn truncate_str(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
 }
 
 /// 空响应守卫：正文与工具调用双空 = 流被掐断的显式错误（不静默成功）。
