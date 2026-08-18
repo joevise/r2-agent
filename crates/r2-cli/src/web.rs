@@ -451,6 +451,46 @@ async fn skill_preview(Query(q): Query<HashMap<String, String>>) -> (StatusCode,
     }
 }
 
+
+/// GET /api/growth：成长可观测聚合（事件流 + 技能盘点 + 目标 + 校准统计）
+async fn api_growth() -> Json<Value> {
+    let events = r2_core::evolution::read_events(200);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let week_ago = now.saturating_sub(7 * 86400);
+    let events_json: Vec<Value> = events
+        .iter()
+        .map(|e| {
+            json!({
+                "ts": e.ts, "kind": e.kind, "content": e.content,
+                "evidence": e.evidence, "session_id": e.session_id,
+            })
+        })
+        .collect();
+    // 技能盘点（复用 skills 扫描逻辑的轻量版）
+    let skills_dir = config::expand_tilde("~/.r2/skills");
+    let mut skills: Vec<Value> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if entry.path().join("SKILL.md").exists() {
+                skills.push(json!({"name": name}));
+            }
+        }
+    }
+    let lessons_7d = events.iter().filter(|e| e.kind == "lesson" && e.ts >= week_ago).count();
+    Json(json!({
+        "goal": r2_core::evolution::read_goal(),
+        "skills": skills,
+        "skills_count": skills.len(),
+        "events": events_json,
+        "lessons_7d": lessons_7d,
+        "total_events": events.len(),
+    }))
+}
+
 /// GET /api/state：完整状态快照
 async fn api_state(State(state): State<Arc<WebState>>) -> Json<Value> {
     Json(state_json(&state))
@@ -742,6 +782,7 @@ pub async fn run(config: Config, port: u16, host: String) -> Result<(), Box<dyn 
         .route("/upload", post(upload))
         .route("/prompt_file", get(get_prompt_file).put(put_prompt_file))
         .route("/skills", get(list_skills))
+        .route("/api/growth", get(api_growth))
         .route("/skill_preview", get(skill_preview))
         .route("/api/state", get(api_state))
         .route("/ws", get(ws_handler))

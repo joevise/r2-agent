@@ -63,6 +63,17 @@ textarea[readonly]{color:var(--dim)}
 .dot{display:inline-block;width:7px;height:7px;border-radius:1px;background:var(--line)}
 .dot.yes{background:var(--ok)}
 .hint{font-size:11px;color:var(--dim);margin-top:6px}
+/* growth */
+.gcard{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:10px}
+.ggoal{font-size:13px;line-height:1.6}
+.gstats{font-size:12px;color:var(--dim);margin-top:6px}
+.gstats b{color:var(--fg)}
+.gtl{display:flex;flex-direction:column;gap:8px}
+.gev{border-left:2px solid var(--line);padding:4px 0 4px 10px}
+.gevh{display:flex;justify-content:space-between;font-size:11px;color:var(--dim)}
+.gevh .gk{color:var(--fg)}
+.gevc{font-size:13px;margin:3px 0}
+.geve{font-size:11px;color:var(--dim);border-top:1px dashed var(--line);padding-top:2px;margin-top:2px}
 /* skills */
 .skill{padding:5px 4px;border-bottom:1px solid var(--line)}
 .skill .nm{cursor:pointer}
@@ -150,6 +161,7 @@ textarea[readonly]{color:var(--dim)}
     <button data-p="tools">TOOLS</button>
     <button data-p="prompt">PROMPT</button>
     <button data-p="skill">SKILL</button>
+    <button data-p="growth">GROWTH</button>
   </div>
   <div id="panels">
     <div class="panel on" id="p-sessions">
@@ -159,6 +171,9 @@ textarea[readonly]{color:var(--dim)}
     <div class="panel" id="p-tools">
       <div class="tgroup">内置</div><div id="tools-builtin"></div>
       <div class="tgroup">MCP</div><div id="tools-mcp"></div>
+    </div>
+    <div class="panel" id="p-growth">
+      <div id="growth-box"><div class="empty">加载中…</div></div>
     </div>
     <div class="panel" id="p-prompt">
       <details open><summary>核心 · 内置（只读）</summary>
@@ -296,6 +311,7 @@ document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{
   document.querySelectorAll(".panel").forEach(x=>x.classList.toggle("on",x.id==="p-"+store.tab));
   if(store.tab==="prompt")loadPromptFiles();
   if(store.tab==="skill")loadSkills();
+  if(store.tab==="growth")loadGrowth();
 });
 /* ---------- sessions ---------- */
 function relTime(ts){
@@ -406,6 +422,41 @@ async function loadSkills(){
       box.appendChild(d);
     }
   }catch(e){box.innerHTML='<div class="empty">skills 加载失败（后端不可达）</div>'}
+}
+/* ---------- 成长（可观测性） ---------- */
+let growthLoaded=false;
+async function loadGrowth(){
+  const box=$("#growth-box");
+  try{
+    const r=await fetch("/api/growth");const g=await r.json();
+    const goal=g.goal||"";
+    const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+    let h="";
+    // 自我档案卡
+    h+='<div class="gcard">';
+    h+=goal?'<div class="ggoal">🎯 '+esc(goal).replace(/\n/g,"<br>")+'</div>'
+          :'<div class="ggoal dim">未设置目标 · 写入 ~/.r2/GOAL.md 启用定向成长</div>';
+    h+='<div class="gstats">技能 <b>'+g.skills_count+'</b> · 教训(7天) <b>'+g.lessons_7d+'</b> · 进化事件 <b>'+g.total_events+'</b></div>';
+    h+='</div>';
+    // 时间线
+    const evs=g.events||[];
+    if(!evs.length){
+      h+='<div class="empty">还没有成长事件<br>会话中出现工具失败/被纠正且提炼出教训时，自动记录在这里</div>';
+    }else{
+      h+='<div class="gtl">';
+      for(let i=evs.length-1;i>=0;i--){
+        const e=evs[i];
+        const t=new Date((e.ts||0)*1000);
+        const dt=(t.getMonth()+1)+"/"+t.getDate()+" "+String(t.getHours()).padStart(2,"0")+":"+String(t.getMinutes()).padStart(2,"0");
+        const kindBadge={"lesson":"📖 教训","skill_draft":"✏️ 技能起草","skill_promoted":"⭐ 技能转正","goal_set":"🎯 目标","mcp_installed":"🔌 MCP","decay":"🍂 衰退"}[e.kind]||e.kind;
+        h+='<div class="gev"><div class="gevh"><span class="gk">'+kindBadge+'</span><span class="gt">'+dt+'</span></div>';
+        h+='<div class="gevc">'+esc(e.content)+'</div>';
+        h+='<div class="geve">证据：'+esc(e.evidence)+'</div></div>';
+      }
+      h+='</div>';
+    }
+    box.innerHTML=h;
+  }catch(e){box.innerHTML='<div class="empty">加载失败（后端不可达）</div>'}
 }
 /* ---------- 消息流 ---------- */
 const flow=$("#flow");
@@ -523,6 +574,7 @@ function onEvent(evt){
     case"tool_call":thinkDone();onToolCall(d.name||"?",d.arguments);break;
     case"tool_result":onToolResult(d.name||"?",d.output);break;
     case"steered":addLine("msg-sys","⌁ steer: "+esc(d.instruction||""));break;
+    case"evolved":addLine("msg-sys","🌱 "+esc(d.text||""));break;
     case"usage_update":
       store.usage={input:d.input_tokens||0,output:d.output_tokens||0};renderUsage();break;
     case"done":thinkDone();endAI();setRunning(false);break;

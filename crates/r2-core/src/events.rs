@@ -21,6 +21,8 @@ pub enum AgentEvent {
     Done { final_text: String },
     /// 用量统计更新（Done 前发出，含会话累计值）
     UsageUpdate(UsageStats),
+    /// 进化事件（反思产出教训/技能变更等——成长可观测的实时流）
+    Evolved(String),
     /// 出错
     Error(String),
 }

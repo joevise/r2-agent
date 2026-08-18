@@ -37,6 +37,7 @@ pub mod mcp;
 #[cfg(feature = "l3-memory")]
 pub mod memory;
 pub mod model;
+pub mod evolution;
 pub mod models;
 pub mod namespaces;
 pub mod rpc;

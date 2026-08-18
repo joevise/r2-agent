@@ -202,6 +202,10 @@ pub struct Agent {
     quiet: bool,
     /// 会话生命周期的累计用量统计
     usage: UsageStats,
+    /// 本轮 run 的硬信号采集（反思钩子原料）
+    turn_signals: crate::evolution::TurnSignals,
+    /// 本轮失败过的工具名（重试成功的检测依据）
+    failed_tools: std::collections::HashSet<String>,
     /// 组装好的三层 system prompt 全文（壳展示用 effective_system_prompt）
     system_prompt: String,
 }
@@ -237,6 +241,8 @@ impl Agent {
             steer_rx: None,
             quiet: false,
             usage: UsageStats::default(),
+            turn_signals: crate::evolution::TurnSignals::default(),
+            failed_tools: std::collections::HashSet::new(),
             system_prompt,
         })
     }
@@ -282,6 +288,8 @@ impl Agent {
             steer_rx: None,
             quiet: false,
             usage,
+            turn_signals: crate::evolution::TurnSignals::default(),
+            failed_tools: std::collections::HashSet::new(),
             system_prompt,
         })
     }
@@ -330,6 +338,8 @@ impl Agent {
             quiet: false,
             // 分支会话的用量从头累计（不继承父会话的用量快照）
             usage: UsageStats::default(),
+            turn_signals: crate::evolution::TurnSignals::default(),
+            failed_tools: std::collections::HashSet::new(),
             system_prompt,
         })
     }
@@ -448,6 +458,48 @@ impl Agent {
     /// v0.1 复用主模型做摘要（config.context.l2_summary_model 暂忽略，
     /// 独立的小模型做摘要是后续优化点）。
     /// 已有摘要时，让模型把旧摘要和新消息合并成一份新摘要。
+
+    /// 反思钩子（v0.7 自进化核心环）：本轮有硬信号时，让模型把信号翻译成
+    /// 一条可操作教训，落进化事件流。失败静默（进化是副业，不打扰主业）。
+    /// 铁律：模型只翻译硬信号，不评判（prompt 见 evolution::reflection_messages）。
+    async fn reflect_and_record(&mut self, task_summary: &str) {
+        if self.turn_signals.is_empty() {
+            return;
+        }
+        let msgs = crate::evolution::reflection_messages(&self.turn_signals, task_summary);
+        let stream = match self.provider.chat_stream(&msgs, &[]).await {
+            Ok(s) => s,
+            Err(_) => return, // 反思失败不影响主流程
+        };
+        let mut chunks = Vec::new();
+        let mut st = stream;
+        use futures_util::StreamExt;
+        while let Some(item) = st.next().await {
+            match item {
+                Ok(c) => chunks.push(c),
+                Err(_) => return,
+            }
+        }
+        let Ok((text, _)) = self.provider.parse_response(&chunks) else {
+            return;
+        };
+        if let Some((lesson, evidence)) = crate::evolution::parse_reflection(&text) {
+            let ev = crate::evolution::EvolutionEvent {
+                ts: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                kind: "lesson".into(),
+                content: lesson.clone(),
+                evidence,
+                session_id: self.session_id().unwrap_or("unknown").to_string(),
+            };
+            if crate::evolution::append_event(&ev).is_ok() {
+                self.emit(AgentEvent::Evolved(format!("🌱 学到教训：{lesson}")));
+            }
+        }
+    }
+
     async fn summarize(&mut self, old_msgs: &[crate::types::Message]) -> ModelResult<String> {
         // 把待压缩消息转成可读对话文本
         let mut dialogue = String::new();
@@ -529,6 +581,9 @@ impl Agent {
     /// 处理一次用户输入，流式打印 assistant 输出，返回完整回复文本
     pub async fn run(&mut self, user_input: &str) -> ModelResult<String> {
         self.emit(AgentEvent::AgentStart);
+        // 硬信号采集开始（每轮独立）
+        self.turn_signals = crate::evolution::TurnSignals::default();
+        self.failed_tools.clear();
         // 排空上一轮残留的 steer 消息——非运行时注入的指令不应影响本轮
         if let Some(rx) = self.steer_rx.as_mut() {
             while rx.try_recv().is_ok() {}
@@ -667,6 +722,14 @@ impl Agent {
                     arguments: call.arguments.clone(),
                 });
                 let result = self.tools.execute(call).await;
+                // 硬信号采集：ERROR 前缀 = 工具失败；曾失败的工具成功 = 重试爬出
+                if result.starts_with("ERROR") {
+                    let preview_e: String = result.chars().take(160).collect();
+                    self.turn_signals.tool_errors.push((call.name.clone(), preview_e));
+                    self.failed_tools.insert(call.name.clone());
+                } else if self.failed_tools.remove(call.name.as_str()) {
+                    self.turn_signals.retries_recovered += 1;
+                }
                 let preview: String = result.chars().take(80).collect();
                 if !self.quiet {
                     println!("\n[tool] {} → {}...", call.name, preview);
@@ -737,6 +800,9 @@ impl Agent {
         if !self.quiet {
             println!("[usage] {}", self.usage_line());
         }
+        // 反思钩子：Done 之后跑（用户已见到回复），教训落进化流
+        let task_summary: String = user_input.chars().take(200).collect();
+        self.reflect_and_record(&task_summary).await;
         Ok(final_text)
     }
 
@@ -757,6 +823,8 @@ impl Agent {
     /// steer 统一处理：保留已收到的文本部分（半截工具调用 JSON 不可用，全部丢弃），
     /// 追加中断标注和 [用户中途指令] 消息，广播 Steered 事件
     fn handle_steer(&mut self, chunks: &[StreamChunk], steer: &str) -> ModelResult<()> {
+        // 用户中途转向 = 最强纠正信号（反思原料）
+        self.turn_signals.steers.push(steer.to_string());
         // 只取文本部分拼 partial_text
         let partial_text: String = chunks
             .iter()

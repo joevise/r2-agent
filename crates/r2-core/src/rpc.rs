@@ -79,6 +79,7 @@ pub fn event_json(event: &AgentEvent) -> Value {
         AgentEvent::AgentStart => ("agent_start", json!({})),
         AgentEvent::MessageUpdate(text) => ("message_update", json!({"text": text})),
         AgentEvent::Thinking(text) => ("thinking", json!({"text": text})),
+        AgentEvent::Evolved(text) => ("evolved", json!({"text": text})),
         AgentEvent::ToolCall { name, arguments } => {
             ("tool_call", json!({"name": name, "arguments": arguments}))
         }
