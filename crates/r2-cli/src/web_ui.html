@@ -468,13 +468,13 @@ async function loadGrowth(){
         const st=t.state==="active"?"✅生效中":t.state==="pending"?"⏳待批准":t.state==="paused"?"⏸已暂停":t.state==="rejected"?"❌已拒绝":t.state;
         const own=t.owner==="agent"?"🤖":"👤";
         const next=t.next_due?new Date(t.next_due*1000).toLocaleString("zh-CN",{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"}):"—";
-        h+='<div class="gtask"><b>'+esc(t.name)+'</b><span class="st '+esc(t.state)+'">'+st+'</span> '+own+' · '+esc(t.schedule)+' · 下次 '+next
+        h+='<div class="gtask" data-tid="'+esc(t.id)+'"><b>'+esc(t.name)+'</b><span class="st '+esc(t.state)+'">'+st+'</span> '+own+' · '+esc(t.schedule)+' · 下次 '+next
           +(t.last_result?'<div class="gres">'+esc(t.last_result).slice(0,120)+'</div>':'')
           +'<div style="margin-top:3px">'
-          +(t.state==="pending"?'<button onclick="wsSend({t:'task_approve',id:''+t.id+''})">批准</button> <button onclick="wsSend({t:'task_reject',id:''+t.id+''})">拒绝</button>':'')
-          +(t.state==="active"?' <button onclick="wsSend({t:'task_pause',id:''+t.id+''})">暂停</button>':'')
-          +(t.state==="paused"?' <button onclick="wsSend({t:'task_resume',id:''+t.id+''})">恢复</button>':'')
-          +' <button onclick="wsSend({t:'task_delete',id:''+t.id+''})">删除</button>'
+          +(t.state==="pending"?'<button data-act="task_approve">批准</button> <button data-act="task_reject">拒绝</button>':'')
+          +(t.state==="active"?' <button data-act="task_pause">暂停</button>':'')
+          +(t.state==="paused"?' <button data-act="task_resume">恢复</button>':'')
+          +' <button data-act="task_delete">删除</button>'
           +'</div></div>';
       }
       h+='</div>';
@@ -574,6 +574,15 @@ function clearFlow(note){
   flow.innerHTML="";aiCur=null;toolCur=null;
   if(note)addLine("msg-note",esc(note));
 }
+/* 任务按钮事件委托：一次绑定，动态渲染的按钮共用（零内联 onclick——
+   内联引号嵌套是这次语法错误的根因，永绝后患） */
+$("#growth-box").addEventListener("click",e=>{
+  const btn=e.target.closest("button[data-act]");
+  if(!btn)return;
+  const card=btn.closest(".gtask");
+  const id=card?card.dataset.tid:null;
+  if(id)wsSend({t:btn.dataset.act,id});
+});
 /* 定时任务审批卡（聊天流内联） */
 function renderTaskCard(t){
   if(!t)return;
