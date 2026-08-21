@@ -36,7 +36,8 @@ pre{font:inherit;white-space:pre-wrap;word-break:break-all}
 .panel.on{display:block}
 .empty{color:var(--dim);padding:12px 4px;font-size:12px}
 /* sessions */
-#btn-new{width:100%;margin-bottom:8px;text-align:left}
+#btn-new{width:calc(50% - 4px);margin-bottom:8px;text-align:left}
+#btn-newgroup{width:calc(50% - 4px);margin-bottom:8px;text-align:left}
 .sess{padding:5px 6px;border-left:2px solid transparent;cursor:pointer;position:relative}
 .sess:hover{background:#111111}
 .sess.cur{border-left-color:var(--white);color:var(--white)}
@@ -124,7 +125,7 @@ textarea[readonly]{color:var(--dim)}
 .gsb-summarized{color:#7ab8d0;border-color:#3a5070}
 .gmark{color:var(--dim)}
 .udot{color:var(--ok);margin-left:6px;font-size:10px}
-#btn-newgroup{width:100%;margin-top:8px;text-align:left}
+#btn-newgroup{width:calc(50% - 4px);margin-bottom:8px;text-align:left}
 #group-form{border:1px solid var(--line);border-radius:8px;padding:8px;margin-top:8px}
 #group-form input[type=text]{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);padding:4px 6px;width:100%;outline:none;margin-bottom:6px}
 .gfmem{display:block;padding:3px 2px;font-size:12px;cursor:pointer}
@@ -243,7 +244,6 @@ textarea[readonly]{color:var(--dim)}
   <div id="panels">
     <div class="panel on" id="p-sessions">
       <button id="btn-new">[+ 新会话]</button>
-      <div id="sesslist"></div>
       <button id="btn-newgroup">[+ 群聊]</button>
       <div id="group-form" style="display:none">
         <input type="text" id="gf-title" placeholder="群标题" spellcheck="false">
@@ -251,6 +251,7 @@ textarea[readonly]{color:var(--dim)}
         <div class="prow"><button id="gf-create">建群</button><button id="gf-cancel">取消</button></div>
         <div class="hint">自动包含 main（你）；成员为 active 分身</div>
       </div>
+      <div id="sesslist"></div>
     </div>
     <div class="panel" id="p-tools">
       <div class="tgroup">内置</div><div id="tools-builtin"></div>
@@ -1131,6 +1132,14 @@ function connect(){
     let j;try{j=JSON.parse(m.data)}catch(e){return}
     switch(j.t){
       case"init":applyState(j);break;
+      /* 增量状态广播（审批/切agent/群变更后）：只刷列表类数据，
+         不碰 running/history——避免误关"运行中"指示 */
+      case"state":
+        store.tasks=j.tasks||store.tasks;renderTaskBadge();
+        store.agents=j.agents||store.agents;store.currentAgent=j.current_agent||store.currentAgent;
+        renderAgentSel();renderAgentList();renderAgentBadge();
+        store.sessions=j.sessions||store.sessions;renderSessions();
+        break;
       case"event":onEvent(j.evt||{});break;
       case"sessions":store.sessions=j.list||[];renderSessions();break;
       case"prompt_done":
