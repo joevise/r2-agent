@@ -16,6 +16,7 @@ use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use r2_core::agents::{self, MAIN};
 use r2_core::config::{self, Config};
+use r2_core::groups::{self, GroupEvent};
 use r2_core::session::{self, SessionSummary};
 use r2_core::tools::ToolRegistry;
 use r2_core::{rpc, AgentSession};
@@ -48,6 +49,10 @@ struct WebState {
     tools: Vec<Value>,
     /// 当前选中的 agent（"main" = 主 agent；其余为 ~/.r2/agents/<name> 分身）
     current_agent: StdMutex<String>,
+    /// 群调度任务表：群 sid → (世代号, JoinHandle)；世代号防自然退出清理误删新任务
+    group_running: StdMutex<HashMap<String, (u64, tokio::task::JoinHandle<()>)>>,
+    /// 群任务世代号自增器
+    group_seq: StdMutex<u64>,
 }
 
 /// 当前 agent 名
@@ -131,10 +136,9 @@ fn broadcast_error(state: &WebState, message: &str) {
 
 /// 广播会话列表刷新
 fn broadcast_sessions(state: &WebState) {
-    let list = session::list_sessions(&session_dir_for(state)).unwrap_or_default();
     let _ = state.event_tx.send(json!({
         "t": "sessions",
-        "list": list.iter().map(summary_json).collect::<Vec<_>>(),
+        "list": sessions_with_groups(&session_dir_for(state)),
     }));
 }
 
@@ -227,6 +231,9 @@ fn state_json(state: &WebState) -> Value {
         Err(_) => (true, None),
     };
     let (_full, sections) = r2_core::agent::build_system_prompt(&cfg);
+    // 群会话条目与普通会话合并（kind:"group" 供前端区分渲染）
+    let mut session_list: Vec<Value> = sessions.iter().map(summary_json).collect();
+    session_list.extend(group_entries(&session_dir_for(state)));
     // 当前会话的历史（浏览器刷新/重连时回放画面；prompt 运行中则跳过）
     let history = match state.agent.try_lock() {
         Ok(g) => g.as_ref().map(session_history_json),
@@ -239,7 +246,7 @@ fn state_json(state: &WebState) -> Value {
         "tasks": r2_core::tasks::load_store().tasks,
         "history": history,
         "current_session": current,
-        "sessions": sessions.iter().map(summary_json).collect::<Vec<_>>(),
+        "sessions": session_list,
         "tools": state.tools,
         "sandbox": {
             "level": cfg.sandbox.level,
@@ -677,6 +684,16 @@ enum ClientMsg {
     AgentApprove(String),
     AgentReject(String),
     AgentSwitch(String),
+    GroupCreate { title: String, members: Vec<(String, String)> },
+    GroupPrompt { id: String, text: String },
+    GroupDiscuss { id: String, topic: String },
+    GroupDelegate { id: String, topic: String, lead: String },
+    GroupPause(String),
+    GroupStop(String),
+    GroupRevokeLead(String),
+    GroupSummary(String),
+    GroupOpen(String),
+    GroupSubtaskApprove { id: String, to: String },
 }
 
 /// 取字符串字段的辅助
@@ -719,6 +736,51 @@ fn parse_client_msg(text: &str) -> Result<ClientMsg, String> {
     "agent_reject" => Ok(ClientMsg::AgentReject(get_str(&v, "name")?.to_string())),
     "agent_switch" => Ok(ClientMsg::AgentSwitch(get_str(&v, "name")?.to_string())),
         "set_model" => Ok(ClientMsg::SetModel(get_str(&v, "model")?.to_string())),
+        "group_create" => {
+            let title = get_str(&v, "title")?.to_string();
+            let arr = v
+                .get("members")
+                .and_then(|x| x.as_array())
+                .ok_or_else(|| "缺少数组字段 members".to_string())?;
+            let mut members = Vec::new();
+            for m in arr {
+                let name = m
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .ok_or_else(|| "members[] 缺少字符串字段 name".to_string())?;
+                let display = m
+                    .get("display_name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                members.push((name.to_string(), display.to_string()));
+            }
+            if members.is_empty() {
+                return Err("members 至少包含 1 个 agent 分身".to_string());
+            }
+            Ok(ClientMsg::GroupCreate { title, members })
+        }
+        "group_prompt" => Ok(ClientMsg::GroupPrompt {
+            id: get_str(&v, "id")?.to_string(),
+            text: get_str(&v, "text")?.to_string(),
+        }),
+        "group_discuss" => Ok(ClientMsg::GroupDiscuss {
+            id: get_str(&v, "id")?.to_string(),
+            topic: get_str(&v, "topic")?.to_string(),
+        }),
+        "group_delegate" => Ok(ClientMsg::GroupDelegate {
+            id: get_str(&v, "id")?.to_string(),
+            topic: get_str(&v, "topic")?.to_string(),
+            lead: get_str(&v, "lead")?.to_string(),
+        }),
+        "group_pause" => Ok(ClientMsg::GroupPause(get_str(&v, "id")?.to_string())),
+        "group_stop" => Ok(ClientMsg::GroupStop(get_str(&v, "id")?.to_string())),
+        "group_revoke_lead" => Ok(ClientMsg::GroupRevokeLead(get_str(&v, "id")?.to_string())),
+        "group_summary" => Ok(ClientMsg::GroupSummary(get_str(&v, "id")?.to_string())),
+        "group_open" => Ok(ClientMsg::GroupOpen(get_str(&v, "id")?.to_string())),
+        "group_subtask_approve" => Ok(ClientMsg::GroupSubtaskApprove {
+            id: get_str(&v, "id")?.to_string(),
+            to: get_str(&v, "to")?.to_string(),
+        }),
         other => Err(format!("未知消息类型：{other}")),
     }
 }
@@ -1035,6 +1097,928 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
                 .event_tx
                 .send(json!({"t": "model_changed", "model": model}));
         }
+        ClientMsg::GroupCreate { title, members } => {
+            match do_group_create(&state.session_dir, &title, &members) {
+                Ok((sid, g)) => {
+                    let _ = state
+                        .event_tx
+                        .send(json!({"t": "group_created", "id": sid, "group": g}));
+                    broadcast_sessions(state);
+                }
+                Err(e) => ws_error(sink, &e).await,
+            }
+        }
+        ClientMsg::GroupPrompt { id, text } => {
+            let dir = match resolve_group_dir(state, &id) {
+                Ok(d) => d,
+                Err(e) => {
+                    ws_error(sink, &e).await;
+                    return;
+                }
+            };
+            let g = groups::load_group(&dir).expect("resolve 已校验");
+            if g.state == "stopped" || g.state == "summarized" {
+                ws_error(sink, &format!("群已终态（{}），不能发言", g.state)).await;
+                return;
+            }
+            // 人发言/插话照常入流（discussing 中不打断当前发言者，下轮调度自然读到）
+            let mentions = parse_mentions(&text, &g);
+            let ev = if mentions.is_empty() {
+                GroupEvent::message("user", &text)
+            } else {
+                GroupEvent::mention("user", &text, mentions.clone())
+            };
+            if let Err(e) = append_and_broadcast(state, &id, &dir, &ev) {
+                ws_error(sink, &e).await;
+                return;
+            }
+            // 人的 @点名 同样跳序（@唤醒权只属于人）
+            if g.state == "discussing" {
+                if let Some(target) = mentions.first() {
+                    if let Some(mut g2) = groups::load_group(&dir) {
+                        if let Some(sp) = speaking_to_force_next(&g2, target) {
+                            g2.speaking = Some(sp);
+                            let _ = groups::save_group(&dir, &g2);
+                        }
+                    }
+                }
+            }
+            // idle/paused → discussing 并启动调度
+            if g.state == "idle" || g.state == "paused" {
+                match groups::set_state(&dir, "discussing") {
+                    Ok(g2) => {
+                        broadcast_last_event(state, &id, &dir);
+                        broadcast_group_state(state, &id, &g2);
+                        if !start_group_scheduler(state, &id) {
+                            ws_error(sink, "群调度已在运行").await;
+                        }
+                    }
+                    Err(e) => ws_error(sink, &e).await,
+                }
+            }
+        }
+        ClientMsg::GroupDiscuss { id, topic } => {
+            let dir = match resolve_group_dir(state, &id) {
+                Ok(d) => d,
+                Err(e) => {
+                    ws_error(sink, &e).await;
+                    return;
+                }
+            };
+            let Some(mut g) = groups::load_group(&dir) else {
+                ws_error(sink, "群档案损坏").await;
+                return;
+            };
+            if g.state != "idle" && g.state != "paused" {
+                ws_error(sink, &format!("群当前状态 {}，不能发起讨论", g.state)).await;
+                return;
+            }
+            g.task = Some(groups::GroupTask {
+                topic: topic.clone(),
+                kind: "discussion".into(),
+                lead: None,
+                depth_left: r2_core::groups::DEFAULT_TASK_DEPTH,
+                started_ts: now_ts(),
+            });
+            if let Err(e) = groups::save_group(&dir, &g) {
+                ws_error(sink, &e).await;
+                return;
+            }
+            if let Err(e) = append_and_broadcast(state, &id, &dir, &GroupEvent::message("user", &topic)) {
+                ws_error(sink, &e).await;
+                return;
+            }
+            match groups::set_state(&dir, "discussing") {
+                Ok(g2) => {
+                    broadcast_last_event(state, &id, &dir);
+                    broadcast_group_state(state, &id, &g2);
+                    if !start_group_scheduler(state, &id) {
+                        ws_error(sink, "群调度已在运行").await;
+                    }
+                }
+                Err(e) => ws_error(sink, &e).await,
+            }
+        }
+        ClientMsg::GroupDelegate { id, topic, lead } => {
+            let dir = match resolve_group_dir(state, &id) {
+                Ok(d) => d,
+                Err(e) => {
+                    ws_error(sink, &e).await;
+                    return;
+                }
+            };
+            let Some(g) = groups::load_group(&dir) else {
+                ws_error(sink, "群档案损坏").await;
+                return;
+            };
+            if g.state != "idle" && g.state != "paused" {
+                ws_error(sink, &format!("群当前状态 {}，不能委任", g.state)).await;
+                return;
+            }
+            if let Err(e) = groups::promote_lead(&dir, &lead) {
+                ws_error(sink, &e).await;
+                return;
+            }
+            let mut g = groups::load_group(&dir).expect("promote 后必可读");
+            g.task = Some(groups::GroupTask {
+                topic: topic.clone(),
+                kind: "delegation".into(),
+                lead: Some(lead.clone()),
+                depth_left: r2_core::groups::DEFAULT_TASK_DEPTH,
+                started_ts: now_ts(),
+            });
+            if let Err(e) = groups::save_group(&dir, &g) {
+                ws_error(sink, &e).await;
+                return;
+            }
+            if let Err(e) = append_and_broadcast(
+                state,
+                &id,
+                &dir,
+                &GroupEvent::message("user", &format!("委任 @{lead}：{topic}")),
+            ) {
+                ws_error(sink, &e).await;
+                return;
+            }
+            match groups::set_state(&dir, "discussing") {
+                Ok(g2) => {
+                    broadcast_last_event(state, &id, &dir);
+                    broadcast_group_state(state, &id, &g2);
+                    if !start_group_scheduler(state, &id) {
+                        ws_error(sink, "群调度已在运行").await;
+                    }
+                }
+                Err(e) => ws_error(sink, &e).await,
+            }
+        }
+        ClientMsg::GroupPause(id) => {
+            handle_group_pause_stop(state, sink, id, "paused").await;
+        }
+        ClientMsg::GroupStop(id) => {
+            handle_group_pause_stop(state, sink, id, "stopped").await;
+        }
+        ClientMsg::GroupRevokeLead(id) => {
+            let dir = match resolve_group_dir(state, &id) {
+                Ok(d) => d,
+                Err(e) => {
+                    ws_error(sink, &e).await;
+                    return;
+                }
+            };
+            match groups::revoke_lead(&dir) {
+                Ok(g) => broadcast_group_state(state, &id, &g),
+                Err(e) => ws_error(sink, &e).await,
+            }
+        }
+        ClientMsg::GroupSummary(id) => {
+            let dir = match resolve_group_dir(state, &id) {
+                Ok(d) => d,
+                Err(e) => {
+                    ws_error(sink, &e).await;
+                    return;
+                }
+            };
+            let g = groups::load_group(&dir).expect("resolve 已校验");
+            if g.state != "discussing" {
+                ws_error(sink, &format!("仅讨论中可小结（当前 {}）", g.state)).await;
+                return;
+            }
+            abort_group_scheduler(state, &id);
+            let st = state.clone();
+            tokio::spawn(async move { run_group_summary(&st, &id).await });
+        }
+        ClientMsg::GroupOpen(id) => {
+            let dir = match resolve_group_dir(state, &id) {
+                Ok(d) => d,
+                Err(e) => {
+                    ws_error(sink, &e).await;
+                    return;
+                }
+            };
+            let g = groups::load_group(&dir).expect("resolve 已校验");
+            let events = groups::read_stream(&dir);
+            ws_send(sink, json!({"t": "group_open", "id": id, "group": g, "events": events})).await;
+        }
+        ClientMsg::GroupSubtaskApprove { id, to } => {
+            let dir = match resolve_group_dir(state, &id) {
+                Ok(d) => d,
+                Err(e) => {
+                    ws_error(sink, &e).await;
+                    return;
+                }
+            };
+            // 找该成员最近一条 pending 子任务（append-only：新事件覆盖语义）
+            let pending = groups::read_stream(&dir).into_iter().rev().find(|e| {
+                matches!(e, GroupEvent::Subtask { to: t, state, .. } if *t == to && state == "pending")
+            });
+            let Some(GroupEvent::Subtask { from, prompt, .. }) = pending else {
+                ws_error(sink, &format!("成员 {to} 没有待批准子任务")).await;
+                return;
+            };
+            let approved = GroupEvent::Subtask {
+                from,
+                to: to.clone(),
+                prompt: prompt.clone(),
+                ts: now_ts(),
+                state: "approved".into(),
+            };
+            if let Err(e) = append_and_broadcast(state, &id, &dir, &approved) {
+                ws_error(sink, &e).await;
+                return;
+            }
+            let st = state.clone();
+            tokio::spawn(async move { run_group_subtask(st, id, to, prompt).await });
+        }
+    }
+}
+
+// ---------- 群聊调度引擎（v0.9.1 会议室） ----------
+//
+// 一个群 = {session_dir}/group-<uuid>/（group.json + stream.jsonl，r2_core::groups 地基）。
+// 调度器 run_group_turn 是 tokio 后台任务：轮流为每个成员开独立临时 AgentSession 发言，
+// 事件逐条 append 到 stream 并实时广播；pause/stop 经 group.json 状态快照对比 + JoinHandle::abort 生效。
+
+/// 群上下文带入最近事件条数
+const GROUP_CTX_EVENTS: usize = 40;
+/// 群上下文字符上限（防 prompt 爆炸）
+const GROUP_CTX_CHARS: usize = 12_000;
+/// 每位成员发言间隔（给前端渲染喘息）
+const GROUP_TURN_GAP_MS: u64 = 300;
+/// 连续失败上限：达到后自动 paused
+const GROUP_MAX_FAIL_STREAK: u32 = 3;
+/// 单轮发言超时（秒）
+const GROUP_TURN_TIMEOUT_SECS: u64 = 300;
+
+fn now_ts() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 群 sid 合法性：group-<uuid> 形态，防路径穿越
+fn valid_group_sid(sid: &str) -> bool {
+    sid.strip_prefix("group-")
+        .map(|rest| !rest.is_empty() && valid_name(rest))
+        .unwrap_or(false)
+}
+
+/// 群目录：{session_dir}/group-<uuid>
+fn group_dir_path(session_dir: &str, sid: &str) -> PathBuf {
+    Path::new(session_dir).join(sid)
+}
+
+/// 建群：自动含 owner（main=人），目录落为 group-<uuid>，stream 首条 StateChange idle。
+/// 返回 (sid, config)。成员必须是已存在的 agent 分身。
+fn do_group_create(
+    session_dir: &str,
+    title: &str,
+    members: &[(String, String)],
+) -> Result<(String, groups::GroupConfig), String> {
+    if title.trim().is_empty() {
+        return Err("ERROR: 群标题不能为空".into());
+    }
+    if members.is_empty() {
+        return Err("ERROR: 至少 1 个 agent 分身".into());
+    }
+    let mut list: Vec<(&str, &str)> = vec![(MAIN, "主人")];
+    for (n, d) in members {
+        if n == MAIN {
+            return Err("ERROR: main（人）由系统自动加入，无需指定".into());
+        }
+        if agents::load_profile(n).is_none() {
+            return Err(format!("ERROR: agent 不存在：{n}"));
+        }
+        list.push((n, d));
+    }
+    let root = Path::new(session_dir);
+    std::fs::create_dir_all(root).map_err(|e| format!("ERROR: 创建会话目录失败：{e}"))?;
+    let g = groups::create_group(root, title, &list)?;
+    let sid = format!("group-{}", g.id);
+    std::fs::rename(groups::group_dir(root, &g.id), root.join(&sid))
+        .map_err(|e| format!("ERROR: 群目录改名失败：{e}"))?;
+    let dir = root.join(&sid);
+    groups::append_event(
+        &dir,
+        &GroupEvent::StateChange {
+            from_state: "idle".into(),
+            to_state: "idle".into(),
+            ts: now_ts(),
+        },
+    )?;
+    Ok((sid, g))
+}
+
+/// 群条目注入会话列表：group-<id> 目录 → kind:"group"
+fn group_entries(session_dir: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    let dir = Path::new(session_dir);
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("group-") {
+                continue;
+            }
+            let Some(g) = groups::load_group(&path) else {
+                continue;
+            };
+            out.push(json!({
+                "id": name,
+                "title": g.title,
+                "kind": "group",
+                "members_count": g.members.len(),
+                "state": g.state,
+                "round": g.round,
+                "used_tokens": g.used_tokens,
+                "preview": g.title,
+                "last_ts": g.created_ts,
+            }));
+        }
+    }
+    out
+}
+
+/// 普通会话 + 群条目合并列表
+fn sessions_with_groups(session_dir: &str) -> Vec<Value> {
+    let mut list: Vec<Value> = session::list_sessions(session_dir)
+        .unwrap_or_default()
+        .iter()
+        .map(summary_json)
+        .collect();
+    list.extend(group_entries(session_dir));
+    list
+}
+
+/// 广播一条群事件（前端实时渲染）
+fn broadcast_group_event(state: &WebState, sid: &str, event: &GroupEvent) {
+    let _ = state
+        .event_tx
+        .send(json!({"t": "group_event", "id": sid, "event": event}));
+}
+
+/// 广播群档案快照（speaking/round/token 账等变化）
+fn broadcast_group_state(state: &WebState, sid: &str, g: &groups::GroupConfig) {
+    let _ = state
+        .event_tx
+        .send(json!({"t": "group_state", "id": sid, "group": g}));
+}
+
+/// append 事件并广播
+fn append_and_broadcast(state: &WebState, sid: &str, dir: &Path, event: &GroupEvent) -> Result<(), String> {
+    groups::append_event(dir, event)?;
+    broadcast_group_event(state, sid, event);
+    Ok(())
+}
+
+/// set_state 后广播其内部追加的 StateChange（stream 末条）
+fn broadcast_last_event(state: &WebState, sid: &str, dir: &Path) {
+    if let Some(ev) = groups::read_stream(dir).last().cloned() {
+        broadcast_group_event(state, sid, &ev);
+    }
+}
+
+/// 文本里的 @成员名（只认群成员里的分身，人 main 不参与被点名）
+fn parse_mentions(text: &str, g: &groups::GroupConfig) -> Vec<String> {
+    let mut names: Vec<&str> = g
+        .members
+        .iter()
+        .map(|m| m.name.as_str())
+        .filter(|n| *n != MAIN)
+        .collect();
+    // 最长匹配优先，防前缀误伤（@cfo2 不被 @cfo 吃掉）
+    names.sort_by(|a, b| b.len().cmp(&a.len()));
+    let mut out: Vec<String> = Vec::new();
+    for n in names {
+        if text.contains(&format!("@{n}")) && !out.iter().any(|x| x == n) {
+            out.push(n.to_string());
+        }
+    }
+    out
+}
+
+/// 收敛信号
+fn has_done(text: &str) -> bool {
+    text.contains("[DONE]")
+}
+
+/// 解析 lead 派卡指令：[DELEGATE @成员名 任务描述] → (成员名, 任务)
+fn parse_delegate(text: &str) -> Option<(String, String)> {
+    let start = text.find("[DELEGATE")?;
+    let inner = &text[start + "[DELEGATE".len()..];
+    let end = inner.find(']')?;
+    let inner = inner[..end].trim().strip_prefix('@')?.trim();
+    let mut it = inner.splitn(2, char::is_whitespace);
+    let to = it.next()?.to_string();
+    let task = it.next().unwrap_or("").trim().to_string();
+    if to.is_empty() || task.is_empty() {
+        return None;
+    }
+    Some((to, task))
+}
+
+/// 与 next_speaker 同构的有效轮序（lead 挪队尾）
+fn effective_turn_order(g: &groups::GroupConfig) -> Vec<String> {
+    let mut order = g.settings.turn_order.clone();
+    if let Some(lead) = g
+        .members
+        .iter()
+        .find(|m| m.role == "lead")
+        .map(|m| m.name.clone())
+    {
+        if let Some(pos) = order.iter().position(|n| *n == lead) {
+            let l = order.remove(pos);
+            order.push(l);
+        }
+    }
+    order
+}
+
+/// 点名跳序：返回应写入 speaking 的值，使下一次 next_speaker(g, Some(main)) 命中 target
+fn speaking_to_force_next(g: &groups::GroupConfig, target: &str) -> Option<String> {
+    let order = effective_turn_order(g);
+    let pos = order.iter().position(|n| n == target)?;
+    if order.len() < 2 {
+        return None;
+    }
+    Some(order[(pos + order.len() - 1) % order.len()].clone())
+}
+
+/// 单事件文本化（群上下文用）
+fn event_text(e: &GroupEvent) -> String {
+    match e {
+        GroupEvent::Message { from, text, .. } => format!("{from}: {text}"),
+        GroupEvent::Mention {
+            from,
+            text,
+            mentions,
+            ..
+        } => format!("{from}: {text}（@{}）", mentions.join(" ")),
+        GroupEvent::Subtask {
+            from,
+            to,
+            prompt,
+            state,
+            ..
+        } => format!("[{from} → {to}] 子任务（{state}）：{prompt}"),
+        GroupEvent::Summary { text, .. } => format!("[小结] {text}"),
+        GroupEvent::StateChange {
+            from_state,
+            to_state,
+            ..
+        } => format!("[状态] {from_state} → {to_state}"),
+        GroupEvent::Error { text, .. } => format!("[错误] {text}"),
+    }
+}
+
+/// 群上下文：最近 max_events 条、max_chars 字符上限（从头部截断保最近）
+fn stream_context(dir: &Path, max_events: usize, max_chars: usize) -> String {
+    let events = groups::read_stream(dir);
+    let start = events.len().saturating_sub(max_events);
+    let s = events[start..].iter().map(event_text).collect::<Vec<_>>().join("\n");
+    if s.chars().count() <= max_chars {
+        return s;
+    }
+    let kept: String = {
+        let mut v: Vec<char> = s.chars().rev().take(max_chars).collect();
+        v.reverse();
+        v.into_iter().collect()
+    };
+    format!("……（前文省略）\n{kept}")
+}
+
+/// 组装成员发言 prompt（纯函数，便于测试）
+fn build_member_prompt(g: &groups::GroupConfig, dir: &Path, name: &str) -> String {
+    let roster = g
+        .members
+        .iter()
+        .map(|m| {
+            let disp = if m.display_name.is_empty() {
+                m.name.clone()
+            } else {
+                m.display_name.clone()
+            };
+            format!("- {}（{}，{}）", m.name, disp, m.role)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lead = g
+        .members
+        .iter()
+        .find(|m| m.role == "lead")
+        .map(|m| m.name.clone())
+        .unwrap_or_else(|| "无".to_string());
+    let is_lead = g.members.iter().any(|m| m.name == name && m.role == "lead");
+    let topic = g
+        .task
+        .as_ref()
+        .map(|t| t.topic.clone())
+        .unwrap_or_else(|| "自由讨论".to_string());
+    let budget_left = g.settings.budget_tokens.saturating_sub(g.used_tokens);
+    let ctx = stream_context(dir, GROUP_CTX_EVENTS, GROUP_CTX_CHARS);
+    format!(
+        "你正在参加群聊「{title}」，你的身份是成员 {name}{lead_note}。\n\n\
+         【群成员】\n{roster}\n\n\
+         【当前 lead】{lead}\n\
+         【主题】{topic}\n\
+         【进度】第 {round}/{max_rounds} 轮，剩余 token 预算约 {budget_left}\n\n\
+         【最近讨论记录】\n{ctx}\n\n\
+         【规则】\n\
+         1. 你是群聊中的 {name}，接续上下文讨论，不要重复别人说过的话。\n\
+         2. 可以 @成员名 点名追问（被点名者将优先发言）。\n\
+         3. 认为讨论已收敛时，在回复末尾单独输出 [DONE]。\n\
+         4. 如果你是 lead：先做规划，可用 [DELEGATE @成员名 任务描述] 派卡（需人批准后执行）。\n\
+         5. 回复控制在 300 字以内，直接说内容，不要客套。",
+        title = g.title,
+        name = name,
+        lead_note = if is_lead { "（lead）" } else { "" },
+        round = g.round + 1,
+        max_rounds = g.settings.max_rounds,
+    )
+}
+
+/// 小结 prompt（main persona 读全流收敛）
+fn build_summary_prompt(g: &groups::GroupConfig, dir: &Path) -> String {
+    let ctx = stream_context(dir, GROUP_CTX_EVENTS, GROUP_CTX_CHARS);
+    format!(
+        "以下是群聊「{title}」（主题：{topic}）的讨论记录：\n\n{ctx}\n\n\
+         请输出不超过 300 字的小结：达成的结论、未决分歧、后续行动。直接给小结正文。",
+        title = g.title,
+        topic = g
+            .task
+            .as_ref()
+            .map(|t| t.topic.clone())
+            .unwrap_or_else(|| "自由讨论".to_string()),
+    )
+}
+
+/// token 记账（落盘）；返回 false = 超预算
+fn group_add_tokens(dir: &Path, n: u64) -> bool {
+    let Some(mut g) = groups::load_group(dir) else {
+        return true;
+    };
+    let ok = groups::add_tokens(&mut g, n);
+    let _ = groups::save_group(dir, &g);
+    ok
+}
+
+/// 预算耗尽：paused + Error 事件
+fn group_pause_budget(state: &WebState, sid: &str, dir: &Path) {
+    if let Ok(g) = groups::set_state(dir, "paused") {
+        broadcast_last_event(state, sid, dir);
+        broadcast_group_state(state, sid, &g);
+    }
+    let _ = append_and_broadcast(state, sid, dir, &GroupEvent::error("预算耗尽，等待续期"));
+}
+
+/// 失败记账：append Error；连续失败达上限 → paused，返回 true = 调度器应退出
+fn group_note_failure(state: &WebState, sid: &str, dir: &Path, streak: u32, err: &str) -> bool {
+    let _ = append_and_broadcast(state, sid, dir, &GroupEvent::error(err));
+    if streak < GROUP_MAX_FAIL_STREAK {
+        return false;
+    }
+    if let Ok(g) = groups::set_state(dir, "paused") {
+        broadcast_last_event(state, sid, dir);
+        broadcast_group_state(state, sid, &g);
+    }
+    let _ = append_and_broadcast(
+        state,
+        sid,
+        dir,
+        &GroupEvent::error("连续 3 次模型调用失败，群已自动暂停"),
+    );
+    true
+}
+
+/// 收敛：main persona 读全流生成 Summary → state summarized
+async fn run_group_summary(state: &Arc<WebState>, sid: &str) {
+    let dir = group_dir_path(&state.session_dir, sid);
+    let Some(g) = groups::load_group(&dir) else {
+        return;
+    };
+    let mut cfg = state.config.lock().expect("config 锁中毒").clone();
+    apply_persona(MAIN, &mut cfg);
+    let prompt = build_summary_prompt(&g, &dir);
+    let outcome = match AgentSession::new(cfg) {
+        Ok(mut s) => {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(GROUP_TURN_TIMEOUT_SECS),
+                s.prompt(&prompt),
+            )
+            .await
+            {
+                Ok(Ok(text)) => Some(text),
+                Ok(Err(e)) => {
+                    let _ = append_and_broadcast(state, sid, &dir, &GroupEvent::error(&format!("小结生成失败：{e}")));
+                    None
+                }
+                Err(_) => {
+                    let _ = append_and_broadcast(state, sid, &dir, &GroupEvent::error("小结生成超时"));
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            let _ = append_and_broadcast(state, sid, &dir, &GroupEvent::error(&format!("小结会话创建失败：{e}")));
+            None
+        }
+    };
+    if let Some(text) = outcome {
+        let _ = append_and_broadcast(state, sid, &dir, &GroupEvent::summary(&text));
+    }
+    if let Ok(g2) = groups::set_state(&dir, "summarized") {
+        broadcast_last_event(state, sid, &dir);
+        broadcast_group_state(state, sid, &g2);
+    }
+    broadcast_sessions(state);
+}
+
+/// 群调度器主循环（tokio 后台任务；seq 用于退出清理防误删新一代任务）
+async fn run_group_turn(state: Arc<WebState>, sid: String, seq: u64) {
+    let dir = group_dir_path(&state.session_dir, &sid);
+    let mut fail_streak: u32 = 0;
+    // 本轮已发言的分身集合：全员覆盖 = 一轮结束
+    let mut round_speakers: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        // 每步对比 group.json 实时状态：pause/stop 立即生效
+        let Some(mut g) = groups::load_group(&dir) else {
+            break;
+        };
+        if g.state != "discussing" {
+            break;
+        }
+        // 人（main）不自动发言：只经 group_prompt 插话
+        let name = match groups::next_speaker(&g, Some(MAIN)) {
+            Some(n) => n,
+            None => {
+                // 单分身群：speaking 占住唯一候选导致 None → 清 speaking 重取
+                let solo = g.members.iter().filter(|m| m.name != MAIN).count() == 1;
+                if !solo {
+                    break;
+                }
+                g.speaking = None;
+                let _ = groups::save_group(&dir, &g);
+                match groups::next_speaker(&g, Some(MAIN)) {
+                    Some(n) => n,
+                    None => break,
+                }
+            }
+        };
+        g.speaking = Some(name.clone());
+        let _ = groups::save_group(&dir, &g);
+        broadcast_group_state(&state, &sid, &g);
+
+        // 独立临时 AgentSession（不碰前台 state.agent 槽位），成员自己的 persona/work_dir
+        let mut cfg = state.config.lock().expect("config 锁中毒").clone();
+        apply_persona(&name, &mut cfg);
+        let prompt = build_member_prompt(&g, &dir, &name);
+        let mut session = match AgentSession::new(cfg) {
+            Ok(s) => s,
+            Err(e) => {
+                fail_streak += 1;
+                if group_note_failure(&state, &sid, &dir, fail_streak, &format!("成员 {name} 会话创建失败：{e}")) {
+                    break;
+                }
+                continue;
+            }
+        };
+        // usage 捕获（UsageUpdate 在 Done 前发出，会话级累计；本会话只跑一轮，直接取值）
+        let usage = Arc::new(StdMutex::new(r2_core::types::UsageStats::default()));
+        let usage2 = usage.clone();
+        let mut rx = session.subscribe();
+        let cap = tokio::spawn(async move {
+            while let Ok(e) = rx.recv().await {
+                if let r2_core::AgentEvent::UsageUpdate(u) = e {
+                    *usage2.lock().expect("usage 锁中毒") = u;
+                }
+            }
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(GROUP_TURN_TIMEOUT_SECS),
+            session.prompt(&prompt),
+        )
+        .await;
+        cap.abort();
+
+        let text = match result {
+            Ok(Ok(text)) => text,
+            Ok(Err(e)) => {
+                fail_streak += 1;
+                if group_note_failure(&state, &sid, &dir, fail_streak, &format!("成员 {name} 发言失败：{e}")) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(GROUP_TURN_GAP_MS)).await;
+                continue;
+            }
+            Err(_) => {
+                fail_streak += 1;
+                if group_note_failure(&state, &sid, &dir, fail_streak, &format!("成员 {name} 发言超时")) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(GROUP_TURN_GAP_MS)).await;
+                continue;
+            }
+        };
+        fail_streak = 0;
+
+        // 发言入流（@点名 → Mention 事件）
+        let mentions = parse_mentions(&text, &g);
+        let ev = if mentions.is_empty() {
+            GroupEvent::message(&name, &text)
+        } else {
+            GroupEvent::mention(&name, &text, mentions.clone())
+        };
+        let _ = append_and_broadcast(&state, &sid, &dir, &ev);
+
+        // lead 派卡指令 → Subtask pending（前端审批卡；批准走 group_subtask_approve）
+        if let Some((to, task)) = parse_delegate(&text) {
+            if g.members.iter().any(|m| m.name == to) {
+                let _ = append_and_broadcast(
+                    &state,
+                    &sid,
+                    &dir,
+                    &GroupEvent::Subtask {
+                        from: name.clone(),
+                        to,
+                        prompt: task,
+                        ts: now_ts(),
+                        state: "pending".into(),
+                    },
+                );
+            }
+        }
+
+        // 点名跳序：被 @ 者优先下一位
+        if let Some(target) = mentions.first() {
+            if *target != name {
+                if let Some(mut g3) = groups::load_group(&dir) {
+                    if let Some(sp) = speaking_to_force_next(&g3, target) {
+                        g3.speaking = Some(sp);
+                        let _ = groups::save_group(&dir, &g3);
+                    }
+                }
+            }
+        }
+
+        // token 记账：usage 优先，无则按字符数/4 估算（prompt + 回复）
+        let u = usage.lock().expect("usage 锁中毒").clone();
+        let tokens = if u.input_tokens + u.output_tokens > 0 {
+            u.input_tokens + u.output_tokens
+        } else {
+            (prompt.chars().count() + text.chars().count()) as u64 / 4
+        };
+        if !group_add_tokens(&dir, tokens) {
+            group_pause_budget(&state, &sid, &dir);
+            break;
+        }
+
+        // 轮次推进：全员分身都发过言 = 一轮结束
+        let member_count = g.members.iter().filter(|m| m.name != MAIN).count();
+        round_speakers.insert(name.clone());
+        if round_speakers.len() >= member_count {
+            round_speakers.clear();
+            if let Some(mut g4) = groups::load_group(&dir) {
+                g4.round += 1;
+                let _ = groups::save_group(&dir, &g4);
+                broadcast_group_state(&state, &sid, &g4);
+                if g4.round + 1 > g4.settings.max_rounds {
+                    run_group_summary(&state, &sid).await;
+                    break;
+                }
+            }
+        }
+
+        // [DONE] 收敛
+        if has_done(&text) {
+            run_group_summary(&state, &sid).await;
+            break;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(GROUP_TURN_GAP_MS)).await;
+    }
+    // 退出清理：只删自己这一代（pause/stop 已 abort 并移除时跳过；新一代已占位时不误删）
+    let mut map = state.group_running.lock().expect("群任务锁中毒");
+    if map.get(&sid).map(|(s, _)| *s == seq).unwrap_or(false) {
+        map.remove(&sid);
+    }
+}
+
+/// 启动群调度器：同群重复启动拒绝（任务还活着时）
+fn start_group_scheduler(state: &Arc<WebState>, sid: &str) -> bool {
+    let mut map = state.group_running.lock().expect("群任务锁中毒");
+    if let Some((_, h)) = map.get(sid) {
+        if !h.is_finished() {
+            return false;
+        }
+    }
+    let seq = {
+        let mut s = state.group_seq.lock().expect("群世代锁中毒");
+        *s += 1;
+        *s
+    };
+    let st = state.clone();
+    let id = sid.to_string();
+    let handle = tokio::spawn(async move { run_group_turn(st, id, seq).await });
+    map.insert(sid.to_string(), (seq, handle));
+    true
+}
+
+/// 中止群调度器（pause/stop 路径；只用 JoinHandle::abort，不碰 OS 信号）
+fn abort_group_scheduler(state: &WebState, sid: &str) {
+    if let Some((_, h)) = state.group_running.lock().expect("群任务锁中毒").remove(sid) {
+        h.abort();
+    }
+}
+
+/// 群 sid → 目录（校验 + 存在性）
+fn resolve_group_dir(state: &WebState, sid: &str) -> Result<PathBuf, String> {
+    if !valid_group_sid(sid) {
+        return Err("ERROR: 非法群 id".into());
+    }
+    let dir = group_dir_path(&state.session_dir, sid);
+    if groups::load_group(&dir).is_none() {
+        return Err(format!("ERROR: 群不存在：{sid}"));
+    }
+    Ok(dir)
+}
+
+/// 批准 lead 的子任务：置 approved → 被执行成员独立会话跑 → 结果回群
+async fn run_group_subtask(state: Arc<WebState>, sid: String, to: String, prompt: String) {
+    let dir = group_dir_path(&state.session_dir, &sid);
+    let Some(g) = groups::load_group(&dir) else {
+        return;
+    };
+    let mut cfg = state.config.lock().expect("config 锁中毒").clone();
+    apply_persona(&to, &mut cfg);
+    let full = format!(
+        "你在群聊「{title}」中被委任子任务：\n{prompt}\n\n最近群上下文：\n{ctx}\n\n\
+         请执行该任务并给出结果汇报（300 字以内）。",
+        title = g.title,
+        ctx = stream_context(&dir, GROUP_CTX_EVENTS, GROUP_CTX_CHARS),
+    );
+    let outcome = match AgentSession::new(cfg) {
+        Ok(mut s) => {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(GROUP_TURN_TIMEOUT_SECS),
+                s.prompt(&full),
+            )
+            .await
+            {
+                Ok(Ok(text)) => Some(text),
+                Ok(Err(e)) => {
+                    let _ = append_and_broadcast(&state, &sid, &dir, &GroupEvent::error(&format!("子任务执行失败（{to}）：{e}")));
+                    None
+                }
+                Err(_) => {
+                    let _ = append_and_broadcast(&state, &sid, &dir, &GroupEvent::error(&format!("子任务执行超时（{to}）")));
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            let _ = append_and_broadcast(&state, &sid, &dir, &GroupEvent::error(&format!("子任务会话创建失败（{to}）：{e}")));
+            None
+        }
+    };
+    if let Some(text) = outcome {
+        let _ = append_and_broadcast(&state, &sid, &dir, &GroupEvent::message(&to, &text));
+        let _ = append_and_broadcast(
+            &state,
+            &sid,
+            &dir,
+            &GroupEvent::Subtask {
+                from: to.clone(),
+                to,
+                prompt,
+                ts: now_ts(),
+                state: "done".into(),
+            },
+        );
+    }
+}
+
+/// pause/stop 公共路径：abort 调度句柄 + set_state + 清 speaking + 广播
+async fn handle_group_pause_stop(state: &Arc<WebState>, sink: &WsSink, id: String, to: &str) {
+    let dir = match resolve_group_dir(state, &id) {
+        Ok(d) => d,
+        Err(e) => {
+            ws_error(sink, &e).await;
+            return;
+        }
+    };
+    abort_group_scheduler(state, &id);
+    match groups::set_state(&dir, to) {
+        Ok(mut g) => {
+            g.speaking = None;
+            let _ = groups::save_group(&dir, &g);
+            broadcast_last_event(state, &id, &dir);
+            broadcast_group_state(state, &id, &g);
+            broadcast_sessions(state);
+        }
+        Err(e) => ws_error(sink, &e).await,
     }
 }
 
@@ -1166,6 +2150,8 @@ pub async fn run(config: Config, port: u16, host: String) -> Result<(), Box<dyn 
         work_dir,
         tools,
         current_agent: StdMutex::new(MAIN.to_string()),
+        group_running: StdMutex::new(HashMap::new()),
+        group_seq: StdMutex::new(0),
     });
 
     // 调度器先克隆再建路由（with_state 会 move state）
@@ -1368,6 +2354,8 @@ mod tests {
             session_dir: "/main/sessions".to_string(),
             work_dir: "/main/work".to_string(),
             current_agent: StdMutex::new(MAIN.to_string()),
+            group_running: StdMutex::new(HashMap::new()),
+            group_seq: StdMutex::new(0),
         };
         assert_eq!(session_dir_for(&state), "/main/sessions");
         *state.current_agent.lock().unwrap() = "cfo".to_string();
@@ -1406,6 +2394,8 @@ mod tests {
             session_dir,
             work_dir: tmp.path().to_string_lossy().to_string(),
             current_agent: StdMutex::new(MAIN.to_string()),
+            group_running: StdMutex::new(HashMap::new()),
+            group_seq: StdMutex::new(0),
         };
         let v = state_json(&state);
         assert!(v["model"].is_string());
@@ -1419,5 +2409,334 @@ mod tests {
         assert!(v["prompt_sections"]["core"].is_string());
         assert_eq!(v["running"], false);
         assert!(v["current_session"].is_null());
+    }
+
+    // ═══ 群聊调度引擎测试 ═══
+
+    /// 最小 WebState（临时目录，不起服务）
+    fn make_test_state(session_dir: &str) -> WebState {
+        let (event_tx, _) = broadcast::channel(EVENT_CAPACITY);
+        WebState {
+            tools: vec![],
+            config: StdMutex::new(Config::default_config()),
+            agent: Mutex::new(None),
+            steer_tx: StdMutex::new(None),
+            event_tx,
+            session_dir: session_dir.to_string(),
+            work_dir: "/tmp".to_string(),
+            current_agent: StdMutex::new(MAIN.to_string()),
+            group_running: StdMutex::new(HashMap::new()),
+            group_seq: StdMutex::new(0),
+        }
+    }
+
+    /// 临时群根 + 三人群（main + cfo + cto），走 r2-core 直建（不校验档案存在）
+    fn make_test_group() -> (tempfile::TempDir, String, groups::GroupConfig) {
+        let root = tempfile::tempdir().unwrap();
+        let g = groups::create_group(
+            root.path(),
+            "评审会",
+            &[(MAIN, "主人"), ("cfo", "CFO"), ("cto", "CTO")],
+        )
+        .unwrap();
+        // 与生产一致：目录改名 group-<id>
+        let sid = format!("group-{}", g.id);
+        std::fs::rename(groups::group_dir(root.path(), &g.id), root.path().join(&sid)).unwrap();
+        (root, sid, g)
+    }
+
+    #[test]
+    fn test_parse_group_create() {
+        match parse_client_msg(
+            r#"{"t":"group_create","title":"评审会","members":[{"name":"cfo","display_name":"CFO"},{"name":"cto"}]}"#,
+        )
+        .unwrap()
+        {
+            ClientMsg::GroupCreate { title, members } => {
+                assert_eq!(title, "评审会");
+                assert_eq!(
+                    members,
+                    vec![("cfo".to_string(), "CFO".to_string()), ("cto".to_string(), String::new())]
+                );
+            }
+            _ => panic!("应为 GroupCreate"),
+        }
+        // 空 members / 缺 title / members 非数组 → 报错
+        assert!(parse_client_msg(r#"{"t":"group_create","title":"t","members":[]}"#).is_err());
+        assert!(parse_client_msg(r#"{"t":"group_create","members":[{"name":"cfo"}]}"#).is_err());
+        assert!(parse_client_msg(r#"{"t":"group_create","title":"t","members":"cfo"}"#).is_err());
+        assert!(parse_client_msg(r#"{"t":"group_create","title":"t","members":[{"display_name":"x"}]}"#).is_err());
+    }
+
+    #[test]
+    fn test_parse_group_msgs() {
+        match parse_client_msg(r#"{"t":"group_prompt","id":"group-a","text":"大家好"}"#).unwrap() {
+            ClientMsg::GroupPrompt { id, text } => {
+                assert_eq!(id, "group-a");
+                assert_eq!(text, "大家好");
+            }
+            _ => panic!("应为 GroupPrompt"),
+        }
+        match parse_client_msg(r#"{"t":"group_discuss","id":"group-a","topic":"预算"}"#).unwrap() {
+            ClientMsg::GroupDiscuss { id, topic } => {
+                assert_eq!(id, "group-a");
+                assert_eq!(topic, "预算");
+            }
+            _ => panic!("应为 GroupDiscuss"),
+        }
+        match parse_client_msg(r#"{"t":"group_delegate","id":"group-a","topic":"年报","lead":"cfo"}"#).unwrap() {
+            ClientMsg::GroupDelegate { id, topic, lead } => {
+                assert_eq!(id, "group-a");
+                assert_eq!(topic, "年报");
+                assert_eq!(lead, "cfo");
+            }
+            _ => panic!("应为 GroupDelegate"),
+        }
+        assert!(matches!(
+            parse_client_msg(r#"{"t":"group_pause","id":"group-a"}"#).unwrap(),
+            ClientMsg::GroupPause(_)
+        ));
+        assert!(matches!(
+            parse_client_msg(r#"{"t":"group_stop","id":"group-a"}"#).unwrap(),
+            ClientMsg::GroupStop(_)
+        ));
+        assert!(matches!(
+            parse_client_msg(r#"{"t":"group_revoke_lead","id":"group-a"}"#).unwrap(),
+            ClientMsg::GroupRevokeLead(_)
+        ));
+        assert!(matches!(
+            parse_client_msg(r#"{"t":"group_summary","id":"group-a"}"#).unwrap(),
+            ClientMsg::GroupSummary(_)
+        ));
+        assert!(matches!(
+            parse_client_msg(r#"{"t":"group_open","id":"group-a"}"#).unwrap(),
+            ClientMsg::GroupOpen(_)
+        ));
+        match parse_client_msg(r#"{"t":"group_subtask_approve","id":"group-a","to":"cto"}"#).unwrap() {
+            ClientMsg::GroupSubtaskApprove { id, to } => {
+                assert_eq!(id, "group-a");
+                assert_eq!(to, "cto");
+            }
+            _ => panic!("应为 GroupSubtaskApprove"),
+        }
+        // 缺字段 → 报错
+        for bad in [
+            r#"{"t":"group_prompt","id":"group-a"}"#,
+            r#"{"t":"group_discuss","id":"group-a"}"#,
+            r#"{"t":"group_delegate","id":"group-a","topic":"x"}"#,
+            r#"{"t":"group_pause"}"#,
+            r#"{"t":"group_open"}"#,
+            r#"{"t":"group_subtask_approve","id":"group-a"}"#,
+        ] {
+            assert!(parse_client_msg(bad).is_err(), "{bad} 应报错");
+        }
+    }
+
+    #[test]
+    fn test_valid_group_sid() {
+        assert!(valid_group_sid("group-550e8400-e29b-41d4-a716-446655440000"));
+        assert!(!valid_group_sid("group-"));
+        assert!(!valid_group_sid("abc"));
+        assert!(!valid_group_sid("group-../etc"));
+        assert!(!valid_group_sid("group-a/b"));
+    }
+
+    #[test]
+    fn test_group_create_dir_structure() {
+        let _g = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let old_home = std::env::var("HOME").unwrap_or_default();
+        std::env::set_var("HOME", tmp.path());
+        agents::draft_profile("cfo", "CFO", "", "", "").unwrap();
+        agents::approve("cfo").unwrap();
+        agents::draft_profile("cto", "CTO", "", "", "").unwrap();
+        agents::approve("cto").unwrap();
+
+        let session_dir = tmp.path().join("sessions");
+        let (sid, g) = do_group_create(
+            session_dir.to_str().unwrap(),
+            "评审会",
+            &[("cfo".to_string(), "CFO".to_string()), ("cto".to_string(), "CTO".to_string())],
+        )
+        .unwrap();
+        assert!(sid.starts_with("group-"));
+        let dir = session_dir.join(&sid);
+        // group.json + stream.jsonl 落盘；owner 自动加入且 role=owner
+        assert!(dir.join("group.json").is_file());
+        assert!(dir.join("stream.jsonl").is_file());
+        assert_eq!(g.members[0].name, MAIN);
+        assert_eq!(g.members[0].role, "owner");
+        // stream 首条 = StateChange idle
+        let events = groups::read_stream(&dir);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            GroupEvent::StateChange { ref from_state, ref to_state, .. }
+                if from_state == "idle" && to_state == "idle"
+        ));
+        // 不存在的 agent / 指定 main / 空标题 → 报错
+        assert!(do_group_create(session_dir.to_str().unwrap(), "t", &[("ghost".into(), "".into())]).is_err());
+        assert!(do_group_create(session_dir.to_str().unwrap(), "t", &[(MAIN.into(), "".into())]).is_err());
+        assert!(do_group_create(session_dir.to_str().unwrap(), "  ", &[("cfo".into(), "".into())]).is_err());
+
+        std::env::set_var("HOME", old_home);
+    }
+
+    #[test]
+    fn test_group_entries_inject() {
+        let (root, sid, _g) = make_test_group();
+        let session_dir = root.path().to_string_lossy().to_string();
+        let entries = group_entries(&session_dir);
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e["id"], json!(sid));
+        assert_eq!(e["kind"], "group");
+        assert_eq!(e["title"], "评审会");
+        assert_eq!(e["members_count"], 3);
+        assert_eq!(e["state"], "idle");
+        // 普通 *.jsonl 列表不受群目录影响（list_sessions 只挑 .jsonl 文件）
+        let plain = session::list_sessions(&session_dir).unwrap();
+        assert!(plain.is_empty());
+    }
+
+    #[test]
+    fn test_parse_mentions_done_delegate() {
+        let (_root, _sid, g) = make_test_group();
+        // @点名只认群成员里的分身；main 不可被点
+        assert_eq!(parse_mentions("请 @cfo 报个数", &g), vec!["cfo".to_string()]);
+        assert_eq!(parse_mentions("@main 你怎么看", &g), Vec::<String>::new());
+        assert_eq!(parse_mentions("@cfo 和 @cto 都对", &g), vec!["cfo".to_string(), "cto".to_string()]);
+        assert_eq!(parse_mentions("没有点名", &g), Vec::<String>::new());
+        assert_eq!(parse_mentions("@ghost 不存在", &g), Vec::<String>::new());
+        // 收敛信号
+        assert!(has_done("综上 [DONE]"));
+        assert!(!has_done("[DONE 还没收敛"));
+        // 派卡指令
+        assert_eq!(
+            parse_delegate("规划如下 [DELEGATE @cto 拉取 Q3 数据] 以上"),
+            Some(("cto".to_string(), "拉取 Q3 数据".to_string()))
+        );
+        assert_eq!(parse_delegate("[DELEGATE cfo 缺@号]"), None);
+        assert_eq!(parse_delegate("[DELEGATE @cto]"), None); // 无任务描述
+        assert_eq!(parse_delegate("没有指令"), None);
+    }
+
+    #[test]
+    fn test_speaking_to_force_next_jump() {
+        let (_root, _sid, mut g) = make_test_group();
+        // 顺序 main → cfo → cto：点名 cto → speaking 置 cfo，下一位即 cto
+        let sp = speaking_to_force_next(&g, "cto").unwrap();
+        g.speaking = Some(sp);
+        assert_eq!(groups::next_speaker(&g, Some(MAIN)).as_deref(), Some("cto"));
+        // 点名 cfo → speaking 置 main
+        let sp = speaking_to_force_next(&g, "cfo").unwrap();
+        g.speaking = Some(sp);
+        assert_eq!(groups::next_speaker(&g, Some(MAIN)).as_deref(), Some("cfo"));
+        // 目标不存在 → None
+        assert_eq!(speaking_to_force_next(&g, "ghost"), None);
+    }
+
+    #[test]
+    fn test_budget_pause_path() {
+        let (root, sid, _g) = make_test_group();
+        let dir = root.path().join(&sid);
+        groups::set_state(&dir, "discussing").unwrap();
+        // 记账到顶仍放行
+        assert!(group_add_tokens(&dir, 300_000));
+        // 超 1 个 token → false（调度器据此走 group_pause_budget）
+        assert!(!group_add_tokens(&dir, 1));
+        let state = make_test_state(root.path().to_str().unwrap());
+        group_pause_budget(&state, "group-x", &dir);
+        let g2 = groups::load_group(&dir).unwrap();
+        assert_eq!(g2.state, "paused");
+        let events = groups::read_stream(&dir);
+        assert!(matches!(events.last(), Some(GroupEvent::Error { text, .. }) if text.contains("预算耗尽")));
+        // paused 后 budget 已超：used_tokens 落盘保留
+        assert!(g2.used_tokens > 300_000);
+    }
+
+    #[test]
+    fn test_group_state_smoke() {
+        let (root, sid, _g) = make_test_group();
+        let dir = root.path().join(&sid);
+        // idle → discussing → summarized 状态落盘正确（无需真模型）
+        let g = groups::set_state(&dir, "discussing").unwrap();
+        assert_eq!(g.state, "discussing");
+        let g = groups::set_state(&dir, "summarized").unwrap();
+        assert_eq!(g.state, "summarized");
+        // 终态不可再迁
+        assert!(groups::set_state(&dir, "discussing").is_err());
+        // StateChange 事件入流
+        let events = groups::read_stream(&dir);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[1], GroupEvent::StateChange { ref from_state, ref to_state, .. } if from_state == "discussing" && to_state == "summarized"));
+    }
+
+    #[test]
+    fn test_interject_keeps_speaking() {
+        let (root, sid, _g) = make_test_group();
+        let dir = root.path().join(&sid);
+        groups::set_state(&dir, "discussing").unwrap();
+        let mut g = groups::load_group(&dir).unwrap();
+        g.speaking = Some("cfo".into());
+        groups::save_group(&dir, &g).unwrap();
+        // 人插话：只入流，不动 speaking（模拟 group_prompt discussing 分支）
+        groups::append_event(&dir, &GroupEvent::message("user", "插一句")).unwrap();
+        let g2 = groups::load_group(&dir).unwrap();
+        assert_eq!(g2.speaking.as_deref(), Some("cfo"));
+        assert_eq!(g2.state, "discussing");
+    }
+
+    #[test]
+    fn test_group_note_failure_pause() {
+        let (root, sid, _g) = make_test_group();
+        let dir = root.path().join(&sid);
+        groups::set_state(&dir, "discussing").unwrap();
+        let state = make_test_state(root.path().to_str().unwrap());
+        // 前两次失败：只记 Error，不暂停
+        assert!(!group_note_failure(&state, "group-x", &dir, 1, "失败1"));
+        assert!(!group_note_failure(&state, "group-x", &dir, 2, "失败2"));
+        assert_eq!(groups::load_group(&dir).unwrap().state, "discussing");
+        // 第三次：自动 paused
+        assert!(group_note_failure(&state, "group-x", &dir, 3, "失败3"));
+        assert_eq!(groups::load_group(&dir).unwrap().state, "paused");
+        let events = groups::read_stream(&dir);
+        assert!(events.iter().filter(|e| matches!(e, GroupEvent::Error { .. })).count() >= 3);
+    }
+
+    #[test]
+    fn test_stream_context_caps() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        // 60 条事件 → 只取最近 40 条
+        for i in 0..60 {
+            groups::append_event(dir, &GroupEvent::message("cfo", &format!("第{i}条"))).unwrap();
+        }
+        let ctx = stream_context(dir, 40, 12_000);
+        assert!(!ctx.contains("第19条"));
+        assert!(ctx.contains("第20条"));
+        assert!(ctx.contains("第59条"));
+        // 字符上限：超长事件流从头部截断
+        let long = "字".repeat(500);
+        for _ in 0..30 {
+            groups::append_event(dir, &GroupEvent::message("cto", &long)).unwrap();
+        }
+        let ctx = stream_context(dir, 40, 12_000);
+        assert!(ctx.starts_with("……（前文省略）"));
+        assert!(ctx.chars().count() <= 12_000 + 20); // 截断标记少量余量
+    }
+
+    #[test]
+    fn test_build_member_prompt_contents() {
+        let (root, sid, g) = make_test_group();
+        let dir = root.path().join(&sid);
+        groups::append_event(&dir, &GroupEvent::message("user", "聊聊 Q3 预算")).unwrap();
+        let prompt = build_member_prompt(&g, &dir, "cfo");
+        assert!(prompt.contains("评审会"));
+        assert!(prompt.contains("成员 cfo"));
+        assert!(prompt.contains("- cfo（CFO，member）"));
+        assert!(prompt.contains("聊聊 Q3 预算"));
+        assert!(prompt.contains("[DONE]"));
+        assert!(prompt.contains("[DELEGATE"));
     }
 }

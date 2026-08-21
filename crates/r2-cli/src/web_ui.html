@@ -273,6 +273,7 @@ textarea[readonly]{color:var(--dim)}
     <span id="model" title="点击输入模型名，如 glm-5.2 / kimi-k3">—</span>
     <span id="agent-badge" title="点击切换 Agent 分身">main</span>
   <span id="taskbadge" title="定时任务状态，点击查看" style="display:none;cursor:pointer;font-size:12px"></span>
+  <span id="agentbadge" title="召唤待批准，点击去审批" style="display:none;cursor:pointer;font-size:12px"></span>
     <span class="sp"></span>
     <span id="offline">[连接断开，重连中…]</span>
     <span id="usage">¥0.00 · 0 tok</span>
@@ -440,7 +441,7 @@ function applyState(st){
   $("#pf-skills").value=(st.prompt_sections&&st.prompt_sections.skills)||"（~/.r2/skills 为空）";
   renderSessions();renderTools();renderSandbox();renderUsage();
   store.agents=st.agents||[];store.currentAgent=st.current_agent||"main";
-  renderAgentSel();renderAgentList();
+  renderAgentSel();renderAgentList();renderAgentBadge();
   setRunning(!!st.running);
 }
 /* ---------- agents ---------- */
@@ -725,6 +726,17 @@ function renderTaskBadge(){
 }
 $("#taskbadge").onclick=()=>{
   document.querySelector('#tabs button[data-p="growth"]').click();
+};
+/* 顶栏召唤徽章：⏳N待批（黄）；点击跳「分身」页审批 */
+function renderAgentBadge(){
+  const b=$("#agentbadge");if(!b)return;
+  const pend=(store.agents||[]).filter(a=>a.state==="pending").length;
+  if(!pend){b.style.display="none";return}
+  b.style.display="inline";
+  b.innerHTML='<span class="pend">⏳'+pend+'待召唤</span>';
+}
+$("#agentbadge").onclick=()=>{
+  document.querySelector('#tabs button[data-p="agent"]').click();
 };
 /* 任务按钮事件委托：一次绑定，动态渲染的按钮共用（零内联 onclick——
    内联引号嵌套是这次语法错误的根因，永绝后患） */
