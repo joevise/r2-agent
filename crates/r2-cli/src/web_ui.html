@@ -115,6 +115,35 @@ textarea[readonly]{color:var(--dim)}
 .gb.trial{color:var(--dim)}
 .gb.promoted{color:var(--fg);border-color:#3a6045}
 .gdecay{border:1px dashed #6a5535;border-radius:8px;padding:8px 12px;margin-bottom:10px;font-size:12.5px;color:#e0b070}
+/* group（群聊） */
+.gsb{font-size:10.5px;border:1px solid var(--line);border-radius:10px;padding:0 6px;margin-left:4px}
+.gsb-idle{color:var(--dim)}
+.gsb-discussing{color:var(--ok);border-color:#3a6045;animation:blink 1s steps(2) infinite}
+.gsb-paused{color:#e0b070;border-color:#6a5535}
+.gsb-stopped{color:var(--err);border-color:#6a3535}
+.gsb-summarized{color:#7ab8d0;border-color:#3a5070}
+.gmark{color:var(--dim)}
+.udot{color:var(--ok);margin-left:6px;font-size:10px}
+#btn-newgroup{width:100%;margin-top:8px;text-align:left}
+#group-form{border:1px solid var(--line);border-radius:8px;padding:8px;margin-top:8px}
+#group-form input[type=text]{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);padding:4px 6px;width:100%;outline:none;margin-bottom:6px}
+.gfmem{display:block;padding:3px 2px;font-size:12px;cursor:pointer}
+.gfmem:hover{color:var(--white)}
+#groupbar{display:none;align-items:center;gap:8px;padding:6px 16px;border-bottom:1px solid var(--line);font-size:12px;flex-wrap:wrap}
+#groupbar .gtitle{color:var(--white)}
+.gchip{border:1px solid var(--line);border-radius:10px;padding:0 6px;white-space:nowrap}
+#gctl{display:none;gap:6px;margin-bottom:6px;flex-wrap:wrap}
+#gctl button{font-size:11.5px;padding:2px 8px}
+#gdeleg{display:none;gap:6px;margin-bottom:6px;align-items:center}
+#gdeleg input,#gdeleg select{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);padding:3px 6px;outline:none}
+.gmsg{margin:8px 0;white-space:pre-wrap;word-break:break-all}
+.gmsg.user{text-align:right}
+.gmsg.user .gtxt{background:#151d29;border:1px solid var(--line);border-radius:8px;padding:6px 10px;display:inline-block;text-align:left;max-width:80%;color:var(--fg)}
+.gname{font-size:11.5px;margin-right:6px}
+.hl{color:#e0b070;background:rgba(224,176,112,.12);border-radius:3px;padding:0 2px}
+.gsum{margin:10px 0;border:1px dashed var(--line);border-radius:8px;padding:8px 12px;color:var(--dim)}
+.gsum .gsumh{text-align:center;color:var(--fg);font-size:11px;letter-spacing:2px}
+.gsum .gsumb{white-space:pre-wrap;word-break:break-all;margin-top:4px}
 /* skills */
 .skill{padding:5px 4px;border-bottom:1px solid var(--line)}
 .skill .nm{cursor:pointer}
@@ -215,6 +244,13 @@ textarea[readonly]{color:var(--dim)}
     <div class="panel on" id="p-sessions">
       <button id="btn-new">[+ 新会话]</button>
       <div id="sesslist"></div>
+      <button id="btn-newgroup">[+ 群聊]</button>
+      <div id="group-form" style="display:none">
+        <input type="text" id="gf-title" placeholder="群标题" spellcheck="false">
+        <div id="gf-members"></div>
+        <div class="prow"><button id="gf-create">建群</button><button id="gf-cancel">取消</button></div>
+        <div class="hint">自动包含 main（你）；成员为 active 分身</div>
+      </div>
     </div>
     <div class="panel" id="p-tools">
       <div class="tgroup">内置</div><div id="tools-builtin"></div>
@@ -280,10 +316,24 @@ textarea[readonly]{color:var(--dim)}
     <span id="sandbox">SANDBOX: —</span>
   </div>
   <div id="flowwrap">
+    <div id="groupbar"></div>
     <div id="flow"></div>
     <div id="scrollhint">↓ 新消息</div>
   </div>
   <div id="inputbar">
+    <div id="gctl">
+      <button data-gact="discuss">全员讨论</button>
+      <button data-gact="delegate">委任lead…</button>
+      <button data-gact="pause">暂停</button>
+      <button data-gact="stop">叫停</button>
+      <button data-gact="summary">小结</button>
+      <button data-gact="revoke">收权</button>
+    </div>
+    <div id="gdeleg">
+      <input type="text" id="gd-topic" placeholder="委任主题" spellcheck="false">
+      <select id="gd-lead"></select>
+      <button id="gd-send">委任</button><button id="gd-cancel">取消</button>
+    </div>
     <div id="steertag">⌁ steer — 输入即转向当前任务</div>
     <textarea id="input" rows="1" placeholder="输入消息，Enter 发送 / Shift+Enter 换行 / 拖拽文件上传" spellcheck="false"></textarea>
   </div>
@@ -325,7 +375,8 @@ const $=s=>document.querySelector(s);
 const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 /* 单一 store */
 const store={model:"",running:false,sessions:[],tools:[],sandbox:null,current:null,
-  usage:{input:0,output:0},tab:"sessions",agents:[],currentAgent:"main"};
+  usage:{input:0,output:0},tab:"sessions",agents:[],currentAgent:"main",
+  groupView:null,groups:{}};
 /* 模型价格表（镜像 r2-core models.rs，元/百万token：[key,in,out]） */
 const PRICES=[["glm-5.2-air",.8,2],["glm-5.2-flash",.5,2],["glm-5.2",8,8],["glm-5.1",7,21.9],
 ["kimi-k2.7-code",5.1,25.2],["kimi-for-coding",8,24],["kimi-k3",20,100],
@@ -386,19 +437,32 @@ function relTime(ts){
   if(d<60)return"刚刚";if(d<3600)return Math.floor(d/60)+"分钟前";
   if(d<86400)return Math.floor(d/3600)+"小时前";return Math.floor(d/86400)+"天前";
 }
+const gUnread=new Set();
+function gStateBadge(st){return '<span class="gsb gsb-'+esc(st)+'">'+esc(st)+'</span>'}
 function renderSessions(){
   const box=$("#sesslist");box.innerHTML="";
   if(!store.sessions.length){box.innerHTML='<div class="empty">暂无会话</div>';return}
   for(const s of store.sessions){
+    if(s.kind==="group"){
+      const d=document.createElement("div");
+      d.className="sess group"+(s.id===store.groupView?" cur":"");
+      d.innerHTML='<div class="t1"><span class="gmark">⊞</span> '+esc(String(s.title||s.id).slice(0,20))
+        +(gUnread.has(s.id)?'<span class="udot">●</span>':"")+"</div>"
+        +'<div class="t2">'+(s.members_count||0)+" 人"+gStateBadge(s.state||"idle")+" · "+relTime(s.last_ts)+"</div>";
+      d.onclick=()=>{if(s.id===store.groupView)return;openGroup(s.id);};
+      box.appendChild(d);
+      continue;
+    }
     const d=document.createElement("div");
-    d.className="sess"+(s.branch_from?" fork":"")+(s.id===store.current?" cur":"");
+    d.className="sess"+(s.branch_from?" fork":"")+((s.id===store.current&&!store.groupView)?" cur":"");
     const title=(s.preview||"(空会话)").slice(0,20);
     d.innerHTML='<div class="t1">'+(s.branch_from?'<span class="forktag">↳ fork </span>':"")+esc(title)+"</div>"+
       '<div class="t2">'+s.message_count+" 条 · "+relTime(s.last_ts)+"</div>"+
       '<span class="ops"><button data-fork="'+esc(s.id)+'">fork</button>'+
       '<button class="del" data-del="'+esc(s.id)+'">×</button></span>';
     d.onclick=()=>{
-      if(s.id===store.current)return;
+      if(s.id===store.current&&!store.groupView)return;
+      exitGroupView();
       wsSend({t:"switch",id:s.id});
       store.current=s.id;clearFlow("已切换到会话 "+s.id);renderSessions();
     };
@@ -410,7 +474,7 @@ function renderSessions(){
     box.appendChild(d);
   }
 }
-$("#btn-new").onclick=()=>{wsSend({t:"new_session"});clearFlow("新会话");store.current=null;renderSessions();};
+$("#btn-new").onclick=()=>{exitGroupView();wsSend({t:"new_session"});clearFlow("新会话");store.current=null;renderSessions();};
 /* ---------- tools ---------- */
 function renderTools(){
   const bi=$("#tools-builtin"),mc=$("#tools-mcp");bi.innerHTML="";mc.innerHTML="";
@@ -654,6 +718,225 @@ async function loadGrowth(){
     box.innerHTML=h;
   }catch(e){box.innerHTML='<div class="empty">加载失败（后端不可达）</div>'}
 }
+/* ---------- 群聊 ---------- */
+const GSYM=["⬡","◆","▲","■","●","◇"];
+const GCLR=["#9ece9e","#7ab8d0","#e0b070","#c792ea","#e08080","#8a8a8a"];
+const subCards={};
+function memberStyle(g,name){
+  const ms=(g&&g.members)||[];
+  let i=ms.findIndex(m=>m.name===name);
+  if(i<0)i=0;
+  const m=ms[i]||{};
+  return{sym:GSYM[i%GSYM.length],clr:GCLR[i%GCLR.length],disp:m.display_name||m.name||name};
+}
+/* 建群表单 */
+$("#btn-newgroup").onclick=()=>{
+  const f=$("#group-form");
+  const show=f.style.display==="none";
+  f.style.display=show?"block":"none";
+  if(show){
+    const box=$("#gf-members");box.innerHTML="";
+    const acts=(store.agents||[]).filter(a=>a.state==="active");
+    if(!acts.length){box.innerHTML='<div class="empty">暂无 active 分身（先到「分身」页召唤）</div>';return}
+    for(const a of acts){
+      const lb=document.createElement("label");
+      lb.className="gfmem";
+      const cb=document.createElement("input");
+      cb.type="checkbox";cb.value=a.name;cb.dataset.disp=a.display_name||a.name;
+      lb.appendChild(cb);
+      lb.appendChild(document.createTextNode(" "+(a.display_name||a.name)+" ("+a.name+")"));
+      box.appendChild(lb);
+    }
+  }
+};
+$("#gf-create").onclick=()=>{
+  const title=$("#gf-title").value.trim();
+  if(!title){toast("填群标题");return}
+  const members=[];
+  document.querySelectorAll("#gf-members input:checked").forEach(cb=>{
+    members.push({name:cb.value,display_name:cb.dataset.disp});
+  });
+  if(!members.length){toast("至少选 1 个分身");return}
+  wsSend({t:"group_create",title:title,members:members});
+  $("#gf-title").value="";
+  $("#group-form").style.display="none";
+};
+$("#gf-cancel").onclick=()=>{$("#group-form").style.display="none"};
+/* 群视图进出 */
+function openGroup(id){
+  store.groupView=id;
+  gUnread.delete(id);
+  wsSend({t:"group_open",id:id});
+  renderSessions();
+}
+function exitGroupView(){
+  if(!store.groupView)return;
+  store.groupView=null;
+  $("#groupbar").style.display="none";
+  $("#gctl").style.display="none";
+  $("#gdeleg").style.display="none";
+}
+function onGroupOpen(j){
+  const id=j.id;if(!id)return;
+  store.groupView=id;
+  store.groups[id]=j.group||{};
+  gUnread.delete(id);
+  for(const k in subCards)delete subCards[k];
+  renderGroupBar(store.groups[id]);
+  clearFlow();
+  for(const ev of (j.events||[]))appendGroupEvent(ev);
+  renderGroupCtl();
+  renderSessions();
+  scrollBottom();
+}
+function renderGroupBar(g){
+  const bar=$("#groupbar");
+  if(!store.groupView){bar.style.display="none";return}
+  let h='<span class="gtitle">⊞ '+esc(g.title||store.groupView)+'</span>';
+  for(const m of (g.members||[])){
+    const st=memberStyle(g,m.name);
+    const isUser=m.name==="main"||m.role==="owner";
+    h+='<span class="gchip" style="color:'+st.clr+'">'+st.sym+" "+esc(m.display_name||m.name)
+      +(isUser?" 👤":"")+(m.role==="lead"?" ★":"")+'</span>';
+  }
+  h+=gStateBadge(g.state||"idle");
+  const s=g.settings||{};
+  h+='<span class="dim">轮 '+(g.round||0)+'/'+(s.max_rounds||0)+' · '
+    +fmtTok(g.used_tokens||0)+'/'+fmtTok(s.budget_tokens||0)+' tok</span>';
+  bar.innerHTML=h;
+  bar.style.display="flex";
+}
+function renderGroupCtl(){
+  const gid=store.groupView,ctl=$("#gctl");
+  if(!gid){ctl.style.display="none";$("#gdeleg").style.display="none";return}
+  const g=store.groups[gid]||{},st=g.state||"idle";
+  const hasLead=!!(g.task&&g.task.lead);
+  ctl.style.display="flex";
+  ctl.querySelector('[data-gact="discuss"]').style.display=st==="idle"?"":"none";
+  ctl.querySelector('[data-gact="delegate"]').style.display=st==="idle"?"":"none";
+  ctl.querySelector('[data-gact="pause"]').style.display=st==="discussing"?"":"none";
+  ctl.querySelector('[data-gact="stop"]').style.display=st==="discussing"?"":"none";
+  ctl.querySelector('[data-gact="summary"]').style.display=st==="discussing"?"":"none";
+  ctl.querySelector('[data-gact="revoke"]').style.display=hasLead?"":"none";
+}
+$("#gctl").addEventListener("click",e=>{
+  const b=e.target.closest("button[data-gact]");
+  if(!b)return;
+  const gid=store.groupView;if(!gid)return;
+  const act=b.dataset.gact;
+  if(act==="discuss"){
+    const topic=input.value.trim();
+    if(!topic){toast("先在输入框写讨论主题");return}
+    wsSend({t:"group_discuss",id:gid,topic:topic});
+    input.value="";autoHeight();
+  }else if(act==="delegate"){
+    const g=store.groups[gid]||{},sel=$("#gd-lead");
+    sel.innerHTML="";
+    for(const m of (g.members||[])){
+      if(m.name==="main"||m.role==="owner")continue;
+      const o=document.createElement("option");
+      o.value=m.name;o.textContent=m.display_name||m.name;
+      sel.appendChild(o);
+    }
+    if(!sel.options.length){toast("没有可委任的分身成员");return}
+    $("#gdeleg").style.display="flex";
+  }else if(act==="pause"){wsSend({t:"group_pause",id:gid})}
+  else if(act==="stop"){wsSend({t:"group_stop",id:gid})}
+  else if(act==="summary"){wsSend({t:"group_summary",id:gid})}
+  else if(act==="revoke"){wsSend({t:"group_revoke_lead",id:gid})}
+});
+$("#gd-send").onclick=()=>{
+  const gid=store.groupView;if(!gid)return;
+  const topic=$("#gd-topic").value.trim(),lead=$("#gd-lead").value;
+  if(!topic){toast("填委任主题");return}
+  if(!lead){toast("选 lead");return}
+  wsSend({t:"group_delegate",id:gid,topic:topic,lead:lead});
+  $("#gd-topic").value="";
+  $("#gdeleg").style.display="none";
+};
+$("#gd-cancel").onclick=()=>{$("#gdeleg").style.display="none"};
+/* 群事件渲染 */
+function gmsgRender(ev,mention){
+  const g=store.groups[store.groupView]||{};
+  const from=ev.from||"?";
+  let txt=esc(ev.text||"");
+  if(mention&&ev.mentions){
+    for(const m of ev.mentions){
+      txt=txt.split("@"+m).join('<span class="hl">@'+esc(m)+"</span>");
+    }
+  }
+  if(from==="user"){
+    addLine("gmsg user",'<span class="gtxt">👤 '+txt+"</span>");
+  }else{
+    const st=memberStyle(g,from);
+    addLine("gmsg",'<span class="gname" style="color:'+st.clr+'">'+st.sym+" "+esc(st.disp)+"</span>"+txt);
+  }
+}
+function renderSubtask(ev){
+  const gid=store.groupView;
+  const g=store.groups[gid]||{};
+  const key=ev.to||"?";
+  const st=memberStyle(g,key);
+  if(ev.state!=="pending"){
+    const exist=subCards[key];
+    if(exist){
+      exist.dataset.state=ev.state;
+      exist.querySelector(".tname").textContent="✓done · 子任务 → "+st.disp;
+      const b=exist.querySelector(".tbtns");if(b)b.remove();
+    }else{
+      const d=document.createElement("div");
+      d.className="taskcard subtask";d.dataset.state=ev.state;
+      d.innerHTML='<div class="tname">✓done · 子任务 → '+esc(st.disp)+'</div>'
+        +'<div class="tprompt">'+esc(ev.prompt||"")+'</div>';
+      flow.appendChild(d);scrollBottom();
+    }
+    return;
+  }
+  const d=document.createElement("div");
+  d.className="taskcard subtask";d.dataset.state="pending";
+  d.innerHTML='<div class="tname">⏳ lead 派单 → '+esc(st.disp)+'</div>'
+    +'<div class="tmeta">'+esc(ev.from||"")+'</div>'
+    +'<div class="tprompt">'+esc(ev.prompt||"")+'</div>'
+    +'<div class="tbtns"><button class="ok">✅ 批准</button></div>';
+  d.querySelector(".ok").onclick=e=>{
+    wsSend({t:"group_subtask_approve",id:gid,to:ev.to});
+    e.target.disabled=true;
+  };
+  subCards[key]=d;
+  flow.appendChild(d);scrollBottom();
+}
+function appendGroupEvent(ev){
+  if(!ev||!ev.type)return;
+  switch(ev.type){
+    case"message":gmsgRender(ev,false);break;
+    case"mention":gmsgRender(ev,true);break;
+    case"summary":{
+      const d=document.createElement("div");d.className="gsum";
+      d.innerHTML='<div class="gsumh">── 总结 ──</div><div class="gsumb">'+esc(ev.text||"")+'</div>';
+      flow.appendChild(d);scrollBottom();
+      break;
+    }
+    case"state_change":addLine("msg-note","⦿ "+esc(ev.from_state||"?")+" → "+esc(ev.to_state||"?"));break;
+    case"error":addLine("msg-note","✗ "+esc(ev.text||""));break;
+    case"subtask":renderSubtask(ev);break;
+    default:break;
+  }
+}
+function onGroupEvent(j){
+  const id=j.id,ev=j.event;
+  if(!id||!ev)return;
+  if(id===store.groupView){appendGroupEvent(ev)}
+  else{gUnread.add(id);renderSessions()}
+}
+function onGroupState(j){
+  const id=j.id;if(!id)return;
+  store.groups[id]=j.group||store.groups[id]||{};
+  const g=store.groups[id];
+  const se=(store.sessions||[]).find(s=>s.id===id);
+  if(se){se.state=g.state;se.round=g.round;se.used_tokens=g.used_tokens;se.members_count=(g.members||[]).length}
+  renderSessions();
+  if(id===store.groupView){renderGroupBar(g);renderGroupCtl()}
+}
 /* ---------- 消息流 ---------- */
 const flow=$("#flow");
 let aiCur=null,toolCur=null,paused=false;
@@ -860,6 +1143,12 @@ function connect(){
       case"task_pending":renderTaskCard(j.task);break;
       case"tasks":store.tasks=j.tasks||[];renderTaskBadge();if(store.tab==="growth")loadGrowth();break;
       case"task_state":toast(j.state==="active"?"✅ 任务已批准生效":"任务状态已更新");break;
+      case"group_created":
+        if(j.id){store.groups[j.id]=j.group||{};toast("群已创建");openGroup(j.id)}
+        break;
+      case"group_open":onGroupOpen(j);break;
+      case"group_event":onGroupEvent(j);break;
+      case"group_state":onGroupState(j);break;
       case"error":toast(j.message||"错误");addLine("msg-err","✗ "+esc(j.message||""));break;
     }
   };
@@ -898,7 +1187,9 @@ function insertAtCursor(text){
 function sendInput(){
   const text=input.value.trim();
   if(!text)return;
-  if(store.running){
+  if(store.groupView){
+    wsSend({t:"group_prompt",id:store.groupView,text:text});
+  }else if(store.running){
     wsSend({t:"steer",text});
   }else{
     addUser(text);
