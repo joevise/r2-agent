@@ -79,6 +79,24 @@ textarea[readonly]{color:var(--dim)}
 .gtask .st.pending{color:#e0b070;border-color:#6a5535}
 .gtask .st.paused{color:var(--dim)}
 .gtask .gres{color:var(--dim);font-size:11.5px;margin-top:3px;border-top:1px dashed var(--line);padding-top:3px}
+/* agents */
+#agent-sel{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);padding:2px 6px;max-width:150px;outline:none}
+#agent-sel:hover{border-color:var(--white)}
+.agentrow{padding:5px 6px;border-left:2px solid transparent;cursor:pointer}
+.agentrow:hover{background:#111111}
+.agentrow.cur{border-left-color:var(--white);color:var(--white)}
+.agentrow.rej{color:var(--dim)}
+.agentrow .t1{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.agentrow .t2{font-size:11px;color:var(--dim)}
+.abadge{font-size:10.5px;border:1px solid var(--line);border-radius:10px;padding:0 6px;margin-left:4px}
+.abadge.active{color:var(--ok);border-color:var(--line)}
+.abadge.pending{color:var(--fg)}
+.abadge.rejected{color:var(--dim)}
+#p-agent input{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);padding:4px 6px;width:100%;outline:none}
+#p-agent input:focus{border-color:var(--dim)}
+#p-agent input[readonly]{color:var(--dim)}
+.agfield{margin-top:6px}
+.agfield .dim{font-size:11px}
 /* growth */
 .gcard{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:10px}
 .ggoal{font-size:13px;line-height:1.6}
@@ -190,6 +208,7 @@ textarea[readonly]{color:var(--dim)}
     <button data-p="prompt">PROMPT</button>
     <button data-p="skill">SKILL</button>
     <button data-p="growth">GROWTH</button>
+    <button data-p="agent">AGENT</button>
   </div>
   <div id="panels">
     <div class="panel on" id="p-sessions">
@@ -226,6 +245,20 @@ textarea[readonly]{color:var(--dim)}
       </details>
       <div class="hint">SOUL.md / AGENTS.md 保存后新会话生效</div>
     </div>
+    <div class="panel" id="p-agent">
+      <div id="agent-pending"></div>
+      <div class="tgroup">分身清单</div>
+      <div id="agentlist"></div>
+      <div id="agent-editor" style="display:none">
+        <div class="tgroup">配置 <span class="dim" id="ag-note"></span></div>
+        <div class="hint">SOUL.md</div>
+        <textarea id="ag-soul" spellcheck="false" style="min-height:180px;font-size:12px"></textarea>
+        <div class="agfield"><span class="dim">display_name</span><input id="ag-display" spellcheck="false"></div>
+        <div class="agfield"><span class="dim">description</span><input id="ag-desc" spellcheck="false"></div>
+        <div class="agfield"><span class="dim">model</span><input id="ag-model" spellcheck="false"></div>
+        <div class="prow"><button id="ag-save">保存</button><span class="dim" id="ag-status"></span></div>
+      </div>
+    </div>
     <div class="panel" id="p-skill">
       <div id="skilllist"></div>
       <details id="skill-preview"><summary>预览</summary><div class="body"><pre id="skill-pre-text"></pre></div></details>
@@ -237,6 +270,7 @@ textarea[readonly]{color:var(--dim)}
     <button id="burger" aria-label="菜单">≡</button>
     <span id="brand">R2 <span id="rundot">●</span></span>
     <span id="model" title="点击输入模型名，如 glm-5.2 / kimi-k3">—</span>
+    <select id="agent-sel" title="切换 Agent 分身"></select>
   <span id="taskbadge" title="定时任务状态，点击查看" style="display:none;cursor:pointer;font-size:12px"></span>
     <span class="sp"></span>
     <span id="offline">[连接断开，重连中…]</span>
@@ -289,7 +323,7 @@ const $=s=>document.querySelector(s);
 const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 /* 单一 store */
 const store={model:"",running:false,sessions:[],tools:[],sandbox:null,current:null,
-  usage:{input:0,output:0},tab:"sessions"};
+  usage:{input:0,output:0},tab:"sessions",agents:[],currentAgent:"main"};
 /* 模型价格表（镜像 r2-core models.rs，元/百万token：[key,in,out]） */
 const PRICES=[["glm-5.2-air",.8,2],["glm-5.2-flash",.5,2],["glm-5.2",8,8],["glm-5.1",7,21.9],
 ["kimi-k2.7-code",5.1,25.2],["kimi-for-coding",8,24],["kimi-k3",20,100],
@@ -341,6 +375,7 @@ document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{
   if(store.tab==="prompt")loadPromptFiles();
   if(store.tab==="skill")loadSkills();
   if(store.tab==="growth")loadGrowth();
+  if(store.tab==="agent")loadAgentFiles();
 });
 /* ---------- sessions ---------- */
 function relTime(ts){
@@ -403,8 +438,91 @@ function applyState(st){
   $("#pf-core").value=(st.prompt_sections&&st.prompt_sections.core)||"";
   $("#pf-skills").value=(st.prompt_sections&&st.prompt_sections.skills)||"（~/.r2/skills 为空）";
   renderSessions();renderTools();renderSandbox();renderUsage();
+  store.agents=st.agents||[];store.currentAgent=st.current_agent||"main";
+  renderAgentSel();renderAgentList();
   setRunning(!!st.running);
 }
+/* ---------- agents ---------- */
+let agentSel="main";
+function renderAgentSel(){
+  const sel=$("#agent-sel");
+  const opts=[{name:"main",display_name:"main"}].concat((store.agents||[]).filter(a=>a.state==="active"));
+  sel.innerHTML="";
+  for(const a of opts){
+    const o=document.createElement("option");
+    o.value=a.name;o.textContent=a.display_name||a.name;
+    sel.appendChild(o);
+  }
+  const cur=store.currentAgent||"main";
+  sel.value=opts.some(a=>a.name===cur)?cur:"main";
+}
+$("#agent-sel").onchange=()=>{
+  const n=$("#agent-sel").value;
+  if(n&&n!==store.currentAgent)wsSend({t:"agent_switch",name:n});
+};
+function renderAgentList(){
+  const pend=$("#agent-pending"),list=$("#agentlist");
+  pend.innerHTML="";list.innerHTML="";
+  const agents=store.agents||[];
+  for(const a of agents.filter(x=>x.state==="pending")){
+    const d=document.createElement("div");d.className="taskcard";
+    d.innerHTML='<div class="tname">⏳ 召唤待批准：'+esc(a.display_name||a.name)+'</div>'
+      +'<div class="tmeta">'+esc(a.name)+' · '+esc(a.model||"默认模型")+'</div>'
+      +(a.description?'<div class="tprompt">'+esc(a.description)+'</div>':"")
+      +'<div class="tbtns"><button class="ok" data-ok="'+esc(a.name)+'">批准生效 ✅</button>'
+      +'<button class="no" data-no="'+esc(a.name)+'">拒绝 ❌</button></div>';
+    pend.appendChild(d);
+  }
+  const rows=[{name:"main",display_name:"main",state:"active",description:"主 Agent"}].concat(agents);
+  for(const a of rows){
+    const d=document.createElement("div");
+    d.className="agentrow"+(a.state==="rejected"?" rej":"")+(a.name===agentSel?" cur":"");
+    const badge=a.name==="main"?'<span class="abadge active">main</span>'
+      :'<span class="abadge '+esc(a.state)+'">'+esc(a.state)+'</span>';
+    d.innerHTML='<div class="t1">'+esc(a.display_name||a.name)+badge+'</div>'
+      +'<div class="t2">'+esc(a.name)+(a.model?" · "+esc(a.model):"")+(a.description?" · "+esc(a.description):"")+'</div>';
+    d.onclick=()=>{agentSel=a.name;renderAgentList();loadAgentFiles();};
+    list.appendChild(d);
+  }
+}
+$("#agent-pending").addEventListener("click",e=>{
+  const ok=e.target.closest("[data-ok]"),no=e.target.closest("[data-no]");
+  if(ok){wsSend({t:"agent_approve",name:ok.dataset.ok});ok.disabled=true}
+  else if(no){wsSend({t:"agent_reject",name:no.dataset.no});no.disabled=true}
+});
+async function loadAgentFiles(){
+  const name=agentSel,ed=$("#agent-editor");
+  ed.style.display="block";
+  $("#ag-status").textContent="加载中…";
+  try{
+    const r=await fetch("/api/agent-files?name="+encodeURIComponent(name));
+    const j=await r.json();
+    if(!r.ok){$("#ag-status").textContent=j.error||"加载失败";return}
+    const p=j.profile||{},isMain=name==="main";
+    $("#ag-soul").value=j.soul||"";
+    $("#ag-display").value=isMain?"main":(p.display_name||"");
+    $("#ag-desc").value=p.description||"";
+    $("#ag-model").value=p.model||"";
+    $("#ag-note").textContent=isMain?"· 主 Agent，仅可改 SOUL":"· "+name;
+    $("#ag-display").readOnly=isMain;$("#ag-desc").readOnly=isMain;$("#ag-model").readOnly=isMain;
+    $("#ag-status").textContent="";
+  }catch(e){$("#ag-status").textContent="加载失败"}
+}
+$("#ag-save").onclick=async()=>{
+  const name=agentSel,body={name,soul:$("#ag-soul").value};
+  if(name!=="main"){
+    body.display_name=$("#ag-display").value;
+    body.description=$("#ag-desc").value;
+    body.model=$("#ag-model").value;
+  }
+  try{
+    const r=await fetch("/api/agent-files",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    const j=await r.json().catch(()=>({}));
+    if(r.ok){toast("已保存");$("#ag-status").textContent="已保存"}
+    else{const m=j.error||"保存失败";$("#ag-status").textContent=m;toast(m)}
+  }catch(e){toast("保存失败："+e.message)}
+};
 async function loadPromptFiles(){
   for(const name of["soul","agents"]){
     try{
