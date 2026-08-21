@@ -189,11 +189,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let reg = make_registry(tmp.path());
         let schemas = reg.schemas();
-        assert_eq!(schemas.len(), 5);
+        // v0.8.0 加 task 工具：6 个（read/write/edit/bash/mcp_admin/task）
+        assert_eq!(schemas.len(), 6);
         let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"read"));
         assert!(names.contains(&"write"));
         assert!(names.contains(&"edit"));
+        assert!(names.contains(&"bash"));
+        assert!(names.contains(&"task"));
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"mcp"));
         for s in &schemas {

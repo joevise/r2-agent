@@ -177,7 +177,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_pends_not_activates() {
-        // 隔离 HOME
+        // 隔离 HOME（持全仓共享锁防并行踩踏）
+        let _guard = crate::testutil::HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
         let tool = TaskTool::new();

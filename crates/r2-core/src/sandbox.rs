@@ -499,12 +499,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_off_keeps_env() {
-        std::env::set_var("R2_TEST_SECRET", "leak");
+        // 与 test_container_cleans_env 用不同变量名：彻底避免进程级环境变量的并行竞态
+        std::env::set_var("R2_TEST_SECRET_KEEP", "leak");
         let sbx = Sandbox::from_config(&cfg_with("off")).unwrap();
-        let out = run_sandboxed(&sbx, "env").await;
-        std::env::remove_var("R2_TEST_SECRET");
+        let out = run_sandboxed(&sbx, "env | grep R2_TEST").await;
+        std::env::remove_var("R2_TEST_SECRET_KEEP");
         let text = String::from_utf8_lossy(&out.stdout);
-        assert!(text.contains("R2_TEST_SECRET=leak"), "off 级别应保留环境：{text}");
+        assert!(
+            text.contains("R2_TEST_SECRET_KEEP=leak"),
+            "off 级别应保留环境：{text}"
+        );
     }
 
     #[tokio::test]

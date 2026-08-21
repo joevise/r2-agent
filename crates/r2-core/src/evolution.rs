@@ -186,8 +186,10 @@ mod tests {
 
     #[test]
     fn test_evolution_event_roundtrip() {
+        // 改 HOME 的测试必须持全仓共享锁（防并行踩踏）
+        let _guard = crate::testutil::HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", tmp.path()); // 测试隔离（单线程场景）
+        std::env::set_var("HOME", tmp.path()); // 测试隔离
         let ev = EvolutionEvent {
             ts: 1787000000,
             kind: "lesson".into(),

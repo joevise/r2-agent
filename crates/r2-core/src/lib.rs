@@ -30,6 +30,7 @@
 //! - `sandbox-strict`：启用 strict 级 seccomp 沙箱（系统需安装 libseccomp-dev）
 
 pub mod agent;
+pub mod agents;
 pub mod config;
 pub mod context;
 mod events;
@@ -52,3 +53,10 @@ pub use agent::Agent;
 pub use config::Config;
 pub use events::AgentEvent;
 pub use session_api::AgentSession;
+
+#[cfg(test)]
+pub(crate) mod testutil {
+    /// 全仓测试共享的 HOME 互斥锁：HOME 是进程级全局，
+    /// 凡改 HOME 的测试（agents/evolution/task_tool）必须串行，防并行踩踏
+    pub(crate) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}

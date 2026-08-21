@@ -76,32 +76,46 @@ pub fn build_system_prompt(config: &Config) -> (String, PromptSections) {
 }
 
 
-/// 扫描 ~/.r2/skills/*/SKILL.md → 技能清单文本（system prompt 注入用）。
+/// 扫描技能目录 → 技能清单文本（system prompt 注入用）。
+/// 双层归属（v0.9）：~/.r2/skills 全员共享 + {persona}/skills 个人私有（同名私有优先）。
 /// 每个技能一行：名字 + frontmatter description（无则正文首行）。
-fn scan_skills_layer(home: &str) -> Option<String> {
-    let dir = format!("{home}/.r2/skills");
-    let entries = std::fs::read_dir(&dir).ok()?;
-    let mut lines = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path().join("SKILL.md");
-        let Ok(content) = std::fs::read_to_string(&path) else {
+fn scan_skills_layer(home: &str, persona_dir: Option<&str>) -> Option<String> {
+    let mut dirs = Vec::new();
+    if let Some(p) = persona_dir {
+        dirs.push(format!("{p}/skills")); // 私有在前：同名时先入表
+    }
+    dirs.push(format!("{home}/.r2/skills"));
+    // 收集（先到的同名胜出）
+    let mut lines: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        let name = entry.file_name().to_string_lossy().to_string();
-        let desc = skill_frontmatter_desc(&content);
-        lines.push(format!("- {name}：{desc}"));
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(entry.path().join("SKILL.md")) else {
+                continue;
+            };
+            let desc = skill_frontmatter_desc(&content);
+            lines.push(format!("- {name}：{desc}"));
+        }
     }
     if lines.is_empty() {
         return None;
     }
     Some(format!(
-        "以下技能已安装（目录 ~/.r2/skills）。任务匹配时主动使用：\n\
+        "以下技能已安装（共享目录 ~/.r2/skills）。任务匹配时主动使用：\n\
          先 bash 执行 cat ~/.r2/skills/<名字>/SKILL.md 阅读完整流程，再遵循执行。\n\
          安装新技能：写到 ~/.r2/skills/<名字>/SKILL.md（frontmatter 带 name/description）。\n\
          {}",
         lines.join("\n")
     ))
 }
+
 
 /// 提取 SKILL.md 描述：frontmatter description 优先，回退正文首条非空行
 fn skill_frontmatter_desc(content: &str) -> String {
@@ -150,7 +164,8 @@ fn build_system_prompt_with_home(config: &Config, home: &str) -> (String, Prompt
     // 技能层：动态扫描 ~/.r2/skills（装了自动可见，删了自动消失，零维护）。
     // 放最前且不受 custom 覆盖——能力感知必须始终可见，
     // 否则 agent 装了 skill 也不知道去哪找（实测病灶：去翻 ~/.claude/skills）。
-    let skills = scan_skills_layer(home);
+    let persona_dir = config.agent.persona_dir.as_deref().map(|p| expand_with_home(p, home));
+    let skills = scan_skills_layer(home, persona_dir.as_deref());
     if let Some(ref s) = skills {
         full.push_str("\n\n[已安装技能]\n");
         full.push_str(s);
@@ -179,8 +194,15 @@ fn build_system_prompt_with_home(config: &Config, home: &str) -> (String, Prompt
         return (full, sections);
     }
 
-    if let Some(soul) = read_layer(&expand_with_home("~/.r2/SOUL.md", home)) {
-        full.push_str("\n\n[SOUL.md 全局人格]\n");
+    // SOUL 层（v0.9）：分身优先自己的 {persona}/SOUL.md（标题随之说明归属），
+    // 无个人 SOUL 时回退全局人格——诚实降级，不静默吞掉人格。
+    let soul_path = persona_dir
+        .as_ref()
+        .map(|p| format!("{p}/SOUL.md"))
+        .unwrap_or_else(|| expand_with_home("~/.r2/SOUL.md", home));
+    let soul_title = if persona_dir.is_some() { "[SOUL.md 分身人格]" } else { "[SOUL.md 全局人格]" };
+    if let Some(soul) = read_layer(&soul_path) {
+        full.push_str(&format!("\n\n{soul_title}\n"));
         full.push_str(&soul);
         sections.soul = Some(soul);
     }
@@ -1268,7 +1290,9 @@ mod tests {
         assert!(!full.contains("[SOUL.md"));
         assert!(!full.contains("[AGENTS.md"));
         assert!(!full.contains("[自定义配置]"));
-        assert_eq!(full, sections.core);
+        // v0.7.2 起内核恒附[成长系统]段（fixture 无技能目录）：core 是前缀而非全部
+        assert!(full.starts_with(sections.core.as_str()), "内核段必须是前缀");
+        assert!(full.contains("[成长系统]"));
         assert!(sections.soul.is_none() && sections.agents.is_none() && sections.custom.is_none());
     }
 
@@ -1331,7 +1355,8 @@ mod tests {
         let agents = sections.agents.expect("应有 AGENTS 段");
         assert!(agents.len() <= MAX_LAYER_BYTES + 64, "截断后超长：{}", agents.len());
         assert!(agents.ends_with("已截断）"));
-        assert!(full.len() < sections.core.len() + MAX_LAYER_BYTES + 128);
+        // 成长系统段（~400B）恒定附加于 core 之后：边界放宽到 +1024 覆盖恒定段
+        assert!(full.len() < sections.core.len() + MAX_LAYER_BYTES + 1024);
     }
 
     #[test]

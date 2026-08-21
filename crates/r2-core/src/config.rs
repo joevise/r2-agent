@@ -88,6 +88,9 @@ pub struct AgentConfig {
     /// 自定义 system prompt：非空时显式覆盖 SOUL.md / AGENTS.md 两层（默认空）
     #[serde(default)]
     pub system_prompt: String,
+    /// 分身档案目录（v0.9：Some = agent 分身，SOUL/私有技能从该目录读；None = 主 agent）
+    #[serde(default)]
+    pub persona_dir: Option<String>,
 }
 
 /// 上下文管理配置
@@ -294,6 +297,7 @@ impl Default for AgentConfig {
             max_total_tokens: default_max_total_tokens(),
             work_dir: default_work_dir(),
             system_prompt: String::new(),
+            persona_dir: None,
         }
     }
 }
