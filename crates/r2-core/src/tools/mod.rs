@@ -4,6 +4,7 @@ mod bash;
 mod edit;
 mod mcp_admin;
 mod read;
+mod summon;
 mod task_tool;
 mod write;
 
@@ -52,6 +53,7 @@ impl ToolRegistry {
                 )),
                 Box::new(mcp_admin::McpAdminTool::new(config_path)),
                 Box::new(task_tool::TaskTool::new()),
+                Box::new(summon::SummonTool::new()),
             ],
         })
     }
@@ -189,8 +191,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let reg = make_registry(tmp.path());
         let schemas = reg.schemas();
-        // v0.8.0 加 task 工具：6 个（read/write/edit/bash/mcp_admin/task）
-        assert_eq!(schemas.len(), 6);
+        // v0.9.0 加 summon 工具：7 个（read/write/edit/bash/mcp_admin/task/summon）
+        assert_eq!(schemas.len(), 7);
         let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"read"));
         assert!(names.contains(&"write"));
@@ -199,6 +201,7 @@ mod tests {
         assert!(names.contains(&"task"));
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"mcp"));
+        assert!(names.contains(&"summon"));
         for s in &schemas {
             assert!(s.parameters["type"] == "object");
         }

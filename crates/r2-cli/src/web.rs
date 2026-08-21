@@ -14,6 +14,7 @@ use axum::{
 };
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
+use r2_core::agents::{self, MAIN};
 use r2_core::config::{self, Config};
 use r2_core::session::{self, SessionSummary};
 use r2_core::tools::ToolRegistry;
@@ -45,11 +46,57 @@ struct WebState {
     work_dir: String,
     /// 工具清单快照（启动时与 Agent 同源构造一次，含 MCP；避免每次请求重连 MCP server）
     tools: Vec<Value>,
+    /// 当前选中的 agent（"main" = 主 agent；其余为 ~/.r2/agents/<name> 分身）
+    current_agent: StdMutex<String>,
 }
 
-/// 当前生效配置副本
+/// 当前 agent 名
+fn current_agent_name(state: &WebState) -> String {
+    state.current_agent.lock().expect("agent 锁中毒").clone()
+}
+
+/// 当前 agent 的会话目录：main = 启动时的 session_dir；分身 = {profile_dir}/sessions
+fn session_dir_for(state: &WebState) -> String {
+    let name = current_agent_name(state);
+    if name == MAIN {
+        state.session_dir.clone()
+    } else {
+        agents::profile_dir(&name)
+            .join("sessions")
+            .to_string_lossy()
+            .to_string()
+    }
+}
+
+/// 分身配置叠加：persona_dir/work_dir/session 目录指向分身目录，模型按档案覆盖。
+/// main 不改动（纯函数，便于测试；目录不存在则顺带创建）。
+fn apply_persona(name: &str, cfg: &mut Config) {
+    if name == MAIN {
+        return;
+    }
+    let dir = agents::profile_dir(name);
+    let sessions = dir.join("sessions");
+    let work = dir.join("work");
+    let _ = std::fs::create_dir_all(&sessions);
+    let _ = std::fs::create_dir_all(&work);
+    cfg.agent.persona_dir = Some(dir.to_string_lossy().to_string());
+    cfg.agent.work_dir = work.to_string_lossy().to_string();
+    cfg.session.dir = sessions.to_string_lossy().to_string();
+    if let Some(p) = agents::load_profile(name) {
+        if !p.model.is_empty() {
+            match cfg.model.provider.as_str() {
+                "anthropic" => cfg.model.anthropic.model = p.model.clone(),
+                _ => cfg.model.openai_compat.model = p.model.clone(),
+            }
+        }
+    }
+}
+
+/// 当前生效配置副本（含当前 agent 的分身叠加）
 fn config_snapshot(state: &WebState) -> Config {
-    state.config.lock().expect("config 锁中毒").clone()
+    let mut cfg = state.config.lock().expect("config 锁中毒").clone();
+    apply_persona(&current_agent_name(state), &mut cfg);
+    cfg
 }
 
 /// 新会话专用配置快照：从源文件刷新 mcp 段（agent 可用 mcp 工具装 server，
@@ -84,11 +131,18 @@ fn broadcast_error(state: &WebState, message: &str) {
 
 /// 广播会话列表刷新
 fn broadcast_sessions(state: &WebState) {
-    let list = session::list_sessions(&state.session_dir).unwrap_or_default();
+    let list = session::list_sessions(&session_dir_for(state)).unwrap_or_default();
     let _ = state.event_tx.send(json!({
         "t": "sessions",
         "list": list.iter().map(summary_json).collect::<Vec<_>>(),
     }));
+}
+
+/// 广播完整状态快照（agent 审批/拒绝后推给全部客户端）
+fn broadcast_state(state: &WebState) {
+    let mut v = state_json(state);
+    v["t"] = json!("state");
+    let _ = state.event_tx.send(v);
 }
 
 /// 安装新会话：接事件转发 + 缓存 steer 端 + 放入槽位
@@ -163,7 +217,7 @@ fn session_history_json(s: &AgentSession) -> Value {
 
 fn state_json(state: &WebState) -> Value {
     let cfg = config_snapshot(state);
-    let sessions = session::list_sessions(&state.session_dir).unwrap_or_default();
+    let sessions = session::list_sessions(&session_dir_for(state)).unwrap_or_default();
     // prompt 运行期间 agent 锁被持有：try_lock 失败即 running
     let (running, current) = match state.agent.try_lock() {
         Ok(g) => (
@@ -180,6 +234,8 @@ fn state_json(state: &WebState) -> Value {
     };
     json!({
         "model": cfg.current_model(),
+        "agents": agents::list_profiles().iter().map(agents::profile_json).collect::<Vec<_>>(),
+        "current_agent": current_agent_name(state),
         "tasks": r2_core::tasks::load_store().tasks,
         "history": history,
         "current_session": current,
@@ -526,6 +582,80 @@ async fn api_state(State(state): State<Arc<WebState>>) -> Json<Value> {
     Json(state_json(&state))
 }
 
+/// main agent 的固定档案视图（无 AGENT.toml，~/.r2 根即档案）
+fn main_profile_json() -> Value {
+    json!({
+        "name": MAIN,
+        "display_name": "R2 主Agent",
+        "model": "",
+        "state": "active",
+        "description": "主 Agent（~/.r2 根，无分身目录）",
+        "created_ts": 0,
+    })
+}
+
+/// GET /api/agent-files?name=xxx：读 agent 的 SOUL 全文 + 档案（配置页用）
+async fn get_agent_files(
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let name = q.get("name").map(String::as_str).unwrap_or("");
+    if name == MAIN {
+        let soul = std::fs::read_to_string(config::expand_tilde("~/.r2/SOUL.md")).unwrap_or_default();
+        return Ok(Json(json!({"soul": soul, "profile": main_profile_json()})));
+    }
+    let Some(p) = agents::load_profile(name) else {
+        return Err((StatusCode::BAD_REQUEST, format!("agent 不存在：{name}")));
+    };
+    let soul = std::fs::read_to_string(agents::profile_dir(name).join("SOUL.md")).unwrap_or_default();
+    Ok(Json(json!({"soul": soul, "profile": agents::profile_json(&p)})))
+}
+
+/// POST /api/agent-files（JSON: name/soul/display_name/description/model）：
+/// 写回 {profile_dir}/SOUL.md 与 AGENT.toml 对应字段；main 只允许改 soul
+async fn post_agent_files(Json(body): Json<Value>) -> Result<Json<Value>, (StatusCode, String)> {
+    let name = body.get("name").and_then(|x| x.as_str()).unwrap_or("");
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "缺少字符串字段 name".to_string()));
+    }
+    let opt = |k: &str| body.get(k).and_then(|x| x.as_str());
+    if name == MAIN {
+        if let Some(soul) = opt("soul") {
+            let path = PathBuf::from(config::expand_tilde("~/.r2/SOUL.md"));
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(&path, soul)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("写入失败：{e}")))?;
+        }
+        return Ok(Json(json!({"ok": true, "profile": main_profile_json()})));
+    }
+    if !agents::valid_name(name) {
+        return Err((StatusCode::BAD_REQUEST, format!("非法档案名：{name}")));
+    }
+    let dir = agents::profile_dir(name);
+    if !dir.exists() {
+        return Err((StatusCode::BAD_REQUEST, format!("agent 目录不存在：{name}")));
+    }
+    if let Some(soul) = opt("soul") {
+        std::fs::write(dir.join("SOUL.md"), soul)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("写入失败：{e}")))?;
+    }
+    let Some(mut p) = agents::load_profile(name) else {
+        return Err((StatusCode::BAD_REQUEST, format!("agent 档案损坏：{name}")));
+    };
+    if let Some(v) = opt("display_name") {
+        p.display_name = v.to_string();
+    }
+    if let Some(v) = opt("description") {
+        p.description = v.to_string();
+    }
+    if let Some(v) = opt("model") {
+        p.model = v.to_string();
+    }
+    agents::save_profile(&p).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(json!({"ok": true, "profile": agents::profile_json(&p)})))
+}
+
 // ---------- WebSocket ----------
 
 type WsSink = Arc<Mutex<SplitSink<WebSocket, WsMessage>>>;
@@ -544,6 +674,9 @@ enum ClientMsg {
     TaskPause(String),
     TaskResume(String),
     TaskDelete(String),
+    AgentApprove(String),
+    AgentReject(String),
+    AgentSwitch(String),
 }
 
 /// 取字符串字段的辅助
@@ -582,6 +715,9 @@ fn parse_client_msg(text: &str) -> Result<ClientMsg, String> {
     "task_pause" => Ok(ClientMsg::TaskPause(get_str(&v, "id")?.to_string())),
     "task_resume" => Ok(ClientMsg::TaskResume(get_str(&v, "id")?.to_string())),
     "task_delete" => Ok(ClientMsg::TaskDelete(get_str(&v, "id")?.to_string())),
+    "agent_approve" => Ok(ClientMsg::AgentApprove(get_str(&v, "name")?.to_string())),
+    "agent_reject" => Ok(ClientMsg::AgentReject(get_str(&v, "name")?.to_string())),
+    "agent_switch" => Ok(ClientMsg::AgentSwitch(get_str(&v, "name")?.to_string())),
         "set_model" => Ok(ClientMsg::SetModel(get_str(&v, "model")?.to_string())),
         other => Err(format!("未知消息类型：{other}")),
     }
@@ -762,7 +898,7 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
                 ws_error(sink, "当前会话使用中，禁止删除").await;
                 return;
             }
-            let path = Path::new(&state.session_dir).join(format!("{id}.jsonl"));
+            let path = Path::new(&session_dir_for(state)).join(format!("{id}.jsonl"));
             match std::fs::remove_file(&path) {
                 Ok(()) => broadcast_sessions(state),
                 Err(e) => ws_error(sink, &format!("删除失败：{e}")).await,
@@ -828,6 +964,51 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
                 }
                 Err(e) => { ws_error(sink, &format!("删除失败：{e}")).await; }
             }
+        }
+        ClientMsg::AgentApprove(name) => {
+            // 签字权：pending→active 唯一通道（与 task 审批同款信任模型）
+            match agents::approve(&name) {
+                Ok(_) => broadcast_state(state),
+                Err(e) => ws_error(sink, &format!("批准 agent 失败：{e}")).await,
+            }
+        }
+        ClientMsg::AgentReject(name) => {
+            match agents::reject(&name) {
+                Ok(()) => broadcast_state(state),
+                Err(e) => ws_error(sink, &format!("拒绝 agent 失败：{e}")).await,
+            }
+        }
+        ClientMsg::AgentSwitch(name) => {
+            // 校验：main 直接放行；分身必须存在且已批准（active）
+            if name != MAIN {
+                match agents::load_profile(&name) {
+                    Some(p) if p.state == "active" => {}
+                    Some(p) => {
+                        ws_error(sink, &format!("agent {} 当前状态 {}，不可切换", p.name, p.state)).await;
+                        return;
+                    }
+                    None => {
+                        ws_error(sink, &format!("agent 不存在：{name}")).await;
+                        return;
+                    }
+                }
+            }
+            // 旧 agent 的会话不带过去：清槽位（prompt 在途则拒切，防历史串台）
+            let mut guard = match state.agent.try_lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    ws_error(sink, "prompt 运行中，稍后再切换 agent").await;
+                    return;
+                }
+            };
+            *state.current_agent.lock().expect("agent 锁中毒") = name.clone();
+            *state.steer_tx.lock().expect("steer 锁中毒") = None;
+            *guard = None;
+            drop(guard);
+            // 广播全新 init（state_json 已含新 agent 的会话列表 + agents + current_agent）
+            let mut init = state_json(state);
+            init["t"] = json!("init");
+            let _ = state.event_tx.send(init);
         }
         ClientMsg::SetModel(model) => {
             {
@@ -984,6 +1165,7 @@ pub async fn run(config: Config, port: u16, host: String) -> Result<(), Box<dyn 
         session_dir,
         work_dir,
         tools,
+        current_agent: StdMutex::new(MAIN.to_string()),
     });
 
     // 调度器先克隆再建路由（with_state 会 move state）
@@ -996,6 +1178,7 @@ pub async fn run(config: Config, port: u16, host: String) -> Result<(), Box<dyn 
         .route("/api/growth", get(api_growth))
         .route("/skill_preview", get(skill_preview))
         .route("/api/state", get(api_state))
+        .route("/api/agent-files", get(get_agent_files).post(post_agent_files))
         .route("/ws", get(ws_handler))
         // 请求体上限：upload 10MB + 1MB 表单余量（其余路由 body 都很小，一并覆盖）
         .layer(DefaultBodyLimit::max(MAX_UPLOAD + 1024 * 1024))
@@ -1097,6 +1280,106 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_agent_msgs() {
+        match parse_client_msg(r#"{"t":"agent_approve","name":"cfo"}"#).unwrap() {
+            ClientMsg::AgentApprove(n) => assert_eq!(n, "cfo"),
+            _ => panic!("应为 AgentApprove"),
+        }
+        match parse_client_msg(r#"{"t":"agent_reject","name":"bob"}"#).unwrap() {
+            ClientMsg::AgentReject(n) => assert_eq!(n, "bob"),
+            _ => panic!("应为 AgentReject"),
+        }
+        match parse_client_msg(r#"{"t":"agent_switch","name":"main"}"#).unwrap() {
+            ClientMsg::AgentSwitch(n) => assert_eq!(n, "main"),
+            _ => panic!("应为 AgentSwitch"),
+        }
+        // 缺 name 字段 → 报错
+        assert!(parse_client_msg(r#"{"t":"agent_approve"}"#).is_err());
+        assert!(parse_client_msg(r#"{"t":"agent_reject"}"#).is_err());
+        assert!(parse_client_msg(r#"{"t":"agent_switch"}"#).is_err());
+    }
+
+    /// HOME 是进程级全局：改 HOME 的测试必须串行（r2-core 的 testutil 锁不导出，本 crate 自持一把）
+    static HOME_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[test]
+    fn test_persona_config_overlay() {
+        let _g = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let old_home = std::env::var("HOME").unwrap_or_default();
+        std::env::set_var("HOME", tmp.path());
+
+        agents::draft_profile("cfo", "CFO 参谋", "glm-x", "管钱", "soul").unwrap();
+        agents::approve("cfo").unwrap();
+
+        // 分身叠加：persona_dir / work_dir / session.dir / 模型覆盖（openai_compat 分支）
+        let mut cfg = Config::default_config();
+        cfg.model.provider = "openai_compat".into();
+        cfg.model.openai_compat.model = "base-model".into();
+        apply_persona("cfo", &mut cfg);
+        let dir = agents::profile_dir("cfo");
+        assert_eq!(cfg.agent.persona_dir.as_deref(), Some(dir.to_string_lossy().as_ref()));
+        assert_eq!(cfg.agent.work_dir, dir.join("work").to_string_lossy());
+        assert_eq!(cfg.session.dir, dir.join("sessions").to_string_lossy());
+        assert_eq!(cfg.model.openai_compat.model, "glm-x");
+        // sessions/work 目录被顺带创建
+        assert!(dir.join("sessions").is_dir());
+        assert!(dir.join("work").is_dir());
+
+        // anthropic 分支模型覆盖
+        let mut cfg = Config::default_config();
+        cfg.model.provider = "anthropic".into();
+        cfg.model.anthropic.model = "claude-base".into();
+        apply_persona("cfo", &mut cfg);
+        assert_eq!(cfg.model.anthropic.model, "glm-x");
+
+        // 档案 model 为空 → 不覆盖
+        agents::draft_profile("plain", "Plain", "", "", "").unwrap();
+        agents::approve("plain").unwrap();
+        let mut cfg = Config::default_config();
+        cfg.model.openai_compat.model = "keep-me".into();
+        apply_persona("plain", &mut cfg);
+        assert_eq!(cfg.model.openai_compat.model, "keep-me");
+
+        // main：完全不改动
+        let mut cfg = Config::default_config();
+        cfg.model.openai_compat.model = "keep-me".into();
+        apply_persona(MAIN, &mut cfg);
+        assert!(cfg.agent.persona_dir.is_none());
+        assert_eq!(cfg.model.openai_compat.model, "keep-me");
+
+        std::env::set_var("HOME", old_home);
+    }
+
+    #[test]
+    fn test_session_dir_for_switching() {
+        let _g = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let old_home = std::env::var("HOME").unwrap_or_default();
+        std::env::set_var("HOME", tmp.path());
+
+        let (event_tx, _) = broadcast::channel(EVENT_CAPACITY);
+        let state = WebState {
+            tools: vec![],
+            config: StdMutex::new(Config::default_config()),
+            agent: Mutex::new(None),
+            steer_tx: StdMutex::new(None),
+            event_tx,
+            session_dir: "/main/sessions".to_string(),
+            work_dir: "/main/work".to_string(),
+            current_agent: StdMutex::new(MAIN.to_string()),
+        };
+        assert_eq!(session_dir_for(&state), "/main/sessions");
+        *state.current_agent.lock().unwrap() = "cfo".to_string();
+        assert_eq!(
+            session_dir_for(&state),
+            agents::profile_dir("cfo").join("sessions").to_string_lossy()
+        );
+
+        std::env::set_var("HOME", old_home);
+    }
+
+    #[test]
     fn test_valid_name() {
         assert!(valid_name("abc-123_def.skill"));
         assert!(!valid_name(""));
@@ -1122,9 +1405,12 @@ mod tests {
             event_tx,
             session_dir,
             work_dir: tmp.path().to_string_lossy().to_string(),
+            current_agent: StdMutex::new(MAIN.to_string()),
         };
         let v = state_json(&state);
         assert!(v["model"].is_string());
+        assert!(v["agents"].is_array());
+        assert_eq!(v["current_agent"], MAIN);
         assert!(v["sessions"].is_array());
         assert_eq!(v["tools"][0]["name"], "read");
         assert_eq!(v["tools"][0]["mcp"], false);
