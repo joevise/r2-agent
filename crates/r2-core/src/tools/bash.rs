@@ -59,6 +59,13 @@ const DANGEROUS_PATTERNS: &[&str] = &[
     "cd /;",          // 逃逸到根目录后执行（分号变体）
     ">/etc/",         // 覆写系统配置
     "~/.",            // 访问 home 隐藏文件（密钥/配置）
+    // ── 信号类广播杀伤（2026-08-21 桌面连坐死亡调查后补）──
+    "kill -9 -1",     // 广播杀本用户全部进程（连坐死亡签名）
+    "kill -KILL -1",  // 同上变体（寗误拦罕见组杀，不放过广播杀）
+    "kill -- -1",     // 默认信号广播全体（SIGTERM everyone）
+    "killall",        // 按名批量杀，范围不可控
+    "pkill -u",       // 按 UID 批量杀
+    "loginctl terminate", // terminate/terminate-user：整会话/整用户连坐清扫
 ];
 
 /// 启发式检测命令是否命中高危模式，返回命中的模式
@@ -67,6 +74,36 @@ fn find_dangerous_pattern(command: &str) -> Option<&'static str> {
         .iter()
         .find(|p| command.contains(**p))
         .copied()
+}
+
+/// 读 /proc/<pid>/stat，返回 (pgrp, starttime)。
+/// comm 可含空格与括号，必须从最后一个 ')' 之后解析。
+fn proc_stat_pgrp_starttime(pid: u32) -> Option<(u32, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.rsplit_once(')')?.1;
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    // ')' 后字段：state(0) ppid(1) pgrp(2) ... starttime(19)（对应 man proc_pid_stat 的 5/22 号字段）
+    let pgrp = f.get(2)?.parse().ok()?;
+    let starttime = f.get(19)?.parse().ok()?;
+    Some((pgrp, starttime))
+}
+
+/// 子进程的 /proc starttime（出生时钟滴答；PID 复用后必变，是身份验证黄金判据）
+fn proc_stat_starttime(pid: u32) -> Option<u64> {
+    proc_stat_pgrp_starttime(pid).map(|(_, t)| t)
+}
+
+/// 组杀前置验证：pid 仍是我们当初 spawn 的那个进程组头——
+/// 组号没漂移（pgrp==pid）且出生时间没变（starttime 一致）。
+/// 任一不满足即拒绝组杀：宁可漏杀后代，绝不误杀无辜进程组。
+/// （2026-08-21 桌面连坐死亡加固：PID 复用竞态下 kill -KILL -<旧pid>
+/// 可能命中被复用的进程组，撞上会话组即全灭。遗留窄窗口：kill_on_drop
+/// 对单个已回收 pid 的直接补杀仍在，但爆炸半径从“整组”降到“单进程”。）
+fn is_still_our_group_leader(pid: u32, born: Option<u64>) -> bool {
+    match (proc_stat_pgrp_starttime(pid), born) {
+        (Some((pgrp, starttime)), Some(b)) => pgrp == pid && starttime == b,
+        _ => false,
+    }
 }
 
 /// 一次执行的结果：进程输出 + 沙箱降级告警
@@ -148,6 +185,8 @@ impl BashTool {
             Err(e) => return Err(format!("ERROR: 启动进程失败：{e}")),
         };
         let pid = child.id();
+        // v0.8.3 加固：记录子进程出生时间戳（/proc starttime），供超时组杀前做身份验证
+        let born = pid.and_then(proc_stat_starttime);
         // cgroup v2 pids 硬限：spawn 后立即把子进程挂入 r2 组（后代继承组）。
         // 失败仅告警降级，不影响执行
         // ns 路径不重复挂组：孙进程在 pre_exec 双 fork 中诞生（早于本处），
@@ -179,11 +218,18 @@ impl BashTool {
             Ok(Ok(output)) => Ok(RunOutcome { output, warn }),
             Ok(Err(e)) => Err(format!("ERROR: 命令执行失败：{e}")),
             Err(_) => {
-                // 超时：kill 整个进程组（负 pid = 进程组）
+                // 超时：kill 整个进程组（负 pid = 进程组）。
+                // v0.8.3 加固①：组杀前先验证 pid 仍是我们 spawn 的组头（pgrp+starttime 双重验证）。
+                // v0.8.3 加固②（真凶修复）：改用进程内 libc::kill 直发，绝不用外部 /usr/bin/kill。
+                // 本机 procps-ng 4.0.4 的 kill 把多位负 pid 截断成首位数字（strace+audit 双重实锤：
+                // -1452340 → kill(-1)），本机 pid 全部 1 开头 → 每次组杀都变成 kill(-1) 广播
+                // 团灭整个桌面会话（2026-08-21 六次连坐死亡的根因）。
                 if let Some(pid) = pid {
-                    let _ = std::process::Command::new("kill")
-                        .args(["-KILL", &format!("-{pid}")])
-                        .status();
+                    if is_still_our_group_leader(pid, born) {
+                        unsafe {
+                            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                        }
+                    }
                 }
                 Err(format!("ERROR: 命令超时({timeout_secs}s)被终止"))
             }
@@ -406,6 +452,12 @@ mod tests {
             "cd /; ls",
             "echo hacked >/etc/passwd",
             "cat ~/.ssh/id_rsa",
+            "kill -9 -1",
+            "kill -KILL -1",
+            "kill -- -1",
+            "killall -9 firefox",
+            "pkill -u elttilz",
+            "loginctl terminate-user elttilz",
         ];
         for cmd in cases {
             assert!(
@@ -427,6 +479,8 @@ mod tests {
             "mkdir -p ./out && cd out",
             "cargo build --release",
             "chmod +x ./run.sh",
+            "kill 1234",
+            "pkill -x r2",
         ];
         for cmd in safe {
             assert!(
@@ -481,5 +535,49 @@ mod tests {
             .execute(&serde_json::json!({"command": {"cmd": "ls"}}))
             .await;
         assert!(result.starts_with("ERROR: 缺少 command"), "got: {result}");
+    }
+
+    /// v0.8.3 组杀加固：/proc stat 解析 + 身份验证
+    #[test]
+    fn test_proc_stat_starttime_stable() {
+        let me = std::process::id();
+        let t1 = proc_stat_starttime(me).expect("解析自身 stat");
+        let t2 = proc_stat_starttime(me).expect("二次解析");
+        assert_eq!(t1, t2, "同进程 starttime 应稳定");
+    }
+
+    #[test]
+    fn test_group_leader_verification_rejects() {
+        // 不存在的 pid → 拒绝组杀
+        assert!(!is_still_our_group_leader(u32::MAX, Some(1)));
+        // born 缺失（spawn 后瞬间退出读不到）→ 拒绝
+        assert!(!is_still_our_group_leader(1, None));
+    }
+
+    /// 真实子进程验证：设了 process_group(0) 的是组长应通过；
+    /// 未设的是组员（pgrp 继承自本进程）必须拒绝
+    #[test]
+    fn test_group_leader_verification_real_child() {
+        use std::os::unix::process::CommandExt;
+        let mut leader = std::process::Command::new("sleep");
+        leader.arg("2").process_group(0).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = leader.spawn().unwrap();
+        let pid = child.id();
+        let born = proc_stat_starttime(pid);
+        assert!(born.is_some(), "刚 spawn 的子进程 stat 应可读");
+        assert!(is_still_our_group_leader(pid, born), "刚出生的组长应通过验证");
+
+        let mut follower = std::process::Command::new("sleep");
+        follower.arg("2").stdout(Stdio::null()).stderr(Stdio::null());
+        let mut fchild = follower.spawn().unwrap();
+        let fpid = fchild.id();
+        let fborn = proc_stat_starttime(fpid);
+        assert!(fborn.is_some());
+        assert!(!is_still_our_group_leader(fpid, fborn), "非组长必须拒绝组杀");
+
+        let _ = child.kill();
+        let _ = fchild.kill();
+        let _ = child.wait();
+        let _ = fchild.wait();
     }
 }
