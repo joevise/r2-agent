@@ -39,6 +39,7 @@ pub mod mcp;
 pub mod memory;
 pub mod model;
 pub mod evolution;
+pub mod groups;
 pub mod models;
 pub mod namespaces;
 pub mod rpc;
