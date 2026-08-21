@@ -28,7 +28,7 @@ pre{font:inherit;white-space:pre-wrap;word-break:break-all}
 /* ---- 左栏 ---- */
 #side{border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
 #tabs{display:flex;border-bottom:1px solid var(--line)}
-#tabs button{flex:1;border:none;border-right:1px solid var(--line);padding:8px 0;color:var(--dim);font-size:11px;letter-spacing:1px}
+#tabs button{flex:1;border:none;border-right:1px solid var(--line);padding:8px 0;color:var(--dim);font-size:11px;letter-spacing:2px;white-space:nowrap}
 #tabs button:last-child{border-right:none}
 #tabs button.on{color:var(--white);border-bottom:1px solid var(--white)}
 #panels{flex:1;overflow-y:auto;min-height:0}
@@ -80,8 +80,9 @@ textarea[readonly]{color:var(--dim)}
 .gtask .st.paused{color:var(--dim)}
 .gtask .gres{color:var(--dim);font-size:11.5px;margin-top:3px;border-top:1px dashed var(--line);padding-top:3px}
 /* agents */
-#agent-sel{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);padding:2px 6px;max-width:150px;outline:none}
-#agent-sel:hover{border-color:var(--white)}
+#agent-badge{cursor:pointer;color:var(--dim);border:1px solid var(--line);padding:2px 8px;font-size:12px;white-space:nowrap}
+#agent-badge:hover{color:var(--white);border-color:var(--white)}
+#agent-badge::before{content:"⬡ "}
 .agentrow{padding:5px 6px;border-left:2px solid transparent;cursor:pointer}
 .agentrow:hover{background:#111111}
 .agentrow.cur{border-left-color:var(--white);color:var(--white)}
@@ -203,12 +204,12 @@ textarea[readonly]{color:var(--dim)}
 <body>
 <div id="side">
   <div id="tabs">
-    <button data-p="sessions" class="on">SESSIONS</button>
-    <button data-p="tools">TOOLS</button>
-    <button data-p="prompt">PROMPT</button>
-    <button data-p="skill">SKILL</button>
-    <button data-p="growth">GROWTH</button>
-    <button data-p="agent">AGENT</button>
+    <button data-p="sessions" class="on">会话</button>
+    <button data-p="tools">工具</button>
+    <button data-p="prompt">提示</button>
+    <button data-p="skill">技能</button>
+    <button data-p="growth">成长</button>
+    <button data-p="agent">分身</button>
   </div>
   <div id="panels">
     <div class="panel on" id="p-sessions">
@@ -270,7 +271,7 @@ textarea[readonly]{color:var(--dim)}
     <button id="burger" aria-label="菜单">≡</button>
     <span id="brand">R2 <span id="rundot">●</span></span>
     <span id="model" title="点击输入模型名，如 glm-5.2 / kimi-k3">—</span>
-    <select id="agent-sel" title="切换 Agent 分身"></select>
+    <span id="agent-badge" title="点击切换 Agent 分身">main</span>
   <span id="taskbadge" title="定时任务状态，点击查看" style="display:none;cursor:pointer;font-size:12px"></span>
     <span class="sp"></span>
     <span id="offline">[连接断开，重连中…]</span>
@@ -445,20 +446,31 @@ function applyState(st){
 /* ---------- agents ---------- */
 let agentSel="main";
 function renderAgentSel(){
-  const sel=$("#agent-sel");
-  const opts=[{name:"main",display_name:"main"}].concat((store.agents||[]).filter(a=>a.state==="active"));
-  sel.innerHTML="";
-  for(const a of opts){
-    const o=document.createElement("option");
-    o.value=a.name;o.textContent=a.display_name||a.name;
-    sel.appendChild(o);
-  }
+  const badge=$("#agent-badge");
+  if(!badge)return;
   const cur=store.currentAgent||"main";
-  sel.value=opts.some(a=>a.name===cur)?cur:"main";
+  const me=(store.agents||[]).find(a=>a.name===cur);
+  badge.textContent=me?(me.display_name||me.name):cur;
 }
-$("#agent-sel").onchange=()=>{
-  const n=$("#agent-sel").value;
-  if(n&&n!==store.currentAgent)wsSend({t:"agent_switch",name:n});
+$("#agent-badge").onclick=()=>{
+  let m=document.getElementById("agent-menu");
+  if(m){m.remove();return;}
+  m=document.createElement("div");
+  m.id="agent-menu";
+  m.style.cssText="position:fixed;top:38px;left:60px;z-index:99;border:1px solid var(--line);background:var(--bg);min-width:150px;padding:4px 0;box-shadow:0 4px 14px rgba(0,0,0,.5)";
+  const opts=[{name:"main",display_name:"main（主Agent）"}].concat((store.agents||[]).filter(a=>a.state==="active"));
+  const cur=store.currentAgent||"main";
+  for(const a of opts){
+    const it=document.createElement("div");
+    it.style.cssText="padding:6px 14px;cursor:pointer;font-size:12.5px;color:"+(a.name===cur?"var(--white)":"var(--fg)");
+    it.textContent=(a.display_name||a.name)+(a.name===cur?" ✓":"");
+    it.onmouseenter=()=>it.style.background="#1a2332";
+    it.onmouseleave=()=>it.style.background="transparent";
+    it.onclick=()=>{m.remove();if(a.name!==cur)wsSend({t:"agent_switch",name:a.name});};
+    m.appendChild(it);
+  }
+  document.body.appendChild(m);
+  setTimeout(()=>document.addEventListener("click",function ev(e){if(!m.contains(e.target)){m.remove();document.removeEventListener("click",ev);}}),0);
 };
 function renderAgentList(){
   const pend=$("#agent-pending"),list=$("#agentlist");
