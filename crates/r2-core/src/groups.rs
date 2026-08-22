@@ -342,6 +342,7 @@ pub fn state_allowed(from: &str, to: &str) -> bool {
             | ("discussing", "summarized")
             | ("paused", "discussing")
             | ("paused", "stopped")
+            | ("summarized", "discussing") // 重开继续聊（v0.9.1）
     )
 }
 

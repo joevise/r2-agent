@@ -796,10 +796,10 @@ function renderGroupBar(g){
   let h='<span class="gtitle">⊞ '+esc(g.title||store.groupView)+'</span>';
   for(const m of (g.members||[])){
     const st=memberStyle(g,m.name);
-    const isUser=m.name==="main"||m.role==="owner";
     h+='<span class="gchip" style="color:'+st.clr+'">'+st.sym+" "+esc(m.display_name||m.name)
-      +(isUser?" 👤":"")+(m.role==="lead"?" ★":"")+'</span>';
+      +(m.role==="lead"?" ★":"")+'</span>';
   }
+  h+='<span class="dim" style="margin-left:4px">👤 你（老板）</span>';
   h+=gStateBadge(g.state||"idle");
   const s=g.settings||{};
   h+='<span class="dim">轮 '+(g.round||0)+'/'+(s.max_rounds||0)+' · '
@@ -813,8 +813,8 @@ function renderGroupCtl(){
   const g=store.groups[gid]||{},st=g.state||"idle";
   const hasLead=!!(g.task&&g.task.lead);
   ctl.style.display="flex";
-  ctl.querySelector('[data-gact="discuss"]').style.display=st==="idle"?"":"none";
-  ctl.querySelector('[data-gact="delegate"]').style.display=st==="idle"?"":"none";
+  ctl.querySelector('[data-gact="discuss"]').style.display=(st==="idle"||st==="summarized")?"":"none";
+  ctl.querySelector('[data-gact="delegate"]').style.display=(st==="idle"||st==="summarized")?"":"none";
   ctl.querySelector('[data-gact="pause"]').style.display=st==="discussing"?"":"none";
   ctl.querySelector('[data-gact="stop"]').style.display=st==="discussing"?"":"none";
   ctl.querySelector('[data-gact="summary"]').style.display=st==="discussing"?"":"none";

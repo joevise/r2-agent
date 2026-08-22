@@ -1117,8 +1117,8 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
                 }
             };
             let g = groups::load_group(&dir).expect("resolve 已校验");
-            if g.state == "stopped" || g.state == "summarized" {
-                ws_error(sink, &format!("群已终态（{}），不能发言", g.state)).await;
+            if g.state == "stopped" {
+                ws_error(sink, "群已终止（stopped），不能发言").await;
                 return;
             }
             // 人发言/插话照常入流（discussing 中不打断当前发言者，下轮调度自然读到）
@@ -1143,8 +1143,8 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
                     }
                 }
             }
-            // idle/paused → discussing 并启动调度
-            if g.state == "idle" || g.state == "paused" {
+            // idle/paused/summarized（重开继续聊）→ discussing 并启动调度
+            if g.state == "idle" || g.state == "paused" || g.state == "summarized" {
                 match groups::set_state(&dir, "discussing") {
                     Ok(g2) => {
                         broadcast_last_event(state, &id, &dir);
@@ -1381,10 +1381,10 @@ fn do_group_create(
     if members.is_empty() {
         return Err("ERROR: 至少 1 个 agent 分身".into());
     }
-    let mut list: Vec<(&str, &str)> = vec![(MAIN, "主人")];
+    let mut list: Vec<(&str, &str)> = vec![(MAIN, "小JOE（主Agent）")];
     for (n, d) in members {
         if n == MAIN {
-            return Err("ERROR: main（人）由系统自动加入，无需指定".into());
+            return Err("ERROR: main（主Agent）由系统自动加入，无需指定".into());
         }
         if agents::load_profile(n).is_none() {
             return Err(format!("ERROR: agent 不存在：{n}"));
@@ -1483,12 +1483,8 @@ fn broadcast_last_event(state: &WebState, sid: &str, dir: &Path) {
 
 /// 文本里的 @成员名（只认群成员里的分身，人 main 不参与被点名）
 fn parse_mentions(text: &str, g: &groups::GroupConfig) -> Vec<String> {
-    let mut names: Vec<&str> = g
-        .members
-        .iter()
-        .map(|m| m.name.as_str())
-        .filter(|n| *n != MAIN)
-        .collect();
+    // main（主Agent）也是同事，可被 @ 点名；人=user 不在成员表，天然不可被点
+    let mut names: Vec<&str> = g.members.iter().map(|m| m.name.as_str()).collect();
     // 最长匹配优先，防前缀误伤（@cfo2 不被 @cfo 吃掉）
     names.sort_by(|a, b| b.len().cmp(&a.len()));
     let mut out: Vec<String> = Vec::new();
@@ -1750,18 +1746,14 @@ async fn run_group_turn(state: Arc<WebState>, sid: String, seq: u64) {
         if g.state != "discussing" {
             break;
         }
-        // 人（main）不自动发言：只经 group_prompt 插话
-        let name = match groups::next_speaker(&g, Some(MAIN)) {
+        // main（主Agent）也是群里的同事：与分身一起轮流发言（人=user 只经输入框插话）
+        let name = match groups::next_speaker(&g, None) {
             Some(n) => n,
             None => {
-                // 单分身群：speaking 占住唯一候选导致 None → 清 speaking 重取
-                let solo = g.members.iter().filter(|m| m.name != MAIN).count() == 1;
-                if !solo {
-                    break;
-                }
+                // speaking 占住唯一候选 → 清 speaking 重取一次
                 g.speaking = None;
                 let _ = groups::save_group(&dir, &g);
-                match groups::next_speaker(&g, Some(MAIN)) {
+                match groups::next_speaker(&g, None) {
                     Some(n) => n,
                     None => break,
                 }
@@ -1875,8 +1867,8 @@ async fn run_group_turn(state: Arc<WebState>, sid: String, seq: u64) {
             break;
         }
 
-        // 轮次推进：全员分身都发过言 = 一轮结束
-        let member_count = g.members.iter().filter(|m| m.name != MAIN).count();
+        // 轮次推进：全员（含 main 主Agent）都发过言 = 一轮结束
+        let member_count = g.members.len();
         round_speakers.insert(name.clone());
         if round_speakers.len() >= member_count {
             round_speakers.clear();
@@ -2602,9 +2594,9 @@ mod tests {
     #[test]
     fn test_parse_mentions_done_delegate() {
         let (_root, _sid, g) = make_test_group();
-        // @点名只认群成员里的分身；main 不可被点
+        // @点名认群成员（含 main 主Agent——他也是同事）；user 不在成员表天然不可被点
         assert_eq!(parse_mentions("请 @cfo 报个数", &g), vec!["cfo".to_string()]);
-        assert_eq!(parse_mentions("@main 你怎么看", &g), Vec::<String>::new());
+        assert_eq!(parse_mentions("@main 你怎么看", &g), vec!["main".to_string()]);
         assert_eq!(parse_mentions("@cfo 和 @cto 都对", &g), vec!["cfo".to_string(), "cto".to_string()]);
         assert_eq!(parse_mentions("没有点名", &g), Vec::<String>::new());
         assert_eq!(parse_mentions("@ghost 不存在", &g), Vec::<String>::new());
@@ -2664,11 +2656,13 @@ mod tests {
         assert_eq!(g.state, "discussing");
         let g = groups::set_state(&dir, "summarized").unwrap();
         assert_eq!(g.state, "summarized");
-        // 终态不可再迁
+        // summarized 可重开继续聊（v0.9.1）；stopped 才是真终态
+        assert!(groups::set_state(&dir, "discussing").is_ok());
+        groups::set_state(&dir, "stopped").unwrap();
         assert!(groups::set_state(&dir, "discussing").is_err());
         // StateChange 事件入流
         let events = groups::read_stream(&dir);
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 4);
         assert!(matches!(events[1], GroupEvent::StateChange { ref from_state, ref to_state, .. } if from_state == "discussing" && to_state == "summarized"));
     }
 
