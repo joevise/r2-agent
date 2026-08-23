@@ -91,6 +91,7 @@ pub fn event_json(event: &AgentEvent) -> Value {
         AgentEvent::UsageUpdate(u) => ("usage_update", json!({
             "input_tokens": u.input_tokens,
             "output_tokens": u.output_tokens,
+            "cached_tokens": u.cached_tokens,
             "llm_calls": u.llm_calls,
         })),
         AgentEvent::Error(message) => ("error", json!({"message": message})),

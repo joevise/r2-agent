@@ -400,7 +400,9 @@ function fmtTok(n){return n>=1e6?(n/1e6).toFixed(1)+"M":n>=1e3?(n/1e3).toFixed(1
 function renderUsage(){
   const u=store.usage,p=priceOf(store.model);
   const cost=p?p[1]*u.input/1e6+p[2]*u.output/1e6:null;
-  $("#usage").textContent=(cost===null?"¥--":"¥"+cost.toFixed(2))+" · "+fmtTok(u.input+u.output)+" tok";
+  // KV-cache 命中率（cached/input，服务端真实上报；无数据不显示）
+  const hit=(u.input>0&&u.cached>0)?" · ⚡"+Math.round(u.cached/u.input*100)+"%":"";
+  $("#usage").textContent=(cost===null?"¥--":"¥"+cost.toFixed(2))+" · "+fmtTok(u.input+u.output)+" tok"+hit;
 }
 function renderSandbox(){
   const s=store.sandbox,el=$("#sandbox");
@@ -1115,7 +1117,7 @@ function onEvent(evt){
     case"bg_started":addLine("msg-sys","🔄 后台任务「"+esc(j.name||"")+"」开始（"+esc(j.prompt_preview||"")+"…）");break;
     case"bg_done":addLine("msg-sys","✅ 后台任务「"+esc(j.name||"")+"」完成："+esc(j.result_preview||""));break;
     case"usage_update":
-      store.usage={input:d.input_tokens||0,output:d.output_tokens||0};renderUsage();break;
+      store.usage={input:d.input_tokens||0,output:d.output_tokens||0,cached:d.cached_tokens||0};renderUsage();break;
     case"done":thinkDone();endAI();setRunning(false);break;
     case"error":thinkDone();addLine("msg-err","✗ "+esc(d.message||""));endAI();setRunning(false);break;
   }
