@@ -231,9 +231,12 @@ fn state_json(state: &WebState) -> Value {
         Err(_) => (true, None),
     };
     let (_full, sections) = r2_core::agent::build_system_prompt(&cfg);
-    // 群会话条目与普通会话合并（kind:"group" 供前端区分渲染）
+    // 群会话条目与普通会话合并（kind:"group" 供前端区分渲染）+ 按最近活动混排（新→旧）
     let mut session_list: Vec<Value> = sessions.iter().map(summary_json).collect();
     session_list.extend(group_entries(&session_dir_for(state)));
+    session_list.sort_by_key(|v| {
+        std::cmp::Reverse(v.get("last_ts").and_then(|x| x.as_u64()).unwrap_or(0))
+    });
     // 当前会话的历史（浏览器刷新/重连时回放画面；prompt 运行中则跳过）
     let history = match state.agent.try_lock() {
         Ok(g) => g.as_ref().map(session_history_json),
@@ -1450,6 +1453,11 @@ fn sessions_with_groups(session_dir: &str) -> Vec<Value> {
         .map(summary_json)
         .collect();
     list.extend(group_entries(session_dir));
+    // 群与普通会话按最近活动混排（新→旧）：刚聊过的群排最前，
+    // 不再被埋在 256 个普通会话后面（8/23 大Joe 实测病灶：群在列表里消失）
+    list.sort_by_key(|v| {
+        std::cmp::Reverse(v.get("last_ts").and_then(|x| x.as_u64()).unwrap_or(0))
+    });
     list
 }
 
