@@ -1116,6 +1116,7 @@ function onEvent(evt){
     case"evolved":addLine("msg-sys","🌱 "+esc(d.text||""));break;
     case"bg_started":addLine("msg-sys","🔄 后台任务「"+esc(j.name||"")+"」开始（"+esc(j.prompt_preview||"")+"…）");break;
     case"bg_done":addLine("msg-sys","✅ 后台任务「"+esc(j.name||"")+"」完成："+esc(j.result_preview||""));break;
+    case"queued_prompt":addLine("msg-sys",esc(j.message||"⏳ 已排队，即将自动发送"));break;
     case"usage_update":
       store.usage={input:d.input_tokens||0,output:d.output_tokens||0,cached:d.cached_tokens||0};renderUsage();break;
     case"done":thinkDone();endAI();setRunning(false);break;

@@ -967,10 +967,21 @@ impl Agent {
         }
         // 反思钩子：Done 之后跑（用户已见到回复），教训落进化流
         let task_summary: String = user_input.chars().take(200).collect();
-        self.reflect_and_record(&task_summary).await;
+        // 收尾钩子 30s 上限：副业（进化）不得无限占用会话锁——
+        // 8/23 大Joe 实测：回复已显示，但钩子的 LLM 调用还在锁内跑，
+        // 此时发消息吃 "prompt in flight" 闭门羹
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.reflect_and_record(&task_summary),
+        )
+        .await;
         // 聚类检查（无条件）：种子教训可能来自历史会话，不能只靠"新教训落流"触发；
         // 幂等保护 = 同名技能已存在时 write_draft_skill 拒绝（E2E 实测发现的 gap）
-        self.maybe_draft_skill().await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.maybe_draft_skill(),
+        )
+        .await;
         // 成长变化记账：目标被设定/修改、技能被沉淀 → 事件流 + git 快照
         self.record_growth_changes().await;
         Ok(final_text)

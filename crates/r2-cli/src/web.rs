@@ -2,7 +2,7 @@
 //!
 //! 架构：浏览器 ↔ WS/HTTP ↔ 本模块 ↔ r2-core 库（同进程直调，不走子进程）。
 //! 多客户端共享单 Agent：AgentSession 全局一把锁，prompt 在途时整锁持有，
-//! 其余操作排队（try_lock 失败即 "prompt in flight"）；事件经 broadcast 扇出给所有 WS 客户端。
+//! 在途时新输入自动排队（收尾完成续发）；事件经 broadcast 扇出给所有 WS 客户端。
 
 use axum::{
     extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
@@ -39,6 +39,8 @@ struct WebState {
     agent: Mutex<Option<AgentSession>>,
     /// 当前会话的 steer 发送端缓存：prompt 持锁期间 steering 仍能直达（不经过 agent 锁）
     steer_tx: StdMutex<Option<mpsc::Sender<String>>>,
+    /// 排队的下一条 prompt（在途时新输入自动排队，收尾完成后续发；最多 1 条，新的覆盖旧的）
+    pending_prompt: StdMutex<Option<String>>,
     /// 事件广播：AgentEvent → JSON 扇出给全部 WS 客户端
     event_tx: broadcast::Sender<Value>,
     /// 会话 JSONL 目录（~ 已展开）
@@ -140,6 +142,60 @@ fn broadcast_sessions(state: &WebState) {
         "t": "sessions",
         "list": sessions_with_groups(&session_dir_for(state)),
     }));
+}
+
+/// 执行一条用户 prompt（Prompt 处理器主体；收尾后被排队输入复用）。
+/// 在途（锁被持有=上一轮还在收尾）→ 排队最多 1 条（新的覆盖旧的），收尾完自动续发。
+/// 8/23 修复：此前直接拒绝（"prompt in flight"），而 Done 后反思/技能钩子
+/// 仍在锁内跑 LLM，用户回复完发消息吃闭门羹。
+async fn run_prompt(st: Arc<WebState>, input: String) {
+    let mut guard = match st.agent.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            *st.pending_prompt.lock().expect("排队锁中毒") = Some(input);
+            let _ = st.event_tx.send(json!({"t": "event", "evt": {
+                "type": "queued_prompt",
+                "message": "⏳ 上一条回复还在收尾，本条已排队，完成后自动发送",
+            }}));
+            return;
+        }
+    };
+    if guard.is_none() {
+        let config = config_snapshot_fresh_mcp(&st);
+        match AgentSession::new(config) {
+            Ok(s) => install_session(&st, &mut guard, s),
+            Err(e) => {
+                broadcast_error(&st, &format!("创建会话失败：{e}"));
+                return;
+            }
+        }
+    }
+    let session = guard.as_mut().expect("刚确保过会话存在");
+    let result = session.prompt(&input).await;
+    let sid = session.session_id().map(String::from);
+    drop(guard);
+    match result {
+        Ok(text) => {
+            let _ = st.event_tx.send(
+                json!({"t": "prompt_done", "final_text": text, "session_id": sid}),
+            );
+        }
+        Err(e) => broadcast_error(&st, &e),
+    }
+    broadcast_sessions(&st);
+    // 收尾完成：取出排队输入自动发起下一轮。
+    // 若此刻锁已被并发的新 prompt 抢占 → 该输入会重新排队，自愈无重发。
+    // 注：不能直接 spawn(run_prompt(..)) —— 递归 async fn 的 Send 推不出来，
+    // 经 spawn_prompt 包装间接递归即可。
+    let queued = st.pending_prompt.lock().expect("排队锁中毒").take();
+    if let Some(next) = queued {
+        spawn_prompt(st.clone(), next);
+    }
+}
+
+/// run_prompt 的 spawn 包装（打破递归 async fn 的 Send 推断环）
+fn spawn_prompt(st: Arc<WebState>, input: String) {
+    tokio::spawn(run_prompt(st, input));
 }
 
 /// 广播完整状态快照（agent 审批/拒绝后推给全部客户端）
@@ -842,38 +898,9 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
     };
     match msg {
         ClientMsg::Prompt(input) => {
-            // prompt 不能阻塞 WS 循环（否则 steer 进不来）：spawn 独立任务
-            let st = state.clone();
-            tokio::spawn(async move {
-                // 锁被持有 = 已有 prompt 在途
-                let Ok(mut guard) = st.agent.try_lock() else {
-                    broadcast_error(&st, "prompt in flight");
-                    return;
-                };
-                if guard.is_none() {
-                    let config = config_snapshot_fresh_mcp(&st);
-                    match AgentSession::new(config) {
-                        Ok(s) => install_session(&st, &mut guard, s),
-                        Err(e) => {
-                            broadcast_error(&st, &format!("创建会话失败：{e}"));
-                            return;
-                        }
-                    }
-                }
-                let session = guard.as_mut().expect("刚确保过会话存在");
-                let result = session.prompt(&input).await;
-                let sid = session.session_id().map(String::from);
-                drop(guard);
-                match result {
-                    Ok(text) => {
-                        let _ = st.event_tx.send(
-                            json!({"t": "prompt_done", "final_text": text, "session_id": sid}),
-                        );
-                    }
-                    Err(e) => broadcast_error(&st, &e),
-                }
-                broadcast_sessions(&st);
-            });
+            // prompt 不能阻塞 WS 循环（否则 steer 进不来）：spawn 独立任务；
+            // 在途时新输入自动排队，收尾完成后续发（不再拒绝）
+            spawn_prompt(state.clone(), input);
         }
         ClientMsg::Steer(text) => {
             // 走缓存的 steer 端：prompt 持锁期间也能注入
@@ -2154,6 +2181,7 @@ pub async fn run(config: Config, port: u16, host: String) -> Result<(), Box<dyn 
         config: StdMutex::new(config),
         agent: Mutex::new(None),
         steer_tx: StdMutex::new(None),
+        pending_prompt: StdMutex::new(None),
         event_tx,
         session_dir,
         work_dir,
@@ -2359,6 +2387,7 @@ mod tests {
             config: StdMutex::new(Config::default_config()),
             agent: Mutex::new(None),
             steer_tx: StdMutex::new(None),
+            pending_prompt: StdMutex::new(None),
             event_tx,
             session_dir: "/main/sessions".to_string(),
             work_dir: "/main/work".to_string(),
@@ -2399,6 +2428,7 @@ mod tests {
             config: StdMutex::new(config),
             agent: Mutex::new(None),
             steer_tx: StdMutex::new(None),
+            pending_prompt: StdMutex::new(None),
             event_tx,
             session_dir,
             work_dir: tmp.path().to_string_lossy().to_string(),
@@ -2430,6 +2460,7 @@ mod tests {
             config: StdMutex::new(Config::default_config()),
             agent: Mutex::new(None),
             steer_tx: StdMutex::new(None),
+            pending_prompt: StdMutex::new(None),
             event_tx,
             session_dir: session_dir.to_string(),
             work_dir: "/tmp".to_string(),
