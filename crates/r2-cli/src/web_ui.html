@@ -508,6 +508,7 @@ function applyState(st){
   store.agents=st.agents||[];store.currentAgent=st.current_agent||"main";
   renderAgentSel();renderAgentList();renderAgentBadge();
   setRunning(!!st.running);
+  tryRestoreGroup();
 }
 /* ---------- agents ---------- */
 let agentSel="main";
@@ -763,9 +764,10 @@ $("#gf-create").onclick=()=>{
   $("#group-form").style.display="none";
 };
 $("#gf-cancel").onclick=()=>{$("#group-form").style.display="none"};
-/* 群视图进出 */
+/* 群视图进出（groupView 持久化到 localStorage：刷新不丢群） */
 function openGroup(id){
   store.groupView=id;
+  localStorage.setItem("r2group",id);
   gUnread.delete(id);
   wsSend({t:"group_open",id:id});
   renderSessions();
@@ -773,9 +775,17 @@ function openGroup(id){
 function exitGroupView(){
   if(!store.groupView)return;
   store.groupView=null;
+  localStorage.removeItem("r2group");
   $("#groupbar").style.display="none";
   $("#gctl").style.display="none";
   $("#gdeleg").style.display="none";
+}
+/* 刷新后恢复群视图：群还在则重进，不在则清记忆 */
+function tryRestoreGroup(){
+  const gid=localStorage.getItem("r2group");
+  if(!gid||store.groupView)return;
+  const s=(store.sessions||[]).find(x=>x.id===gid&&x.kind==="group");
+  if(s)openGroup(gid);else localStorage.removeItem("r2group");
 }
 function onGroupOpen(j){
   const id=j.id;if(!id)return;

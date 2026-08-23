@@ -1697,6 +1697,9 @@ async fn run_group_summary(state: &Arc<WebState>, sid: &str) {
     };
     let mut cfg = state.config.lock().expect("config 锁中毒").clone();
     apply_persona(MAIN, &mut cfg);
+    // 小结轮同样写入群 turns/（不污染主会话列表）
+    cfg.session.dir = dir.join("turns").to_string_lossy().to_string();
+    let _ = std::fs::create_dir_all(&cfg.session.dir);
     let prompt = build_summary_prompt(&g, &dir);
     let outcome = match AgentSession::new(cfg) {
         Ok(mut s) => {
@@ -1766,6 +1769,9 @@ async fn run_group_turn(state: Arc<WebState>, sid: String, seq: u64) {
         // 独立临时 AgentSession（不碰前台 state.agent 槽位），成员自己的 persona/work_dir
         let mut cfg = state.config.lock().expect("config 锁中毒").clone();
         apply_persona(&name, &mut cfg);
+        // 群轮次会话写入群目录 turns/：不污染主会话列表，也留每轮原始记录可审计
+        cfg.session.dir = dir.join("turns").to_string_lossy().to_string();
+        let _ = std::fs::create_dir_all(&cfg.session.dir);
         let prompt = build_member_prompt(&g, &dir, &name);
         let mut session = match AgentSession::new(cfg) {
             Ok(s) => s,
@@ -1945,6 +1951,9 @@ async fn run_group_subtask(state: Arc<WebState>, sid: String, to: String, prompt
     };
     let mut cfg = state.config.lock().expect("config 锁中毒").clone();
     apply_persona(&to, &mut cfg);
+    // 子任务执行轮写入群 turns/
+    cfg.session.dir = dir.join("turns").to_string_lossy().to_string();
+    let _ = std::fs::create_dir_all(&cfg.session.dir);
     let full = format!(
         "你在群聊「{title}」中被委任子任务：\n{prompt}\n\n最近群上下文：\n{ctx}\n\n\
          请执行该任务并给出结果汇报（300 字以内）。",
