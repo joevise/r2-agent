@@ -91,9 +91,11 @@ fn write_session_config(
     // agent 段：work_dir 锁定会话目录
     toml.push_str(&format!("\n[agent]\nwork_dir = {:?}\n", sess_dir.display()));
 
-    // sandbox 段：强制 strict + 会话级 pids
+    // sandbox 段：强制 strict。pids 仅用于会话 cgroup（pids.max 按子树计数，正确）；
+    // 绝不写进 max_processes（→ RLIMIT_NPROC 按真实 uid 全局计线程，桌面机 uid 1000
+    // 名下飞书/Cursor/浏览器等 2000+ 线程，256 限额 = 所有 fork EAGAIN 团灭，8/23 实测实锤）
     toml.push_str(&format!(
-        "\n[sandbox]\nlevel = \"strict\"\nmax_processes = {pids}\nbash_timeout_secs = {}\n",
+        "\n[sandbox]\nlevel = \"strict\"\nmax_processes = 0\nbash_timeout_secs = {}\n",
         parent.sandbox.bash_timeout_secs
     ));
 
@@ -224,7 +226,11 @@ mod tests {
         let path = write_session_config(&parent, None, tmp.path(), 128).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("level = \"strict\""), "必须强制 strict：{content}");
-        assert!(content.contains("max_processes = 128"));
+        // max_processes 必须为 0（不设 RLIMIT_NPROC）：pids 只走 cgroup。
+        // RLIMIT_NPROC 按真实 uid 全局计线程，桌面机 uid 1000 名下 2000+ 线程，
+        // 任何正数限额都会让所有 fork EAGAIN 团灭（2026-08-23 实测实锤）
+        assert!(content.contains("max_processes = 0"), "绝不设 RLIMIT_NPROC：{content}");
+        assert!(!content.contains("max_processes = 128"));
         assert!(content.contains("api_key"), "密钥段必须复制");
         assert!(content.contains(&format!("work_dir = {:?}", tmp.path().display())));
         // 0600 权限

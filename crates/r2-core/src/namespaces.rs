@@ -27,29 +27,56 @@ const OUTPUT_LIMIT: usize = 64 * 1024;
 
 /// 检测 namespace 沙箱是否真正可用。
 ///
-/// 关键：Ubuntu 23.10+ 默认 `apparmor_restrict_unprivileged_userns=1`——
-/// 它允许 unshare(NEWUSER) 成功，但剥夺新 user ns 内的一切能力：
-/// uid_map 写入 EPERM、后续 unshare(NEWNS/NEWPID/NEWNET) 全部 EPERM。
-/// 因此仅检查 uid_map 存在不够，必须实测「能否在 user ns 内写 uid_map」。
-///
+/// 关键（v0.9.3 修正）：sysctl=1 只是“默认限制”，AppArmor profile 可对单个
+/// 二进制放行（Ubuntu 24.04 按可执行文件白名单，flatpak 同机制）。
+/// 静态读 sysctl 判死会误杀已放行的二进制——改为 fork 探测：
+/// 子进程实测 unshare(CLONE_NEWUSER)+写 uid_map（AppArmor 拦截时写 uid_map
+/// 返回 EPERM），退出码即答案；子进程只调 async-signal-safe 系统调用，
+/// 失败不污染父进程。结果进程内缓存（OnceLock，profile 状态不会运行中翻转）。
 /// 三种可用路径：
-/// 1. 进程本身是 root（euid==0）→ 直接可建 mount/pid/net ns（不需要 userns）
-/// 2. 非 root 但 AppArmor 未限制 → userns 路径可用
-/// 3. 非 root 且 AppArmor 限制（Ubuntu 默认）→ 不可用，须降级
+/// 1. 进程本身是 root（euid==0）→ 直接可用
+/// 2. 非 root 且二进制被 profile 放行/系统未限制 → fork 探测通过
+/// 3. 非 root 且被限制 → 探测失败，诚实降级 container
 pub fn can_namespace() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| probe_userns())
+}
+
+/// fork 探测 userns 可用性（子进程仅 async-signal-safe 调用）
+fn probe_userns() -> bool {
     if unsafe { libc::geteuid() } == 0 {
         return true;
     }
-    if let Ok(v) = std::fs::read_to_string(
-        "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
-    ) {
-        if v.trim() == "1" {
+    unsafe {
+        let pid = libc::fork();
+        if pid < 0 {
             return false;
         }
+        if pid == 0 {
+            // 子进程：最小验证链 = unshare userns + 写 uid_map（限制的精确拦截点）
+            // ⚠️ 必须在 unshare 前取真实 uid：新 user ns 内未映射时 getuid() 返回
+            //    overflowuid(65534)，写 "0 65534 1" 会 EINVAL（2026-08-23 实测踩坑）
+            let real_uid = libc::getuid();
+            let ok = libc::unshare(libc::CLONE_NEWUSER) == 0
+                && {
+                    let fd = libc::open(c"/proc/self/uid_map".as_ptr(), libc::O_WRONLY);
+                    if fd < 0 {
+                        false
+                    } else {
+                        let line = format!("0 {real_uid} 1\n");
+                        let n = libc::write(fd, line.as_ptr() as *const _, line.len());
+                        libc::close(fd);
+                        n == line.len() as isize
+                    }
+                };
+            libc::_exit(if ok { 0 } else { 1 });
+        }
+        let mut status: libc::c_int = 0;
+        if libc::waitpid(pid, &mut status, 0) < 0 {
+            return false;
+        }
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
     }
-    std::fs::read_to_string("/proc/self/uid_map")
-        .map(|m| !m.trim().is_empty())
-        .unwrap_or(false)
 }
 
 /// 定位系统 busybox（strict 档的最小根 /bin 唯一居民）

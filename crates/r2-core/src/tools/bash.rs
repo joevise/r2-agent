@@ -299,6 +299,8 @@ impl Tool for BashTool {
             .min(MAX_TIMEOUT_SECS);
 
         // strict 首试带 ns；容器/受限环境 unshare 被拦（EPERM）→ 摘 ns 重试（降级链闭合）
+        // ⚠️ 子串坑（8/23 实锤）："os error 1" 是 "os error 11"(EAGAIN) 的前缀子串！
+        // EAGAIN=资源耗尽（RLIMIT_NPROC 等）与 ns 无关，绝不能走降级重试——必须精确匹配
         if self.sandbox.level == crate::sandbox::SandboxLevel::Strict {
             match self.spawn_and_wait(command, timeout_secs, true, true).await {
                 Ok(o) => {
@@ -307,11 +309,13 @@ impl Tool for BashTool {
                         None => format_output(&o.output),
                     };
                 }
-                Err(e) if e.contains("Operation not permitted") || e.contains("os error 1") => {
+                Err(e)
+                    if e.contains("Operation not permitted")
+                        || e.contains("(os error 1)") => {
                     const NS_RETRY_WARN: &str =
                         "WARN: namespace 被 seccomp/容器策略拦截（EPERM），降级 container 档";
                     return match self.spawn_and_wait(command, timeout_secs, true, false).await {
-                        Ok(o) => format!("{NS_RETRY_WARN}\n{}", format_output(&o.output)),
+                        Ok(o) => format!("{NS_RETRY_WARN}\n[orig: {e}]\n{}", format_output(&o.output)),
                         Err(e2) => format!("{NS_RETRY_WARN}\n{e2}"),
                     };
                 }
