@@ -318,7 +318,10 @@ impl ToolRegistry {
             let result = McpConnection::connect(server)
                 .and_then(|mut conn| conn.list_tools().map(|schemas| (conn, schemas)));
             match result {
-                Ok((conn, schemas)) => {
+                Ok((conn, mut schemas)) => {
+                    // server 返回的工具顺序不稳定（实现相关），不排序会让 tools 列表
+                    // 前缀抖动、击穿 KV-cache 命中——按名字排序保证跨调用稳定
+                    schemas.sort_by(|a, b| a.name.cmp(&b.name));
                     let conn = Arc::new(tokio::sync::Mutex::new(conn));
                     let count = schemas.len();
                     for schema in schemas {

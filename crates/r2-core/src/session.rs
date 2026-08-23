@@ -352,6 +352,7 @@ impl Session {
                     input_tokens,
                     output_tokens,
                     llm_calls,
+                    ..Default::default()
                 };
             }
         }
@@ -572,6 +573,7 @@ mod tests {
                 input_tokens: 100,
                 output_tokens: 50,
                 llm_calls: 1,
+                ..Default::default()
             }))
             .unwrap();
         session
@@ -579,6 +581,7 @@ mod tests {
                 input_tokens: 300,
                 output_tokens: 120,
                 llm_calls: 2,
+                ..Default::default()
             }))
             .unwrap();
         drop(session);

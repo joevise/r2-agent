@@ -84,6 +84,8 @@ fn build_request_body(model: &str, messages: &[Message], tools: &[ToolSchema]) -
         "model": model,
         "messages": msgs,
         "stream": true,
+        // OpenAI 标准字段：要求流尾部返回真实 usage（GLM/DeepSeek/Kimi 兼容）
+        "stream_options": {"include_usage": true},
     });
     if !tools.is_empty() {
         let arr: Vec<serde_json::Value> = tools
@@ -119,6 +121,19 @@ fn parse_data_payload(payload: &str) -> ModelResult<Vec<StreamChunk>> {
         if !r.is_empty() {
             chunks.push(StreamChunk::Reasoning(r.to_string()));
         }
+    }
+    // 服务端真实用量（include_usage 尾块：choices 为空、usage 在场；字段缺失按 0）
+    if let Some(usage) = v.get("usage").filter(|u| u.is_object()) {
+        let input_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0);
+        let output_tokens = usage["completion_tokens"].as_u64().unwrap_or(0);
+        let cached_tokens = usage["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap_or(0);
+        chunks.push(StreamChunk::Usage {
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+        });
     }
     if let Some(tool_calls) = delta["tool_calls"].as_array() {
         for tc in tool_calls {
@@ -309,6 +324,7 @@ impl ModelProvider for OpenAiCompatProvider {
                     }
                     entry.2.push_str(arguments_delta);
                 }
+                StreamChunk::Usage { .. } => {} // 用量由 agent 层校正，不进正文/工具拼装
                 StreamChunk::Done => {}
             }
         }
@@ -388,6 +404,47 @@ mod tests {
             other => panic!("期望 ToolCallDelta，实际 {other:?}"),
         }
         assert!(matches!(chunks[4], StreamChunk::Done));
+    }
+
+    /// 含 usage 尾块的流（include_usage=true 时服务端在 [DONE] 前发 usage）
+    const SSE_WITH_USAGE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":1200,\"completion_tokens\":42,\"prompt_tokens_details\":{\"cached_tokens\":800}}}\n\ndata: [DONE]\n\n";
+
+    #[test]
+    fn test_sse_parse_usage_tail_chunk() {
+        let chunks = parse_all(SSE_WITH_USAGE);
+        assert_eq!(chunks.len(), 3);
+        match &chunks[1] {
+            StreamChunk::Usage {
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+            } => {
+                assert_eq!(*input_tokens, 1200);
+                assert_eq!(*output_tokens, 42);
+                assert_eq!(*cached_tokens, 800);
+            }
+            other => panic!("期望 Usage，实际 {other:?}"),
+        }
+        assert!(matches!(chunks[2], StreamChunk::Done));
+    }
+
+    #[test]
+    fn test_sse_parse_usage_missing_fields_default_zero() {
+        // usage 对象字段缺失按 0；prompt_tokens_details 整体缺失也按 0
+        let text = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100}}\n\ndata: [DONE]\n\n";
+        let chunks = parse_all(text);
+        match &chunks[0] {
+            StreamChunk::Usage {
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+            } => {
+                assert_eq!(*input_tokens, 100);
+                assert_eq!(*output_tokens, 0);
+                assert_eq!(*cached_tokens, 0);
+            }
+            other => panic!("期望 Usage，实际 {other:?}"),
+        }
     }
 
     #[test]

@@ -604,6 +604,7 @@ mod tests {
             input_tokens: 1_000_000,
             output_tokens: 1_000_000,
             llm_calls: 2,
+            ..UsageStats::default()
         };
         let cost = estimate_cost("glm-5.2", &usage).unwrap();
         assert!((cost - 16.0).abs() < 1e-9);
@@ -613,6 +614,7 @@ mod tests {
             input_tokens: 12_000,
             output_tokens: 4_500,
             llm_calls: 1,
+            ..UsageStats::default()
         };
         let cost = estimate_cost("glm-5.2", &usage).unwrap();
         assert!((cost - 0.132).abs() < 1e-9);
@@ -629,6 +631,7 @@ mod tests {
             input_tokens: 1_000_000,
             output_tokens: 1_000_000,
             llm_calls: 2,
+            ..UsageStats::default()
         };
         let cost = estimate_cost("deepseek-v4-pro", &usage).unwrap();
         assert!((cost - 9.0).abs() < 1e-9);
@@ -638,6 +641,7 @@ mod tests {
             input_tokens: 500_000,
             output_tokens: 100_000,
             llm_calls: 1,
+            ..UsageStats::default()
         };
         let cost = estimate_cost("deepseek-v4-pro", &usage).unwrap();
         assert!((cost - 2.1).abs() < 1e-9);

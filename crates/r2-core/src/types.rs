@@ -47,9 +47,12 @@ pub struct ToolSchema {
 /// 一轮对话的用量统计
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UsageStats {
-    pub input_tokens: u64,  // 发给模型的全部消息（含system）估算
-    pub output_tokens: u64, // 模型回复估算
+    pub input_tokens: u64,  // 发给模型的全部消息（含system）估算（服务端上报后被真实值校正）
+    pub output_tokens: u64, // 模型回复估算（服务端上报后被真实值校正）
     pub llm_calls: u64,     // 模型调用次数（含摘要/重试）
+    /// KV-cache 命中 token 数（服务端真实上报；命中率是第一生产指标）
+    #[serde(default)]
+    pub cached_tokens: u64,
 }
 
 /// 流式响应块
@@ -66,6 +69,12 @@ pub enum StreamChunk {
     },
     /// 模型思考增量（GLM reasoning_content 等；不计入正文，仅展示/用量）
     Reasoning(String),
+    /// 服务端上报的真实用量（SSE 尾部 usage 对象；有则覆盖本轮估算）
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+    },
     /// 流结束
     Done,
 }

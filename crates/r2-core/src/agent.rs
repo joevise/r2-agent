@@ -86,7 +86,7 @@ fn scan_skills_layer(home: &str, persona_dir: Option<&str>) -> Option<String> {
     }
     dirs.push(format!("{home}/.r2/skills"));
     // 收集（先到的同名胜出）
-    let mut lines: Vec<String> = Vec::new();
+    let mut items: Vec<(String, String)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for dir in dirs {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -101,12 +101,16 @@ fn scan_skills_layer(home: &str, persona_dir: Option<&str>) -> Option<String> {
                 continue;
             };
             let desc = skill_frontmatter_desc(&content);
-            lines.push(format!("- {name}：{desc}"));
+            items.push((name, desc));
         }
     }
-    if lines.is_empty() {
+    if items.is_empty() {
         return None;
     }
+    // read_dir 顺序随文件系统状态漂移，不排序会让 system prompt 前缀抖动、
+    // 直接击穿 KV-cache 前缀命中——按名字排序保证跨调用字节级稳定
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    let lines: Vec<String> = items.iter().map(|(n, d)| format!("- {n}：{d}")).collect();
     Some(format!(
         "以下技能已安装（共享目录 ~/.r2/skills）。任务匹配时主动使用：\n\
          先 bash 执行 cat ~/.r2/skills/<名字>/SKILL.md 阅读完整流程，再遵循执行。\n\
@@ -751,6 +755,11 @@ impl Agent {
                 .map(crate::context::message_tokens)
                 .sum::<usize>() as u64;
             self.usage.llm_calls += 1;
+            // 本轮用量基线快照：服务端真实 usage（StreamChunk::Usage）到达时
+            // 按「基线 + 服务端值」覆盖本轮估算；cached_tokens 为累计值直接累加
+            let turn_base_input = self.usage.input_tokens;
+            let turn_base_output = self.usage.output_tokens;
+            let mut server_usage_seen = false;
             let mut stream = self
                 .provider
                 .chat_stream(&messages, &self.tools.schemas())
@@ -780,6 +789,24 @@ impl Agent {
                                     self.usage.output_tokens +=
                                         crate::context::estimate_tokens(s) as u64;
                                     self.emit(AgentEvent::Thinking(s.clone()));
+                                }
+                                // 服务端真实用量：校正本轮估算（0 值字段不动，
+                                // 兼容 Anthropic start/delta 分块上报）
+                                StreamChunk::Usage {
+                                    input_tokens,
+                                    output_tokens,
+                                    cached_tokens,
+                                } => {
+                                    if *input_tokens > 0 {
+                                        self.usage.input_tokens =
+                                            turn_base_input + input_tokens;
+                                    }
+                                    if *output_tokens > 0 {
+                                        self.usage.output_tokens =
+                                            turn_base_output + output_tokens;
+                                    }
+                                    self.usage.cached_tokens += cached_tokens;
+                                    server_usage_seen = true;
                                 }
                                 _ => {}
                             }
@@ -832,11 +859,14 @@ impl Agent {
             // "调了工具但不回复"。
             validate_turn_output(&text, &tool_calls)?;
             // 用量统计：输出 = 回复文本 + 工具调用参数
-            self.usage.output_tokens += crate::context::estimate_tokens(&text) as u64;
-            for tc in &tool_calls {
-                self.usage.output_tokens += (crate::context::estimate_tokens(&tc.arguments)
-                    + crate::context::estimate_tokens(&tc.name))
-                    as u64;
+            // （服务端已上报真实 output 时跳过估算，避免双计）
+            if !server_usage_seen {
+                self.usage.output_tokens += crate::context::estimate_tokens(&text) as u64;
+                for tc in &tool_calls {
+                    self.usage.output_tokens += (crate::context::estimate_tokens(&tc.arguments)
+                        + crate::context::estimate_tokens(&tc.name))
+                        as u64;
+                }
             }
             self.context.add_assistant_with_tools(&text, tool_calls.clone())?;
             self.log_session(&SessionEntry::assistant(&text, tool_calls.clone()));

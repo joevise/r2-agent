@@ -144,7 +144,13 @@ fn build_request_body(model: &str, messages: &[Message], tools: &[ToolSchema]) -
         "stream": true,
     });
     if let Some(system) = system {
-        body["system"] = serde_json::Value::String(system);
+        // prompt caching 断点打在 system 末尾：system 是会话内最大稳定前缀，
+        // 断点在此可覆盖 全部 system 内容 进入 KV-cache（messages/tools 结构不动）
+        body["system"] = serde_json::json!([{
+            "type": "text",
+            "text": system,
+            "cache_control": {"type": "ephemeral"},
+        }]);
     }
     if !tools.is_empty() {
         // 注意：Anthropic 参数字段叫 input_schema（OpenAI 叫 parameters）
@@ -209,8 +215,32 @@ fn parse_data_payload(payload: &str) -> ModelResult<Vec<StreamChunk>> {
                 _ => {}
             }
         }
+        "message_start" => {
+            // message 对象携带 input 侧真实用量（含缓存读/写明细）
+            let usage = &v["message"]["usage"];
+            let input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
+            let cached_tokens = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+            if input_tokens > 0 || cached_tokens > 0 {
+                chunks.push(StreamChunk::Usage {
+                    input_tokens,
+                    output_tokens: 0,
+                    cached_tokens,
+                });
+            }
+        }
+        "message_delta" => {
+            // 流尾部携带累计 output_tokens（真实值，覆盖客户端估算）
+            let output_tokens = v["usage"]["output_tokens"].as_u64().unwrap_or(0);
+            if output_tokens > 0 {
+                chunks.push(StreamChunk::Usage {
+                    input_tokens: 0,
+                    output_tokens,
+                    cached_tokens: 0,
+                });
+            }
+        }
         "message_stop" => chunks.push(StreamChunk::Done),
-        // message_start / content_block_stop / message_delta / ping 等忽略
+        // content_block_stop / ping 等忽略
         _ => {}
     }
     Ok(chunks)
@@ -385,6 +415,7 @@ impl ModelProvider for AnthropicProvider {
                     }
                     entry.2.push_str(arguments_delta);
                 }
+                StreamChunk::Usage { .. } => {} // 用量由 agent 层校正，不进正文/工具拼装
                 StreamChunk::Done => {}
             }
         }
@@ -503,6 +534,63 @@ mod tests {
             }
             drop(parser.finish());
         }
+    }
+
+    #[test]
+    fn test_request_body_system_has_cache_control_breakpoint() {
+        let msgs = vec![
+            Message {
+                role: Role::System,
+                content: "你是 R2".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::User,
+                content: "hi".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        let body = build_request_body("claude-sonnet-4-20250514", &msgs, &[]);
+        let system = body["system"].as_array().expect("system 应为块数组");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["type"], "text");
+        assert_eq!(system[0]["text"], "你是 R2");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_sse_parse_message_start_and_delta_usage() {
+        // message_start 带 input 侧用量（含缓存明细），message_delta 带 output
+        let text = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":1500,\"cache_read_input_tokens\":1200,\"cache_creation_input_tokens\":300,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let chunks = parse_all(text);
+        assert_eq!(chunks.len(), 4);
+        match &chunks[0] {
+            StreamChunk::Usage {
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+            } => {
+                assert_eq!(*input_tokens, 1500);
+                assert_eq!(*output_tokens, 0);
+                assert_eq!(*cached_tokens, 1200);
+            }
+            other => panic!("期望 Usage(message_start)，实际 {other:?}"),
+        }
+        match &chunks[2] {
+            StreamChunk::Usage {
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+            } => {
+                assert_eq!(*input_tokens, 0);
+                assert_eq!(*output_tokens, 42);
+                assert_eq!(*cached_tokens, 0);
+            }
+            other => panic!("期望 Usage(message_delta)，实际 {other:?}"),
+        }
+        assert!(matches!(chunks[3], StreamChunk::Done));
     }
 
     #[test]
