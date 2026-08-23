@@ -109,9 +109,10 @@ impl Sandbox {
         install_pre_exec(cmd, self, use_seccomp);
 
         let warn = if self.strict && !cfg!(feature = "sandbox-strict") {
+            // 措辞准确性（8/23）：ns 隔离（假根/pid/net）与 cgroup 由 namespaces.rs 提供、
+            // 不依赖此 feature；未编译仅意味着系统调用白名单缺失
             Some(
-                "WARN: seccomp 未编译（需要 sandbox-strict feature），strict 降级为 container 行为"
-                    .to_string(),
+                "WARN: seccomp 系统调用白名单未编译（需 sandbox-strict feature）；namespace 隔离仍生效".to_string(),
             )
         } else {
             None
