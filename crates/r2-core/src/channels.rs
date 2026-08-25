@@ -389,6 +389,245 @@ impl FeishuClient {
         }
         Ok(())
     }
+
+    /// 发送一张 CardKit 流式卡片并返回控制器（v0.10.2：思考小字+主区 markdown 流式）。
+    /// 建卡（streaming_mode=true + note 小字区）→ 发进聊天 → 拿到 card_id/message_id。
+    /// 后续 append_content/update_note/finalize 原地更新，打字机效果由飞书端渲染。
+    /// 任一步失败返回 Err（调用方降级 send_text 纯文本路径）
+    pub async fn start_streaming_card(
+        &self,
+        open_id: &str,
+        with_note: bool,
+    ) -> Result<StreamingCard, String> {
+        let token = get_token(&self.inner).await?;
+        // ① 建卡实体（Card JSON 2.0；note 区带灰色小字体思考流）
+        let mut elements = vec![serde_json::json!({
+            "tag": "markdown", "content": "", "element_id": "content"
+        })];
+        if with_note {
+            elements.push(serde_json::json!({"tag": "hr"}));
+            elements.push(serde_json::json!({
+                "tag": "markdown", "content": "<font color='grey'>…</font>", "element_id": "note"
+            }));
+        }
+        let card_json = serde_json::json!({
+            "schema": "2.0",
+            "config": {
+                "streaming_mode": true,
+                "summary": { "content": "[生成中…]" },
+                "streaming_config": {
+                    "print_frequency_ms": { "default": 50 },
+                    "print_step": { "default": 1 }
+                }
+            },
+            "body": { "elements": elements }
+        });
+        let create_url = format!("{}/open-apis/cardkit/v1/cards", self.inner.cfg.domain);
+        let resp = self
+            .inner
+            .http
+            .post(&create_url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "data": card_json }))
+            .send()
+            .await
+            .map_err(|e| format!("ERROR: 建卡请求失败: {e}"))?;
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("ERROR: 建卡响应解析失败: {e}"))?;
+        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown");
+            return Err(format!("ERROR: 建卡失败 code={code} msg={msg}（检查 cardkit:card:write 权限）"));
+        }
+        let card_id = v
+            .pointer("/data/card_id")
+            .and_then(|x| x.as_str())
+            .ok_or("ERROR: 建卡响应缺 card_id")?
+            .to_string();
+        // ② 发进聊天（msg_type=interactive，content 引 card_id）
+        let send_url = format!(
+            "{}/open-apis/im/v1/messages?receive_id_type=open_id",
+            self.inner.cfg.domain
+        );
+        let content = serde_json::json!({ "type": "card", "data": { "card_id": card_id } }).to_string();
+        let body = serde_json::json!({
+            "receive_id": open_id,
+            "msg_type": "interactive",
+            "content": content,
+        });
+        let resp = self
+            .inner
+            .http
+            .post(&send_url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("ERROR: 发送卡片请求失败: {e}"))?;
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("ERROR: 发送卡片响应解析失败: {e}"))?;
+        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown");
+            return Err(format!("ERROR: 发送卡片失败 code={code} msg={msg}"));
+        }
+        Ok(StreamingCard {
+            inner: self.inner.clone(),
+            card_id,
+            sequence: std::sync::atomic::AtomicU64::new(1),
+            has_note: with_note,
+            content_text: String::new(),
+            note_text: String::new(),
+            last_flush: std::sync::Mutex::new(std::time::Instant::now()),
+        })
+    }
+}
+
+/// 流式卡片控制器：每次更新传**全量**文本（飞书端做增量渲染：旧文本是新文本前缀
+/// 时打字机续写，否则整体上屏）。节流 160ms（OpenClaw 同款值，防 API 抖动/限流）
+pub struct StreamingCard {
+    inner: Arc<Inner>,
+    card_id: String,
+    sequence: std::sync::atomic::AtomicU64,
+    has_note: bool,
+    content_text: String,
+    note_text: String,
+    last_flush: std::sync::Mutex<std::time::Instant>,
+}
+
+impl StreamingCard {
+    /// 全量替换主区 markdown（带节流：距上次 <160ms 时本地缓冲，下次再刷）
+    pub async fn update_content(&mut self, text: &str) -> Result<(), String> {
+        self.content_text = text.to_string();
+        self.flush(false).await
+    }
+
+    /// 全量替换 note 小字区（思考流；内容套灰色字体）
+    pub async fn update_note(&mut self, text: &str) -> Result<(), String> {
+        if !self.has_note {
+            return Ok(());
+        }
+        self.note_text = text.to_string();
+        self.flush(true).await
+    }
+
+    /// 收尾（不节流）：主区定格 final_text + 保留 note 小字现状 + 关闭 streaming_mode。
+    /// 错误/超时路径同样用它（final_text 传错误消息，用户在卡片主区直接看到）
+    pub async fn finalize(&mut self, final_text: &str) -> Result<(), String> {
+        self.content_text = final_text.to_string();
+        if self.has_note {
+            self.put_note().await?;
+        }
+        self.put_content().await?;
+        self.close_streaming().await
+    }
+
+    /// 关闭流式模式（卡片定格；finalize 内部调用，也可单独用）
+    pub async fn close_streaming(&self) -> Result<(), String> {
+        let token = get_token(&self.inner).await?;
+        let seq = self.sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let url = format!(
+            "{}/open-apis/cardkit/v1/cards/{}/settings",
+            self.inner.cfg.domain, self.card_id
+        );
+        let settings = serde_json::json!({ "config": { "streaming_mode": false } });
+        let resp = self
+            .inner
+            .http
+            .patch(&url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "settings": settings.to_string() }))
+            .send()
+            .await
+            .map_err(|e| format!("ERROR: 关闭流式模式失败: {e}"))?;
+        let v: serde_json::Value = resp.json().await.unwrap_or_default();
+        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown");
+            return Err(format!("ERROR: 关闭流式失败 code={code} msg={msg}（seq={seq}）"));
+        }
+        Ok(())
+    }
+
+    /// 节流判断：距上次实际 API 刷新不足 160ms 时跳过（finalize 不节流）
+    async fn flush(&mut self, is_note: bool) -> Result<(), String> {
+        {
+            let mut t = self.last_flush.lock().unwrap();
+            if t.elapsed() < std::time::Duration::from_millis(160) {
+                return Ok(());
+            }
+            *t = std::time::Instant::now();
+        }
+        if is_note {
+            self.put_note().await
+        } else {
+            self.put_content().await
+        }
+    }
+
+    async fn put_content(&self) -> Result<(), String> {
+        let token = get_token(&self.inner).await?;
+        let seq = self.sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let url = format!(
+            "{}/open-apis/cardkit/v1/cards/{}/elements/content/content",
+            self.inner.cfg.domain, self.card_id
+        );
+        let body = serde_json::json!({
+            "content": self.content_text,
+            "sequence": seq,
+            "uuid": format!("s_{}_{}", self.card_id, seq),
+        });
+        let resp = self
+            .inner
+            .http
+            .put(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("ERROR: 流式更新主区失败: {e}"))?;
+        let v: serde_json::Value = resp.json().await.unwrap_or_default();
+        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown");
+            return Err(format!("ERROR: 流式更新主区 code={code} msg={msg}"));
+        }
+        Ok(())
+    }
+
+    async fn put_note(&self) -> Result<(), String> {
+        let token = get_token(&self.inner).await?;
+        let seq = self.sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let url = format!(
+            "{}/open-apis/cardkit/v1/cards/{}/elements/note/content",
+            self.inner.cfg.domain, self.card_id
+        );
+        let body = serde_json::json!({
+            "content": format!("<font color='grey'>{}</font>", self.note_text),
+            "sequence": seq,
+            "uuid": format!("n_{}_{}", self.card_id, seq),
+        });
+        let resp = self
+            .inner
+            .http
+            .put(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("ERROR: 思考区更新失败: {e}"))?;
+        let v: serde_json::Value = resp.json().await.unwrap_or_default();
+        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown");
+            return Err(format!("ERROR: 思考区更新 code={code} msg={msg}"));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for FeishuClient {

@@ -1755,46 +1755,87 @@ async fn run_dm_prompt(
     text: &str,
 ) {
     let mode = show_process_mode(&cf.show_process);
-    // 事件消费任务：转发 Console + compact/full 档过程消息
+    // ① 流式卡片（Card Kit）：主区=最终回复 markdown 流式渲染，note=灰色小字思考流。
+    //    建/发卡任一步失败 → 降级纯文本路径（主链路不受影响），日志留座
+    //    v0.10.2：compact 档 note=工具状态单行；full 档 note=思考流+工具标记；none 无 note
+    let card_holder: Arc<tokio::sync::Mutex<Option<r2_core::channels::StreamingCard>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    match client.start_streaming_card(open_id, mode >= ShowProcess::Compact).await {
+        Ok(c) => *card_holder.lock().await = Some(c),
+        Err(e) => eprintln!("[feishu] 流式卡片创建失败，降级纯文本：{e}"),
+    }
+    let has_card = card_holder.try_lock().map(|g| g.is_some()).unwrap_or(false);
+    // ② 事件消费任务：转发 Console + 卡片流式更新（降级时走纯文本过程消息）
     let mut rx = session.subscribe();
     let etx = state.event_tx.clone();
     let client2 = client.clone();
     let oid = open_id.to_string();
     let agent2 = agent.to_string();
+    let cards = card_holder.clone();
     let consumer = tokio::spawn(async move {
         let mut thinking_buf = String::new();
+        let mut main_buf = String::new();
         loop {
             match rx.recv().await {
                 Ok(evt) => {
-                    // spawn_event_forward 同款转发：前端 Console 实时可见飞书来的对话
+                    // Console 实时可见飞书来的对话（含过程）
                     let _ = etx.send(json!({
                         "t": "event",
                         "evt": rpc::event_json(&evt),
                         "from_channel": "feishu",
                         "agent": agent2,
                     }));
+                    let mut card_guard = cards.lock().await;
                     match &evt {
-                        // e. compact 档：工具调用各发一行（名称+参数摘要，不发结果）
-                        AgentEvent::ToolCall { name, arguments }
-                            if mode >= ShowProcess::Compact =>
-                        {
-                            let _ = client2
-                                .send_text(&oid, &tool_call_summary(name, arguments))
-                                .await;
+                        // 主区流式：助手文本增量实时上屏（打字机效果）
+                        AgentEvent::MessageUpdate(s) => {
+                            main_buf.push_str(s);
+                            if let Some(c) = card_guard.as_mut() {
+                                let _ = c.update_content(&main_buf).await;
+                            }
                         }
-                        // e. full 档：思考流累计满 500 字发一段
+                        // note 小字：full=思考流追加；compact=工具状态单行替换
                         AgentEvent::Thinking(t) if mode == ShowProcess::Full => {
                             thinking_buf.push_str(t);
-                            if thinking_buf.chars().count() >= DM_THINKING_FLUSH_CHARS {
+                            if let Some(c) = card_guard.as_mut() {
+                                // 显示层截尾（思考流可能很长，PUT 全量代价高）
+                                let tail: String =
+                                    thinking_buf.chars().rev().take(1200).collect::<Vec<_>>()
+                                        .into_iter().rev().collect();
+                                let _ = c.update_note(&tail).await;
+                            } else if thinking_buf.chars().count() >= DM_THINKING_FLUSH_CHARS {
                                 let chunk = std::mem::take(&mut thinking_buf);
                                 let _ = client2.send_text(&oid, &format!("💭 {chunk}")).await;
                             }
                         }
+                        AgentEvent::ToolCall { name, arguments }
+                            if mode >= ShowProcess::Compact =>
+                        {
+                            if let Some(c) = card_guard.as_mut() {
+                                if mode == ShowProcess::Compact {
+                                    // 单行状态：当前在干嘛（实时替换，不刷屏）
+                                    let _ = c.update_note(&tool_call_summary(name, arguments)).await;
+                                } else {
+                                    thinking_buf.push('\n');
+                                    thinking_buf.push_str(&tool_call_summary(name, arguments));
+                                    let tail: String =
+                                        thinking_buf.chars().rev().take(1200).collect::<Vec<_>>()
+                                            .into_iter().rev().collect();
+                                    let _ = c.update_note(&tail).await;
+                                }
+                            } else {
+                                let _ = client2
+                                    .send_text(&oid, &tool_call_summary(name, arguments))
+                                    .await;
+                            }
+                        }
                         AgentEvent::Done { .. } => {
-                            // 收尾：flush 残余思考流后退出消费任务
+                            // 收尾：flush 残余思考流（降级路径）后退出
                             if mode == ShowProcess::Full && !thinking_buf.is_empty() {
-                                let chunk = std::mem::take(&mut thinking_buf);
-                                let _ = client2.send_text(&oid, &format!("💭 {chunk}")).await;
+                                if card_guard.is_none() {
+                                    let chunk = std::mem::take(&mut thinking_buf);
+                                    let _ = client2.send_text(&oid, &format!("💭 {chunk}")).await;
+                                }
                             }
                             break;
                         }
@@ -1807,7 +1848,7 @@ async fn run_dm_prompt(
             }
         }
     });
-    // prompt 主体：deadline 兜底 + none 档心跳（select 循环，心跳不打断 prompt）
+    // ③ prompt 主体：deadline 兜底 + none 档心跳（select 循环，心跳不打断 prompt）
     let deadline = tokio::time::Instant::now() + Duration::from_secs(DM_PROMPT_TIMEOUT_SECS);
     let mut prompt_fut = Box::pin(session.prompt(text));
     let timed_out;
@@ -1822,8 +1863,8 @@ async fn run_dm_prompt(
                 break Ok(String::new());
             }
             _ = tokio::time::sleep(Duration::from_secs(DM_HEARTBEAT_SECS)) => {
-                // none 档静默期防“假死”观感（compact/full 本身有过程流）
-                if mode == ShowProcess::None {
+                // none 档且无卡片时防"假死"；有卡片时主区/note 自带活性
+                if mode == ShowProcess::None && !has_card {
                     let _ = client.send_text(open_id, "⏳ 仍在处理中…").await;
                 }
             }
@@ -1835,8 +1876,29 @@ async fn run_dm_prompt(
     } else {
         consumer.abort();
     }
-    // f. 最终回复 / 错误摘要；完成后贴 👍 换掉收到时的 Typing 表情（成功确认）
-    if timed_out {
+    // ④ 收尾：卡片路径 finalize（主区定格最终回复+关流式）；降级路径纯文本
+    let succeeded = !timed_out && result.is_ok();
+    let card_opt = card_holder.lock().await.take();
+    if let Some(mut c) = card_opt {
+        if timed_out {
+            let _ = c
+                .finalize(&format!("（超时 {DM_PROMPT_TIMEOUT_SECS} 秒，未能完成回复）"))
+                .await;
+        } else {
+            match &result {
+                Ok(reply) => {
+                    if let Err(e) = c.finalize(reply).await {
+                        eprintln!("[feishu] 卡片收尾失败，改发文本：{e}");
+                        let _ = client.send_text(open_id, reply).await;
+                    }
+                }
+                Err(e) => {
+                    let brief: String = e.chars().take(200).collect();
+                    let _ = c.finalize(&format!("（出错：{brief}）")).await;
+                }
+            }
+        }
+    } else if timed_out {
         let _ = client
             .send_text(
                 open_id,
@@ -1847,14 +1909,18 @@ async fn run_dm_prompt(
         match result {
             Ok(reply) => {
                 let _ = client.send_text(open_id, &reply).await;
-                if let Err(e) = client.add_reaction(message_id, "THUMBSUP").await {
-                    eprintln!("[feishu] 👍 表情贴失败：{e}");
-                }
             }
             Err(e) => {
                 let brief: String = e.chars().take(200).collect();
                 let _ = client.send_text(open_id, &format!("（出错：{brief}）")).await;
             }
+        }
+    }
+    // 成功完成贴 👍（换掉收到时的 Typing；失败记日志方便诊断权限缺失）
+    // （result 在上方 match 已部分 move，成功标志提前存）
+    if succeeded {
+        if let Err(e) = client.add_reaction(message_id, "THUMBSUP").await {
+            eprintln!("[feishu] 👍 表情贴失败：{e}");
         }
     }
 }
