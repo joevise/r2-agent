@@ -99,6 +99,16 @@ textarea[readonly]{color:var(--dim)}
 #p-agent input[readonly]{color:var(--dim)}
 .agfield{margin-top:6px}
 .agfield .dim{font-size:11px}
+/* channel（飞书通道绑定） */
+#p-channel input[type=text],#p-channel input[type=password],#p-channel select{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);padding:4px 6px;width:100%;outline:none}
+#p-channel input:focus,#p-channel select:focus{border-color:var(--dim)}
+.chcard{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:10px}
+.chhead{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.chprov{font-size:10.5px;border:1px solid var(--line);border-radius:10px;padding:0 6px;color:#7ab8d0}
+.chdot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--dim)}
+.chdot-connecting,.chdot-reconnecting{background:#e0b070;animation:blink 1s steps(2) infinite}
+.chdot-connected{background:var(--ok)}
+.chdot-failed{background:var(--err)}
 /* growth */
 .gcard{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:10px}
 .ggoal{font-size:13px;line-height:1.6}
@@ -249,6 +259,7 @@ textarea[readonly]{color:var(--dim)}
     <button data-p="skill">技能</button>
     <button data-p="growth">成长</button>
     <button data-p="agent">分身</button>
+    <button data-p="channel">频道</button>
   </div>
   <div id="panels">
     <div class="panel on" id="p-sessions">
@@ -306,6 +317,11 @@ textarea[readonly]{color:var(--dim)}
         <div class="prow"><button id="ag-save">保存</button><span class="dim" id="ag-status"></span></div>
       </div>
     </div>
+    <section class="panel" id="p-channel">
+      <div class="tgroup">飞书频道</div>
+      <div class="hint">给每个分身绑定一个飞书机器人（自建应用）。AppID/Secret 来自飞书开放平台；应用需订阅 im.message.receive_v1 事件并选择长连接模式。绑定后可在飞书直接私聊该分身。</div>
+      <div id="chlist"></div>
+    </section>
     <div class="panel" id="p-skill">
       <div id="skilllist"></div>
       <details id="skill-preview"><summary>预览</summary><div class="body"><pre id="skill-pre-text"></pre></div></details>
@@ -386,7 +402,7 @@ const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"
 /* 单一 store */
 const store={model:"",running:false,sessions:[],tools:[],sandbox:null,current:null,
   usage:{input:0,output:0},tab:"sessions",agents:[],currentAgent:"main",
-  groupView:null,groups:{}};
+  groupView:null,groups:{},channels:[]};
 /* 模型价格表（镜像 r2-core models.rs，元/百万token：[key,in,out]） */
 const PRICES=[["glm-5.2-air",.8,2],["glm-5.2-flash",.5,2],["glm-5.2",8,8],["glm-5.1",7,21.9],
 ["kimi-k2.7-code",5.1,25.2],["kimi-for-coding",8,24],["kimi-k3",20,100],
@@ -441,6 +457,7 @@ document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{
   if(store.tab==="skill")loadSkills();
   if(store.tab==="growth")loadGrowth();
   if(store.tab==="agent")loadAgentFiles();
+  if(store.tab==="channel")renderChannelList();
 });
 /* ---------- sessions ---------- */
 function relTime(ts){
@@ -520,7 +537,9 @@ function applyState(st){
   $("#pf-skills").value=(st.prompt_sections&&st.prompt_sections.skills)||"（~/.r2/skills 为空）";
   renderSessions();renderTools();renderSandbox();renderUsage();
   store.agents=st.agents||[];store.currentAgent=st.current_agent||"main";
+  store.channels=st.channels||[];
   renderAgentSel();renderAgentList();renderAgentBadge();
+  if(store.tab==="channel")renderChannelList();
   setRunning(!!st.running);
   tryRestoreGroup();
 }
@@ -619,6 +638,50 @@ $("#ag-save").onclick=async()=>{
     else{const m=j.error||"保存失败";$("#ag-status").textContent=m;toast(m)}
   }catch(e){toast("保存失败："+e.message)}
 };
+/* ---------- 频道（飞书通道绑定） ---------- */
+const CH_PROC={none:"只回最终回复",compact:"工具调用小结",full:"含思考流"};
+function renderChannelList(){
+  const box=$("#chlist");if(!box)return;
+  box.innerHTML="";
+  const agents=store.agents||[];
+  if(!agents.length){box.innerHTML='<div class="empty">暂无分身——先到「分身」页召唤，再回来绑定飞书机器人</div>';return}
+  for(const a of agents){
+    const ch=(store.channels||[]).find(c=>c.agent===a.name)||{};
+    const st=ch.status||"stopped";
+    const d=document.createElement("div");d.className="chcard";
+    d.innerHTML='<div class="chhead"><b>'+esc(a.display_name||a.name)+'</b>'
+      +'<span class="chprov">飞书</span>'
+      +'<span class="chdot chdot-'+esc(st)+'" title="'+esc(st)+'"></span>'
+      +'<span class="dim" style="font-size:11px">'+esc(st)+'</span></div>'
+      +'<div class="agfield"><span class="dim">App ID</span><input type="text" data-f="app_id" spellcheck="false" value="'+esc(ch.app_id||"")+'" placeholder="cli_xxx"></div>'
+      +'<div class="agfield"><span class="dim">App Secret</span><input type="password" data-f="app_secret" spellcheck="false" value="'+(ch.app_id?"●●●●":"")+'" placeholder="留空 = 不修改"></div>'
+      +'<div class="agfield"><span class="dim">DM 白名单</span><input type="text" data-f="allow_from" spellcheck="false" placeholder="ou_xxx, * 或留空拒绝所有人"></div>'
+      +'<div class="agfield"><span class="dim">过程可见性</span><select data-f="show_process">'
+      +["none","compact","full"].map(v=>'<option value="'+v+'">'+CH_PROC[v]+'</option>').join("")+'</select></div>'
+      +'<div class="prow"><label style="font-size:12px;cursor:pointer"><input type="checkbox" data-f="enabled"'+(ch.enabled?" checked":"")+'> 启用</label></div>'
+      +'<div class="prow"><button data-act="save">保存</button><button data-act="test">测试连接</button></div>';
+    /* 保存：全量 config；secret 未改动（占位符/留空）一律传空串——后端约定空串不覆盖已存凭证 */
+    d.querySelector('[data-act="save"]').onclick=()=>{
+      const gv=f=>{const el=d.querySelector('[data-f="'+f+'"]');return el?el.value:""};
+      let sec=gv("app_secret");
+      if(sec==="●●●●")sec="";
+      wsSend({t:"channel_set",agent:a.name,config:{
+        enabled:d.querySelector('[data-f="enabled"]').checked,
+        app_id:gv("app_id").trim(),
+        app_secret:sec,
+        allow_from:gv("allow_from").split(",").map(s=>s.trim()).filter(Boolean),
+        show_process:gv("show_process")
+      }});
+      toast("已保存，通道重载中…");
+    };
+    /* 测试连接：按钮转「测试中…」，channel_test 回包后重渲恢复 */
+    d.querySelector('[data-act="test"]').onclick=e=>{
+      e.target.textContent="测试中…";e.target.disabled=true;
+      wsSend({t:"channel_test",agent:a.name});
+    };
+    box.appendChild(d);
+  }
+}
 async function loadPromptFiles(){
   for(const name of["soul","agents"]){
     try{
@@ -1262,6 +1325,19 @@ function connect(){
       case"group_open":onGroupOpen(j);break;
       case"group_event":onGroupEvent(j);break;
       case"group_state":onGroupState(j);break;
+      /* 频道：连接测试回包 → toast + 重渲（恢复按钮/状态点） */
+      case"channel_test":
+        toast(j.ok?"✅ 连接成功":"❌ "+(j.detail||"连接失败"));
+        renderChannelList();
+        break;
+      /* 频道：状态变化广播 → 就地更新对应分身的 status 后重渲 */
+      case"channel_status":{
+        const cs=(store.channels||[]).find(c=>c.agent===j.agent);
+        if(cs)cs.status=j.status;
+        else store.channels.push({agent:j.agent,enabled:false,app_id:"",status:j.status});
+        renderChannelList();
+        break;
+      }
       case"error":toast(j.message||"错误");addLine("msg-err","✗ "+esc(j.message||""));break;
     }
   };

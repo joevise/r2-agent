@@ -14,16 +14,18 @@ use axum::{
 };
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use r2_core::agents::{self, MAIN};
+use r2_core::agents::{self, ChannelFeishu, MAIN};
+use r2_core::channels::{ChannelStatus, FeishuClient, FeishuConfig, FeishuDm};
 use r2_core::config::{self, Config};
 use r2_core::groups::{self, GroupEvent};
 use r2_core::session::{self, SessionSummary};
 use r2_core::tools::ToolRegistry;
-use r2_core::{rpc, AgentSession};
+use r2_core::{rpc, AgentEvent, AgentSession};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 /// 上传大小上限：10MB
@@ -55,6 +57,11 @@ struct WebState {
     group_running: StdMutex<HashMap<String, (u64, tokio::task::JoinHandle<()>)>>,
     /// 群任务世代号自增器
     group_seq: StdMutex<u64>,
+    /// 运行中的飞书通道：agent 名 → 运行时（只短持锁做增删/查状态）
+    channels: StdMutex<HashMap<String, FeishuRuntime>>,
+    /// 飞书 DM 会话：key = "agent|open_id" → 会话槽。
+    /// 与 state.agent 主槽位完全隔离：main console 会话不受任何影响。
+    dm_sessions: StdMutex<HashMap<String, Arc<DmSession>>>,
 }
 
 /// 当前 agent 名
@@ -308,6 +315,7 @@ fn state_json(state: &WebState) -> Value {
         "model": cfg.current_model(),
         "agents": agents::list_profiles().iter().map(agents::profile_json).collect::<Vec<_>>(),
         "current_agent": current_agent_name(state),
+        "channels": channels_json(state),
         "tasks": r2_core::tasks::load_store().tasks,
         "history": history,
         "current_session": current,
@@ -764,6 +772,8 @@ enum ClientMsg {
     GroupSummary(String),
     GroupOpen(String),
     GroupSubtaskApprove { id: String, to: String },
+    ChannelSet { agent: String, config: Value },
+    ChannelTest { agent: String },
 }
 
 /// 取字符串字段的辅助
@@ -850,6 +860,17 @@ fn parse_client_msg(text: &str) -> Result<ClientMsg, String> {
         "group_subtask_approve" => Ok(ClientMsg::GroupSubtaskApprove {
             id: get_str(&v, "id")?.to_string(),
             to: get_str(&v, "to")?.to_string(),
+        }),
+        "channel_set" => {
+            let agent = get_str(&v, "agent")?.to_string();
+            let config = v
+                .get("config")
+                .cloned()
+                .ok_or_else(|| "缺少字段 config".to_string())?;
+            Ok(ClientMsg::ChannelSet { agent, config })
+        }
+        "channel_test" => Ok(ClientMsg::ChannelTest {
+            agent: get_str(&v, "agent")?.to_string(),
         }),
         other => Err(format!("未知消息类型：{other}")),
     }
@@ -1080,7 +1101,10 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
         ClientMsg::AgentApprove(name) => {
             // 签字权：pending→active 唯一通道（与 task 审批同款信任模型）
             match agents::approve(&name) {
-                Ok(_) => broadcast_state(state),
+                Ok(_) => {
+                    start_feishu_channels(state); // 档案变更后幂等重载通道
+                    broadcast_state(state);
+                }
                 Err(e) => ws_error(sink, &format!("批准 agent 失败：{e}")).await,
             }
         }
@@ -1379,7 +1403,450 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
             let st = state.clone();
             tokio::spawn(async move { run_group_subtask(st, id, to, prompt).await });
         }
+        ClientMsg::ChannelSet { agent, config } => {
+            // channel_feishu 全量写入档案 + 幂等重载该通道
+            let Some(mut p) = agents::load_profile(&agent) else {
+                ws_error(sink, &format!("agent 不存在：{agent}")).await;
+                return;
+            };
+            match serde_json::from_value::<ChannelFeishu>(config) {
+                Err(e) => ws_error(sink, &format!("channel_feishu 配置解析失败：{e}")).await,
+                Ok(cf) => {
+                    p.channel_feishu = cf;
+                    match agents::save_profile(&p) {
+                        Ok(()) => {
+                            start_feishu_channels(state);
+                            ws_send(sink, json!({"t": "channel_set", "agent": agent, "ok": true}))
+                                .await;
+                        }
+                        Err(e) => ws_error(sink, &format!("保存档案失败：{e}")).await,
+                    }
+                }
+            }
+        }
+        ClientMsg::ChannelTest { agent } => {
+            // 自检有网络等待（≤10s）：spawn 独立任务，不阻塞 WS 循环
+            let sink2 = sink.clone();
+            tokio::spawn(async move {
+                let (ok, detail) = test_feishu_channel(&agent).await;
+                ws_send(
+                    &sink2,
+                    json!({"t": "channel_test", "agent": agent, "ok": ok, "detail": detail}),
+                )
+                .await;
+            });
+        }
     }
+}
+
+// ---------- 飞书 DM 通道（v0.10.0-B：飞书消息 ↔ agent 会话） ----------
+//
+// 每个 active 分身可在 AGENT.toml 配 [channel_feishu]：启用后该 agent 的飞书机器人
+// 私聊消息路由到它自己的持久 AgentSession（每 (agent, open_id) 一个），回复发回飞书。
+// dm_sessions 与 state.agent 主槽位完全隔离：main console 会话不受任何影响。
+
+/// DM prompt 超时（秒）
+const DM_PROMPT_TIMEOUT_SECS: u64 = 120;
+/// 单个 DM 会话排队上限（满了回"忙"）
+const DM_QUEUE_MAX: usize = 8;
+/// full 档思考流累计多少字发一段
+const DM_THINKING_FLUSH_CHARS: usize = 500;
+/// 通道自检等待 Connected/Failed 的超时（秒）
+const CHANNEL_TEST_TIMEOUT_SECS: u64 = 10;
+
+/// 运行中的飞书通道
+struct FeishuRuntime {
+    client: Arc<FeishuClient>,
+    /// 幂等对比用：凭证变了才重启
+    app_id: String,
+    app_secret: String,
+    status: ChannelStatus,
+}
+
+/// 一个 (agent, open_id) 的持久 DM 会话
+struct DmSession {
+    /// prompt 串行化：持锁期间新消息进 pending
+    session: Mutex<AgentSession>,
+    /// 会话级排队（复用 pending 语义：本 DM 内 FIFO，最多 DM_QUEUE_MAX 条）
+    pending: StdMutex<VecDeque<String>>,
+}
+
+/// show_process 分档（带序：None < Compact < Full，便于 >= 判断）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ShowProcess {
+    None,
+    Compact,
+    Full,
+}
+
+/// show_process 配置 → 分档（空串/未识别值按默认 compact 处理）
+fn show_process_mode(s: &str) -> ShowProcess {
+    match s {
+        "none" => ShowProcess::None,
+        "full" => ShowProcess::Full,
+        _ => ShowProcess::Compact,
+    }
+}
+
+/// DM 白名单判定：空数组 = 拒绝所有人；"*" = 对所有人开放；否则精确匹配 open_id
+fn feishu_allowed(allow_from: &[String], open_id: &str) -> bool {
+    allow_from.iter().any(|x| x == "*" || x == open_id)
+}
+
+/// DM 会话槽位 key：agent|open_id
+fn dm_key(agent: &str, open_id: &str) -> String {
+    format!("{agent}|{open_id}")
+}
+
+/// compact 档工具调用摘要：🔧 工具名 + 参数前 60 字（只发调用不发结果）
+fn tool_call_summary(name: &str, arguments: &str) -> String {
+    let mut args: String = arguments.chars().take(60).collect();
+    if arguments.chars().count() > 60 {
+        args.push('…');
+    }
+    format!("🔧 {name} {args}")
+}
+
+/// 通道状态 → 前端字符串（failed 附带原因）
+fn channel_status_str(st: &ChannelStatus) -> String {
+    match st {
+        ChannelStatus::Connecting => "connecting".into(),
+        ChannelStatus::Connected => "connected".into(),
+        ChannelStatus::Reconnecting => "reconnecting".into(),
+        ChannelStatus::Failed(e) => format!("failed: {e}"),
+    }
+}
+
+/// 通道状态列表（init/state_json 的 "channels" 字段）：
+/// 凡配过 [channel_feishu]（enabled 或填了 app_id）的分身都列出
+fn channels_json(state: &WebState) -> Vec<Value> {
+    let table = state.channels.lock().expect("通道锁中毒");
+    agents::list_profiles()
+        .iter()
+        .filter(|p| p.channel_feishu.enabled || !p.channel_feishu.app_id.is_empty())
+        .map(|p| {
+            let status = table
+                .get(&p.name)
+                .map(|rt| channel_status_str(&rt.status))
+                .unwrap_or_else(|| "stopped".to_string());
+            json!({
+                "agent": p.name,
+                "enabled": p.channel_feishu.enabled,
+                "app_id": p.channel_feishu.app_id,
+                "status": status,
+            })
+        })
+        .collect()
+}
+
+/// 启动/重载全部飞书通道（幂等对账，以 active 档案的 [channel_feishu] 为准）：
+/// - active 且 enabled 且凭证齐备 → 未运行则起；(app_id, secret) 变了才重启
+/// - 档案禁用/删除/不再是 active → 停掉并移除运行表项
+/// main 不绑通道（v1 只遍历分身）
+fn start_feishu_channels(state: &Arc<WebState>) {
+    // 目标集合
+    let mut desired: HashMap<String, ChannelFeishu> = HashMap::new();
+    for p in agents::list_profiles() {
+        let cf = &p.channel_feishu;
+        if p.state == "active" && cf.enabled && !cf.app_id.is_empty() && !cf.app_secret.is_empty()
+        {
+            desired.insert(p.name.clone(), cf.clone());
+        }
+    }
+    let mut table = state.channels.lock().expect("通道锁中毒");
+    // ① 下线：不再需要的运行项
+    let stale: Vec<String> = table
+        .keys()
+        .filter(|k| !desired.contains_key(*k))
+        .cloned()
+        .collect();
+    for k in stale {
+        if let Some(rt) = table.remove(&k) {
+            rt.client.stop();
+        }
+    }
+    // ② 上新/重启
+    for (name, cf) in desired {
+        let unchanged = table
+            .get(&name)
+            .map(|rt| rt.app_id == cf.app_id && rt.app_secret == cf.app_secret)
+            .unwrap_or(false);
+        if unchanged {
+            continue; // 凭证没变 → 不动（幂等）
+        }
+        if let Some(old) = table.remove(&name) {
+            old.client.stop();
+        }
+        let client = Arc::new(FeishuClient::new(FeishuConfig {
+            app_id: cf.app_id.clone(),
+            app_secret: cf.app_secret.clone(),
+            domain: String::new(), // 空 = 默认 https://open.feishu.cn
+        }));
+        // on_message 是同步 Fn：里面 tokio::spawn 包异步工作
+        let st = state.clone();
+        let agent = name.clone();
+        let cfg_msg = cf.clone();
+        let client_msg = client.clone();
+        let st_status = state.clone();
+        let agent_status = name.clone();
+        client.start(
+            Box::new(move |dm: FeishuDm| {
+                tokio::spawn(handle_dm(
+                    st.clone(),
+                    agent.clone(),
+                    cfg_msg.clone(),
+                    client_msg.clone(),
+                    dm,
+                ));
+            }),
+            Box::new(move |status: ChannelStatus| {
+                // 注：初始状态即 Connecting，start() 内 set_status(Connecting) 相等不回调，
+                // 这里的锁不会与 start_feishu_channels 持有的表锁形成重入
+                {
+                    let mut t = st_status.channels.lock().expect("通道锁中毒");
+                    if let Some(rt) = t.get_mut(&agent_status) {
+                        rt.status = status.clone();
+                    }
+                }
+                let _ = st_status.event_tx.send(json!({
+                    "t": "channel_status",
+                    "agent": agent_status,
+                    "status": channel_status_str(&status),
+                }));
+            }),
+        );
+        table.insert(
+            name,
+            FeishuRuntime {
+                client,
+                app_id: cf.app_id,
+                app_secret: cf.app_secret,
+                status: ChannelStatus::Connecting,
+            },
+        );
+    }
+}
+
+/// 处理一条飞书 DM：白名单 → 文本校验 → 会话获取 → 排队/prompt → 回复
+async fn handle_dm(
+    state: Arc<WebState>,
+    agent: String,
+    cf: ChannelFeishu,
+    client: Arc<FeishuClient>,
+    dm: FeishuDm,
+) {
+    // a. 白名单校验
+    if !feishu_allowed(&cf.allow_from, &dm.open_id) {
+        let _ = client.send_text(&dm.open_id, "（未授权）").await;
+        return;
+    }
+    // b. 非文本消息（图片等 text 为空）
+    if dm.text.trim().is_empty() {
+        let _ = client.send_text(&dm.open_id, "v1 只支持文本消息").await;
+        return;
+    }
+    // c. 会话获取：每 (agent, open_id) 一个持久 AgentSession
+    let key = dm_key(&agent, &dm.open_id);
+    let existing = state
+        .dm_sessions
+        .lock()
+        .expect("dm 锁中毒")
+        .get(&key)
+        .cloned();
+    let dm_sess = match existing {
+        Some(d) => d,
+        None => {
+            // 锁外创建：AgentSession::new 可能做 MCP 冷启动（秒级），不能卡 dm_sessions 锁。
+            // 飞书会话 = 该 agent 的一个普通会话：config 快照 + apply_persona
+            // （session.dir 指向 ~/.r2/agents/<agent>/sessions，历史可审计、Console 可见）
+            let mut cfg = state.config.lock().expect("config 锁中毒").clone();
+            apply_persona(&agent, &mut cfg);
+            if let Some(p) = cfg.source_path.clone() {
+                if let Ok(fresh) = Config::load_from_file(&p) {
+                    cfg.mcp = fresh.mcp; // 与 config_snapshot_fresh_mcp 同款：mcp 段从源文件刷新
+                }
+            }
+            let session = match AgentSession::new(cfg) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = client
+                        .send_text(&dm.open_id, &format!("（创建会话失败：{e}）"))
+                        .await;
+                    return;
+                }
+            };
+            let mut map = state.dm_sessions.lock().expect("dm 锁中毒");
+            // 并发下同 key 只留一个（后到者丢弃自己建的，复用先入者）
+            map.entry(key)
+                .or_insert_with(|| {
+                    Arc::new(DmSession {
+                        session: Mutex::new(session),
+                        pending: StdMutex::new(VecDeque::new()),
+                    })
+                })
+                .clone()
+        }
+    };
+    // g. prompt 在途 → 排队（本 DM 会话级 FIFO，满了回"忙"）
+    let mut guard = match dm_sess.session.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            // 队列入队/判满在锁内做完即放锁（std guard 不可跨 await）
+            let full = {
+                let mut q = dm_sess.pending.lock().expect("排队锁中毒");
+                if q.len() >= DM_QUEUE_MAX {
+                    true
+                } else {
+                    q.push_back(dm.text);
+                    false
+                }
+            };
+            if full {
+                let _ = client.send_text(&dm.open_id, "（忙，请稍后再发）").await;
+            }
+            return;
+        }
+    };
+    // d-f. 串行跑本 DM 的消息（含排队续发，同 spawn_prompt 的收尾续发语义）
+    let mut text = dm.text;
+    loop {
+        run_dm_prompt(&state, &agent, &cf, &client, &dm.open_id, &mut guard, &text).await;
+        let next = dm_sess.pending.lock().expect("排队锁中毒").pop_front();
+        match next {
+            Some(t) => text = t,
+            None => break,
+        }
+    }
+}
+
+/// 执行一条 DM prompt：事件转发到 Console（带 from_channel 标记）+ 按 show_process
+/// 分档回传过程消息，完成后最终回复发回飞书（FeishuClient 自带 4000 字分片）
+async fn run_dm_prompt(
+    state: &Arc<WebState>,
+    agent: &str,
+    cf: &ChannelFeishu,
+    client: &Arc<FeishuClient>,
+    open_id: &str,
+    session: &mut AgentSession,
+    text: &str,
+) {
+    let mode = show_process_mode(&cf.show_process);
+    // 事件消费任务：转发 Console + compact/full 档过程消息
+    let mut rx = session.subscribe();
+    let etx = state.event_tx.clone();
+    let client2 = client.clone();
+    let oid = open_id.to_string();
+    let agent2 = agent.to_string();
+    let consumer = tokio::spawn(async move {
+        let mut thinking_buf = String::new();
+        loop {
+            match rx.recv().await {
+                Ok(evt) => {
+                    // spawn_event_forward 同款转发：前端 Console 实时可见飞书来的对话
+                    let _ = etx.send(json!({
+                        "t": "event",
+                        "evt": rpc::event_json(&evt),
+                        "from_channel": "feishu",
+                        "agent": agent2,
+                    }));
+                    match &evt {
+                        // e. compact 档：工具调用各发一行（名称+参数摘要，不发结果）
+                        AgentEvent::ToolCall { name, arguments }
+                            if mode >= ShowProcess::Compact =>
+                        {
+                            let _ = client2
+                                .send_text(&oid, &tool_call_summary(name, arguments))
+                                .await;
+                        }
+                        // e. full 档：思考流累计满 500 字发一段
+                        AgentEvent::Thinking(t) if mode == ShowProcess::Full => {
+                            thinking_buf.push_str(t);
+                            if thinking_buf.chars().count() >= DM_THINKING_FLUSH_CHARS {
+                                let chunk = std::mem::take(&mut thinking_buf);
+                                let _ = client2.send_text(&oid, &format!("💭 {chunk}")).await;
+                            }
+                        }
+                        AgentEvent::Done { .. } => {
+                            // 收尾：flush 残余思考流后退出消费任务
+                            if mode == ShowProcess::Full && !thinking_buf.is_empty() {
+                                let chunk = std::mem::take(&mut thinking_buf);
+                                let _ = client2.send_text(&oid, &format!("💭 {chunk}")).await;
+                            }
+                            break;
+                        }
+                        AgentEvent::Error(_) => break,
+                        _ => {}
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    // prompt 主体（超时 120s）
+    let result = tokio::time::timeout(
+        Duration::from_secs(DM_PROMPT_TIMEOUT_SECS),
+        session.prompt(text),
+    )
+    .await;
+    if result.is_ok() {
+        // 等消费任务收尾（flush 残余思考流）；Done/Error 后它自行退出
+        let _ = tokio::time::timeout(Duration::from_secs(2), consumer).await;
+    } else {
+        consumer.abort();
+    }
+    // f. 最终回复 / 错误摘要
+    match result {
+        Ok(Ok(reply)) => {
+            let _ = client.send_text(open_id, &reply).await;
+        }
+        Ok(Err(e)) => {
+            let brief: String = e.chars().take(200).collect();
+            let _ = client.send_text(open_id, &format!("（出错：{brief}）")).await;
+        }
+        Err(_) => {
+            let _ = client
+                .send_text(open_id, "（超时 120 秒，未能完成回复）")
+                .await;
+        }
+    }
+}
+
+/// 通道自检：用档案配置起临时 client 连一次，等首个 Connected/Failed（≤10s）后立即停掉
+async fn test_feishu_channel(agent: &str) -> (bool, String) {
+    let Some(p) = agents::load_profile(agent) else {
+        return (false, format!("agent 不存在：{agent}"));
+    };
+    let cf = &p.channel_feishu;
+    if cf.app_id.is_empty() || cf.app_secret.is_empty() {
+        return (false, "app_id/app_secret 未配置".into());
+    }
+    let client = FeishuClient::new(FeishuConfig {
+        app_id: cf.app_id.clone(),
+        app_secret: cf.app_secret.clone(),
+        domain: String::new(),
+    });
+    let (tx, mut rx) = mpsc::channel::<ChannelStatus>(8);
+    client.start(
+        Box::new(|_| {}),
+        Box::new(move |st| {
+            let _ = tx.try_send(st);
+        }),
+    );
+    let verdict = tokio::time::timeout(Duration::from_secs(CHANNEL_TEST_TIMEOUT_SECS), async {
+        while let Some(st) = rx.recv().await {
+            match st {
+                ChannelStatus::Connected => return (true, "连接成功".to_string()),
+                ChannelStatus::Failed(e) => return (false, e),
+                _ => {} // Connecting/Reconnecting 继续等
+            }
+        }
+        (false, "连接提前结束".to_string())
+    })
+    .await
+    .unwrap_or_else(|_| (false, "10 秒内未连上（超时）".to_string()));
+    client.stop();
+    verdict
 }
 
 // ---------- 群聊调度引擎（v0.9.1 会议室） ----------
@@ -2264,10 +2731,13 @@ pub async fn run(config: Config, port: u16, host: String) -> Result<(), Box<dyn 
         current_agent: StdMutex::new(MAIN.to_string()),
         group_running: StdMutex::new(HashMap::new()),
         group_seq: StdMutex::new(0),
+        channels: StdMutex::new(HashMap::new()),
+        dm_sessions: StdMutex::new(HashMap::new()),
     });
 
-    // 调度器先克隆再建路由（with_state 会 move state）
+    // 调度器/通道先克隆再建路由（with_state 会 move state）
     spawn_scheduler(state.clone());
+    let state_channels = state.clone();
     let app = Router::new()
         .route("/", get(index))
         .route("/upload", post(upload))
@@ -2283,6 +2753,8 @@ pub async fn run(config: Config, port: u16, host: String) -> Result<(), Box<dyn 
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
+    // web server 已就绪：按档案起一轮飞书通道（之后档案变更/审批会幂等重载）
+    start_feishu_channels(&state_channels);
     println!("R2 Console → http://{}:{port}", if host == "0.0.0.0" { "0.0.0.0（本机局域网IP）".to_string() } else { host.clone() });
     if host == "0.0.0.0" {
         println!("⚠ 已绑定 0.0.0.0：局域网内设备可访问，注意环境安全");
@@ -2294,6 +2766,96 @@ pub async fn run(config: Config, port: u16, host: String) -> Result<(), Box<dyn 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_channel_feishu_toml_roundtrip() {
+        // 老档案（无 channel_feishu 段）→ 默认全关，show_process 默认 compact
+        let old = "name = \"cfo\"\ndisplay_name = \"CFO\"\n";
+        let p: agents::AgentProfile = toml::from_str(old).unwrap();
+        assert!(!p.channel_feishu.enabled);
+        assert!(p.channel_feishu.app_id.is_empty());
+        assert!(p.channel_feishu.allow_from.is_empty());
+        assert_eq!(p.channel_feishu.show_process, "compact");
+        // 完整段 → roundtrip 不丢字段
+        let full = "name = \"cfo\"\n\n[channel_feishu]\nenabled = true\napp_id = \"cli_xxx\"\napp_secret = \"sec\"\nallow_from = [\"ou_1\", \"*\"]\nshow_process = \"full\"\n";
+        let p: agents::AgentProfile = toml::from_str(full).unwrap();
+        assert!(p.channel_feishu.enabled);
+        let s = toml::to_string(&p).unwrap();
+        let p2: agents::AgentProfile = toml::from_str(&s).unwrap();
+        assert_eq!(p2.channel_feishu.app_id, "cli_xxx");
+        assert_eq!(p2.channel_feishu.app_secret, "sec");
+        assert_eq!(
+            p2.channel_feishu.allow_from,
+            vec!["ou_1".to_string(), "*".to_string()]
+        );
+        assert_eq!(p2.channel_feishu.show_process, "full");
+    }
+
+    #[test]
+    fn test_feishu_whitelist() {
+        // 空数组 = 拒绝所有人
+        assert!(!feishu_allowed(&[], "ou_a"));
+        // ["*"] = 对所有人开放
+        assert!(feishu_allowed(&["*".to_string()], "ou_a"));
+        assert!(feishu_allowed(&["ou_b".to_string(), "*".to_string()], "ou_a"));
+        // 精确匹配
+        assert!(feishu_allowed(&["ou_a".to_string()], "ou_a"));
+        assert!(!feishu_allowed(&["ou_b".to_string()], "ou_a"));
+    }
+
+    #[test]
+    fn test_dm_key() {
+        assert_eq!(dm_key("cfo", "ou_1"), "cfo|ou_1");
+        assert_eq!(dm_key("main", "ou_1"), "main|ou_1");
+        // 同 open_id 不同 agent 不串台
+        assert_ne!(dm_key("a", "ou_1"), dm_key("b", "ou_1"));
+    }
+
+    #[test]
+    fn test_show_process_mode() {
+        assert_eq!(show_process_mode("none"), ShowProcess::None);
+        assert_eq!(show_process_mode("compact"), ShowProcess::Compact);
+        assert_eq!(show_process_mode("full"), ShowProcess::Full);
+        // 空串/未识别值按默认 compact
+        assert_eq!(show_process_mode(""), ShowProcess::Compact);
+        assert_eq!(show_process_mode("verbose"), ShowProcess::Compact);
+        // 档位序：None < Compact < Full
+        assert!(ShowProcess::None < ShowProcess::Compact);
+        assert!(ShowProcess::Compact < ShowProcess::Full);
+    }
+
+    #[test]
+    fn test_tool_call_summary() {
+        assert_eq!(tool_call_summary("bash", "{}"), "🔧 bash {}");
+        // 参数超 60 字截断加省略号
+        let long = "x".repeat(100);
+        let s = tool_call_summary("read", &long);
+        assert!(s.starts_with("🔧 read "));
+        assert!(s.ends_with('…'));
+        assert_eq!(s.chars().count(), "🔧 read ".chars().count() + 61);
+    }
+
+    #[test]
+    fn test_parse_channel_msgs() {
+        match parse_client_msg(
+            r#"{"t":"channel_set","agent":"cfo","config":{"enabled":true,"app_id":"cli_1"}}"#,
+        )
+        .unwrap()
+        {
+            ClientMsg::ChannelSet { agent, config } => {
+                assert_eq!(agent, "cfo");
+                assert_eq!(config["app_id"], "cli_1");
+            }
+            _ => panic!("应为 ChannelSet"),
+        }
+        match parse_client_msg(r#"{"t":"channel_test","agent":"cfo"}"#).unwrap() {
+            ClientMsg::ChannelTest { agent } => assert_eq!(agent, "cfo"),
+            _ => panic!("应为 ChannelTest"),
+        }
+        // 缺字段 → 报错
+        assert!(parse_client_msg(r#"{"t":"channel_set","agent":"cfo"}"#).is_err());
+        assert!(parse_client_msg(r#"{"t":"channel_test"}"#).is_err());
+    }
 
     #[test]
     fn test_upload_extension_whitelist() {
@@ -2469,6 +3031,8 @@ mod tests {
             current_agent: StdMutex::new(MAIN.to_string()),
             group_running: StdMutex::new(HashMap::new()),
             group_seq: StdMutex::new(0),
+            channels: StdMutex::new(HashMap::new()),
+            dm_sessions: StdMutex::new(HashMap::new()),
         };
         assert_eq!(session_dir_for(&state), "/main/sessions");
         *state.current_agent.lock().unwrap() = "cfo".to_string();
@@ -2510,6 +3074,8 @@ mod tests {
             current_agent: StdMutex::new(MAIN.to_string()),
             group_running: StdMutex::new(HashMap::new()),
             group_seq: StdMutex::new(0),
+            channels: StdMutex::new(HashMap::new()),
+            dm_sessions: StdMutex::new(HashMap::new()),
         };
         let v = state_json(&state);
         assert!(v["model"].is_string());
@@ -2542,6 +3108,8 @@ mod tests {
             current_agent: StdMutex::new(MAIN.to_string()),
             group_running: StdMutex::new(HashMap::new()),
             group_seq: StdMutex::new(0),
+            channels: StdMutex::new(HashMap::new()),
+            dm_sessions: StdMutex::new(HashMap::new()),
         }
     }
 

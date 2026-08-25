@@ -31,6 +31,7 @@
 
 pub mod agent;
 pub mod agents;
+pub mod channels;
 pub mod config;
 pub mod context;
 mod events;

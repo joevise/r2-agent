@@ -37,6 +37,9 @@ libc = "0.2"
 # Web 服务层（r2 web 子命令）
 axum = { version = "0.7", features = ["ws", "multipart"] }
 
+# 飞书 WS 长连接（channels 模块）
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+
 # L3 向量索引（可选，feature gate）
 rusqlite = { version = "0.31" }
 

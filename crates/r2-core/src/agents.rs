@@ -19,6 +19,33 @@ use serde::{Deserialize, Serialize};
 /// 保留名：主 agent
 pub const MAIN: &str = "main";
 
+/// 飞书 DM 通道配置（AGENT.toml 的 [channel_feishu] 段；v0.10.0-B）。
+/// 老档案无此段 → serde(default) 全部取默认（enabled=false），零影响。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChannelFeishu {
+    /// 是否启用该 agent 的飞书机器人私聊桥
+    pub enabled: bool,
+    pub app_id: String,
+    pub app_secret: String,
+    /// DM 白名单：空数组 = 拒绝所有人；["*"] = 对所有人开放
+    pub allow_from: Vec<String>,
+    /// none=只发最终回复 compact=工具调用各发一行 full=思考流也发（分片）
+    pub show_process: String,
+}
+
+impl Default for ChannelFeishu {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            app_id: String::new(),
+            app_secret: String::new(),
+            allow_from: Vec::new(),
+            show_process: "compact".into(),
+        }
+    }
+}
+
 /// Agent 档案（AGENT.toml）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentProfile {
@@ -38,6 +65,9 @@ pub struct AgentProfile {
     pub description: String,
     #[serde(default)]
     pub created_ts: u64,
+    /// 飞书 DM 通道（老档案无此段 → 默认全关；读入后再写回时原样保留）
+    #[serde(default)]
+    pub channel_feishu: ChannelFeishu,
 }
 
 fn default_state() -> String {
@@ -144,6 +174,7 @@ pub fn draft_profile(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
+        channel_feishu: ChannelFeishu::default(),
     };
     save_profile(&profile)?;
     std::fs::write(profile_dir(name).join("SOUL.md"), soul).map_err(|e| e.to_string())?;

@@ -21,6 +21,7 @@ toml.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 libc.workspace = true
+tokio-tungstenite.workspace = true
 rusqlite = { workspace = true, optional = true }
 libseccomp = { workspace = true, optional = true }
 
