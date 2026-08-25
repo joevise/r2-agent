@@ -1545,6 +1545,8 @@ fn channels_json(state: &WebState) -> Vec<Value> {
                 // v0.10.1：策略化 DM 准入（前端下拉选择器用；老档案 allow_from 已归一）
                 "dm_policy": p.channel_feishu.effective_policy().0,
                 "policy_list": p.channel_feishu.effective_policy().1,
+                // 过程可见性回显（缺了它前端下拉永远显示第一项，重存时静默覆盖成 none——8/25 实锤）
+                "show_process": p.channel_feishu.show_process,
             })
         })
         .collect()

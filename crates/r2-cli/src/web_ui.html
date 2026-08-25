@@ -660,7 +660,7 @@ function renderChannelList(){
       +Object.entries(CH_POLICY).map(([v,l])=>'<option value="'+v+'"'+((ch.dm_policy||"deny_all")===v?' selected':"")+'>'+l+'</option>').join("")+'</select></div>'
       +'<div class="agfield" data-row="policy_list" style="display:'+((ch.dm_policy==="allow_list"||ch.dm_policy==="deny_list")?'flex':'none')+'"><span class="dim">名单</span><input type="text" data-f="policy_list" spellcheck="false" value="'+esc((ch.policy_list||[]).join(", "))+'" placeholder="open_id 列表，逗号分隔"></div>'
       +'<div class="agfield"><span class="dim">过程可见性</span><select data-f="show_process">'
-      +["none","compact","full"].map(v=>'<option value="'+v+'">'+CH_PROC[v]+'</option>').join("")+'</select></div>'
+      +["none","compact","full"].map(v=>'<option value="'+v+'"'+((ch.show_process||"compact")===v?' selected':"")+'>'+CH_PROC[v]+'</option>').join("")+'</select></div>'
       +'<div class="prow"><label style="font-size:12px;cursor:pointer"><input type="checkbox" data-f="enabled"'+(ch.enabled?" checked":"")+'> 启用</label></div>'
       +'<div class="prow"><button data-act="save">保存</button><button data-act="test">测试连接</button></div>';
     /* 策略切到名单型时显隐名单输入框 */
