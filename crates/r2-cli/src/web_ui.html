@@ -502,6 +502,9 @@ function applyState(st){
   store.model=st.model||"";$("#model").textContent=store.model||"—";
   store.tasks=st.tasks||[];renderTaskBadge();
   if(st.history)renderHistory(st.history);
+  /* history 为空（agent 刚切换、无进行中会话）时必须清屏——
+     否则上一个 agent 的聊天残留在新 agent 视图里，切换后首聊观感串台 */
+  else clearFlow();
   store.sessions=st.sessions||[];store.current=st.current_session||null;
   store.tools=st.tools||[];store.sandbox=st.sandbox||null;
   $("#pf-core").value=(st.prompt_sections&&st.prompt_sections.core)||"";
@@ -526,7 +529,10 @@ $("#agent-badge").onclick=()=>{
   if(m){m.remove();return;}
   m=document.createElement("div");
   m.id="agent-menu";
-  m.style.cssText="position:fixed;top:38px;left:60px;z-index:99;border:1px solid var(--line);background:var(--bg);min-width:150px;padding:4px 0;box-shadow:0 4px 14px rgba(0,0,0,.5)";
+  /* 锚定徽章实际位置（旧版硬编码 top:38px;left:60px，布局一变就跑偏） */
+  const ar=$("#agent-badge").getBoundingClientRect();
+  const mx=Math.min(Math.round(ar.left),Math.max(8,innerWidth-170));
+  m.style.cssText=`position:fixed;top:${Math.round(ar.bottom+6)}px;left:${mx}px;z-index:99;border:1px solid var(--line);background:var(--bg);min-width:150px;padding:4px 0;box-shadow:0 4px 14px rgba(0,0,0,.5)`;
   const opts=[{name:"main",display_name:"main（主Agent）"}].concat((store.agents||[]).filter(a=>a.state==="active"));
   const cur=store.currentAgent||"main";
   for(const a of opts){
@@ -1107,16 +1113,15 @@ function thinkDone(){
 function onEvent(evt){
   const d=evt.data||{};
   switch(evt.type){
-    case"agent_start":setRunning(true);endAI();thinkCur=null;break;
-    case"thinking":thinkAppend(d.text||"");break;
-    case"message_update":thinkDone();aiAppend(d.text||"");break;
-    case"tool_call":thinkDone();onToolCall(d.name||"?",d.arguments);break;
-    case"tool_result":onToolResult(d.name||"?",d.output);break;
+    case"agent_start":setRunning(true);endAI();thinkCur=null;turnGotContent=false;break;
+    case"thinking":thinkAppend(d.text||"");turnGotContent=true;break;
+    case"message_update":thinkDone();aiAppend(d.text||"");turnGotContent=true;break;
+    case"tool_call":thinkDone();onToolCall(d.name||"?",d.arguments);turnGotContent=true;break;
+    case"tool_result":onToolResult(d.name||"?",d.output);turnGotContent=true;break;
     case"steered":addLine("msg-sys","⌁ steer: "+esc(d.instruction||""));break;
     case"evolved":addLine("msg-sys","🌱 "+esc(d.text||""));break;
-    case"bg_started":addLine("msg-sys","🔄 后台任务「"+esc(j.name||"")+"」开始（"+esc(j.prompt_preview||"")+"…）");break;
-    case"bg_done":addLine("msg-sys","✅ 后台任务「"+esc(j.name||"")+"」完成："+esc(j.result_preview||""));break;
-    case"queued_prompt":addLine("msg-sys",esc(j.message||"⏳ 已排队，即将自动发送"));break;
+    case"notice":addLine("msg-sys","⏳ "+esc(d.text||""));break;
+    case"queued_prompt":addLine("msg-sys",esc(evt.message||d.message||"⏳ 已排队，即将自动发送"));break;
     case"usage_update":
       store.usage={input:d.input_tokens||0,output:d.output_tokens||0,cached:d.cached_tokens||0};renderUsage();break;
     case"done":thinkDone();endAI();setRunning(false);break;
@@ -1124,7 +1129,7 @@ function onEvent(evt){
   }
 }
 /* ---------- WebSocket ---------- */
-let ws=null,backoff=3000;
+let ws=null,backoff=3000,lastWsMsg=Date.now(),turnGotContent=false;
 function wsSend(o){
   if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));
   else toast("连接不可用，请稍候");
@@ -1142,8 +1147,10 @@ function connect(){
   ws.onclose=()=>{$("#offline").style.display="inline";schedule()};
   ws.onerror=()=>{};
   ws.onmessage=m=>{
+    lastWsMsg=Date.now();
     let j;try{j=JSON.parse(m.data)}catch(e){return}
     switch(j.t){
+      case"hb":break;
       case"init":applyState(j);break;
       /* 增量状态广播（审批/切agent/群变更后）：只刷列表类数据，
          不碰 running/history——避免误关"运行中"指示 */
@@ -1157,6 +1164,9 @@ function connect(){
       case"sessions":store.sessions=j.list||[];renderSessions();break;
       case"prompt_done":
         endAI();setRunning(false);
+        /* 流式帧丢失兑底（隧道闪断/重连间隙）：本轮没收到任何内容帧时，
+           用服务端带回的 final_text 直接补画——回复永远不再凭空消失 */
+        if(!turnGotContent&&j.final_text){aiAppend(j.final_text);endAI()}
         if(j.session_id){store.current=j.session_id}
         break;
       case"model_changed":store.model=j.model||"";$("#model").textContent=store.model;renderUsage();break;
@@ -1164,6 +1174,8 @@ function connect(){
       case"session_history":renderHistory(j.history);break;
       case"task_pending":renderTaskCard(j.task);break;
       case"tasks":store.tasks=j.tasks||[];renderTaskBadge();if(store.tab==="growth")loadGrowth();break;
+      case"bg_started":addLine("msg-sys","🔄 后台任务「"+esc(j.name||"")+"」开始（"+esc(j.prompt_preview||"")+"…）");break;
+      case"bg_done":addLine("msg-sys","✅ 后台任务「"+esc(j.name||"")+"」完成："+esc(j.result_preview||""));break;
       case"task_state":toast(j.state==="active"?"✅ 任务已批准生效":"任务状态已更新");break;
       case"group_created":
         if(j.id){store.groups[j.id]=j.group||{};toast("群已创建");openGroup(j.id)}
@@ -1176,6 +1188,14 @@ function connect(){
   };
 }
 function schedule(){setTimeout(connect,backoff);backoff=Math.min(backoff*2,30000)}
+/* 失联看门狗：服务端 15s 心跳（hb 帧），35s 无任何帧判定半死连接，
+   主动断开触发重连——重连后 init 快照自带历史，回复自动可见 */
+setInterval(()=>{
+  if(ws&&ws.readyState===1&&Date.now()-lastWsMsg>35000){
+    toast("连接中断，自动重连中…");
+    try{ws.close()}catch(e){}
+  }
+},5000);
 /* ---------- 顶栏 ---------- */
 $("#model").onclick=()=>{
   const m=prompt("输入模型名，如 glm-5.2 / kimi-k3",store.model);
@@ -1214,7 +1234,10 @@ function sendInput(){
   }else if(store.running){
     wsSend({t:"steer",text});
   }else{
+    if(!ws||ws.readyState!==1){toast("连接不可用，重连中——消息已保留，稍后重发");return}
     addUser(text);
+    turnGotContent=false;
+    setRunning(true);
     wsSend({t:"prompt",input:text});
     endAI();
   }

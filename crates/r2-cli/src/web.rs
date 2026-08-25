@@ -161,6 +161,12 @@ async fn run_prompt(st: Arc<WebState>, input: String) {
         }
     };
     if guard.is_none() {
+        // 懒建会话预热反馈：MCP 子进程冷启动（npx 实测 ~9s）期间前端原本完全沉默，
+        // 用户以为“没反应”——先推一条 notice，灯亮者有据可依
+        let _ = st.event_tx.send(json!({"t": "event", "evt": {
+            "type": "notice",
+            "data": {"text": "正在创建会话（工具预热，首次约 10 秒）…"},
+        }}));
         let config = config_snapshot_fresh_mcp(&st);
         match AgentSession::new(config) {
             Ok(s) => install_session(&st, &mut guard, s),
@@ -854,20 +860,29 @@ async fn handle_ws(socket: WebSocket, state: Arc<WebState>) {
     let (sink, mut stream) = socket.split();
     let sink: WsSink = Arc::new(Mutex::new(sink));
 
-    // 广播 → 本连接
+    // 广播 → 本连接（心跳+事件扇出：hb 每 15s，前端看门狗 35s 无帧断线重连）
     let mut evt_rx = state.event_tx.subscribe();
     let sink_fwd = sink.clone();
     let forward = tokio::spawn(async move {
+        let mut hb = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
-            match evt_rx.recv().await {
-                Ok(v) => {
+            tokio::select! {
+                r = evt_rx.recv() => match r {
+                    Ok(v) => {
+                        let mut s = sink_fwd.lock().await;
+                        if s.send(WsMessage::Text(v.to_string())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = hb.tick() => {
                     let mut s = sink_fwd.lock().await;
-                    if s.send(WsMessage::Text(v.to_string())).await.is_err() {
+                    if s.send(WsMessage::Text(json!({"t": "hb"}).to_string())).await.is_err() {
                         break;
                     }
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+                },
             }
         }
     });
