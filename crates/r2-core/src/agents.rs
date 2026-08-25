@@ -28,8 +28,14 @@ pub struct ChannelFeishu {
     pub enabled: bool,
     pub app_id: String,
     pub app_secret: String,
-    /// DM 白名单：空数组 = 拒绝所有人；["*"] = 对所有人开放
+    /// 【v0.10.1 弃用】旧白名单语义：空=拒绝所有人；["*"]=开放。
+    /// 仅为兼容老档案保留，读入后归一到 dm_policy；写入时不再使用
     pub allow_from: Vec<String>,
+    /// DM 策略：deny_all=拒绝所有人 / allow_all=允许所有人 /
+    /// allow_list=仅允许名单内 / deny_list=拒绝名单内（其余放行）
+    pub dm_policy: String,
+    /// 策略名单（allow_list/deny_list 用，open_id 列表）
+    pub policy_list: Vec<String>,
     /// none=只发最终回复 compact=工具调用各发一行 full=思考流也发（分片）
     pub show_process: String,
 }
@@ -41,7 +47,30 @@ impl Default for ChannelFeishu {
             app_id: String::new(),
             app_secret: String::new(),
             allow_from: Vec::new(),
+            dm_policy: "deny_all".into(),
+            policy_list: Vec::new(),
             show_process: "compact".into(),
+        }
+    }
+}
+
+impl ChannelFeishu {
+    /// 有效的 DM 策略（allow_from 老语义归一：["*"] → allow_all，非空 → allow_list）
+    pub fn effective_policy(&self) -> (&str, &[String]) {
+        match self.dm_policy.as_str() {
+            "allow_all" => ("allow_all", &self.policy_list),
+            "allow_list" => ("allow_list", &self.policy_list),
+            "deny_list" => ("deny_list", &self.policy_list),
+            _ => {
+                // 未设置（老档案）看 allow_from 归一
+                if self.allow_from.iter().any(|x| x == "*") {
+                    ("allow_all", &self.policy_list)
+                } else if !self.allow_from.is_empty() {
+                    ("allow_list", &self.allow_from)
+                } else {
+                    ("deny_all", &self.policy_list)
+                }
+            }
         }
     }
 }

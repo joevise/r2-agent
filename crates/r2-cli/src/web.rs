@@ -1467,8 +1467,8 @@ struct FeishuRuntime {
 struct DmSession {
     /// prompt 串行化：持锁期间新消息进 pending
     session: Mutex<AgentSession>,
-    /// 会话级排队（复用 pending 语义：本 DM 内 FIFO，最多 DM_QUEUE_MAX 条）
-    pending: StdMutex<VecDeque<String>>,
+    /// 会话级排队：FIFO，元素 (text, message_id)——排队消息完成时贴各自的 👍
+    pending: StdMutex<VecDeque<(String, String)>>,
 }
 
 /// show_process 分档（带序：None < Compact < Full，便于 >= 判断）
@@ -1488,9 +1488,17 @@ fn show_process_mode(s: &str) -> ShowProcess {
     }
 }
 
-/// DM 白名单判定：空数组 = 拒绝所有人；"*" = 对所有人开放；否则精确匹配 open_id
-fn feishu_allowed(allow_from: &[String], open_id: &str) -> bool {
-    allow_from.iter().any(|x| x == "*" || x == open_id)
+/// DM 策略判定（v0.10.1）：deny_all 拒绝所有人 / allow_all 允许所有人 /
+/// allow_list 仅允许名单内 / deny_list 拒绝名单内（其余放行）。
+/// 老档案 allow_from 语义经 effective_policy 归一，此处不再关心兼容细节
+fn feishu_allowed(cf: &ChannelFeishu, open_id: &str) -> bool {
+    match cf.effective_policy() {
+        ("deny_all", _) => false,
+        ("allow_all", _) => true,
+        ("allow_list", list) => list.iter().any(|x| x == open_id),
+        ("deny_list", list) => !list.iter().any(|x| x == open_id),
+        _ => false,
+    }
 }
 
 /// DM 会话槽位 key：agent|open_id
@@ -1534,6 +1542,9 @@ fn channels_json(state: &WebState) -> Vec<Value> {
                 "enabled": p.channel_feishu.enabled,
                 "app_id": p.channel_feishu.app_id,
                 "status": status,
+                // v0.10.1：策略化 DM 准入（前端下拉选择器用；老档案 allow_from 已归一）
+                "dm_policy": p.channel_feishu.effective_policy().0,
+                "policy_list": p.channel_feishu.effective_policy().1,
             })
         })
         .collect()
@@ -1635,11 +1646,15 @@ async fn handle_dm(
     client: Arc<FeishuClient>,
     dm: FeishuDm,
 ) {
-    // a. 白名单校验
-    if !feishu_allowed(&cf.allow_from, &dm.open_id) {
-        let _ = client.send_text(&dm.open_id, "（未授权）").await;
+    // a. DM 策略校验（deny_all/allow_all/allow_list/deny_list）
+    if !feishu_allowed(&cf, &dm.open_id) {
+        let _ = client
+            .send_text(&dm.open_id, "（未授权：该机器人设置了访问限制）")
+            .await;
         return;
     }
+    // 收到确认：贴 Typing 表情（成功后回复完换 👍；失败静默不影响主链路）
+    let _ = client.add_reaction(&dm.message_id, "Typing").await;
     // b. 非文本消息（图片等 text 为空）
     if dm.text.trim().is_empty() {
         let _ = client.send_text(&dm.open_id, "v1 只支持文本消息").await;
@@ -1697,7 +1712,7 @@ async fn handle_dm(
                 if q.len() >= DM_QUEUE_MAX {
                     true
                 } else {
-                    q.push_back(dm.text);
+                    q.push_back((dm.text, dm.message_id.clone()));
                     false
                 }
             };
@@ -1708,12 +1723,13 @@ async fn handle_dm(
         }
     };
     // d-f. 串行跑本 DM 的消息（含排队续发，同 spawn_prompt 的收尾续发语义）
-    let mut text = dm.text;
+    let mut item = (dm.text, dm.message_id.clone());
     loop {
-        run_dm_prompt(&state, &agent, &cf, &client, &dm.open_id, &mut guard, &text).await;
+        let (text, mid) = &item;
+        run_dm_prompt(&state, &agent, &cf, &client, &dm.open_id, mid, &mut guard, text).await;
         let next = dm_sess.pending.lock().expect("排队锁中毒").pop_front();
         match next {
-            Some(t) => text = t,
+            Some(x) => item = x,
             None => break,
         }
     }
@@ -1727,6 +1743,7 @@ async fn run_dm_prompt(
     cf: &ChannelFeishu,
     client: &Arc<FeishuClient>,
     open_id: &str,
+    message_id: &str,
     session: &mut AgentSession,
     text: &str,
 ) {
@@ -1795,10 +1812,11 @@ async fn run_dm_prompt(
     } else {
         consumer.abort();
     }
-    // f. 最终回复 / 错误摘要
+    // f. 最终回复 / 错误摘要；完成后贴 👍 换掉收到时的 Typing 表情（成功确认）
     match result {
         Ok(Ok(reply)) => {
             let _ = client.send_text(open_id, &reply).await;
+            let _ = client.add_reaction(message_id, "THUMBSUP").await;
         }
         Ok(Err(e)) => {
             let brief: String = e.chars().take(200).collect();
@@ -2793,14 +2811,30 @@ mod tests {
 
     #[test]
     fn test_feishu_whitelist() {
-        // 空数组 = 拒绝所有人
-        assert!(!feishu_allowed(&[], "ou_a"));
-        // ["*"] = 对所有人开放
-        assert!(feishu_allowed(&["*".to_string()], "ou_a"));
-        assert!(feishu_allowed(&["ou_b".to_string(), "*".to_string()], "ou_a"));
-        // 精确匹配
-        assert!(feishu_allowed(&["ou_a".to_string()], "ou_a"));
-        assert!(!feishu_allowed(&["ou_b".to_string()], "ou_a"));
+        // 策略四档：deny_all / allow_all / allow_list / deny_list
+        let mut cf = ChannelFeishu::default();
+        // deny_all（默认）= 拒绝所有人
+        assert!(!feishu_allowed(&cf, "ou_a"));
+        // allow_all = 允许所有人
+        cf.dm_policy = "allow_all".into();
+        assert!(feishu_allowed(&cf, "ou_a"));
+        // allow_list = 仅名单内
+        cf.dm_policy = "allow_list".into();
+        cf.policy_list = vec!["ou_a".into()];
+        assert!(feishu_allowed(&cf, "ou_a"));
+        assert!(!feishu_allowed(&cf, "ou_b"));
+        // deny_list = 拒绝名单内，其余放行
+        cf.dm_policy = "deny_list".into();
+        assert!(!feishu_allowed(&cf, "ou_a"));
+        assert!(feishu_allowed(&cf, "ou_b"));
+        // 老档案 allow_from 归一：["*"] → allow_all；非空 → allow_list
+        let mut old = ChannelFeishu::default();
+        old.allow_from = vec!["*".into()];
+        assert!(feishu_allowed(&old, "ou_any"));
+        let mut old2 = ChannelFeishu::default();
+        old2.allow_from = vec!["ou_x".into()];
+        assert!(feishu_allowed(&old2, "ou_x"));
+        assert!(!feishu_allowed(&old2, "ou_y"));
     }
 
     #[test]

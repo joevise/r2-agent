@@ -320,6 +320,37 @@ impl FeishuClient {
     }
 
     /// 发文本（自动按 4000 字符分片，逐条发送）
+    /// 给指定消息贴表情（收到确认/完成确认用；需 im:message.reaction:write 权限）
+    /// emoji_type 参考：Typing（输入中动画）/ THUMBSUP（👍）。
+    /// 失败静默由调用方处理，不影响主链路
+    pub async fn add_reaction(&self, message_id: &str, emoji_type: &str) -> Result<(), String> {
+        let token = get_token(&self.inner).await?;
+        let url = format!(
+            "{}/open-apis/im/v1/messages/{message_id}/reactions",
+            self.inner.cfg.domain
+        );
+        let body = serde_json::json!({ "reaction_type": { "emoji_type": emoji_type } });
+        let resp = self
+            .inner
+            .http
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("ERROR: 贴表情请求失败: {e}"))?;
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("ERROR: 贴表情响应解析失败: {e}"))?;
+        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown");
+            return Err(format!("ERROR: 贴表情失败 code={code} msg={msg}"));
+        }
+        Ok(())
+    }
+
     pub async fn send_text(&self, open_id: &str, text: &str) -> Result<(), String> {
         let token = get_token(&self.inner).await?;
         let url = format!(

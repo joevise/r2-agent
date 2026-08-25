@@ -640,6 +640,7 @@ $("#ag-save").onclick=async()=>{
 };
 /* ---------- 频道（飞书通道绑定） ---------- */
 const CH_PROC={none:"只回最终回复",compact:"工具调用小结",full:"含思考流"};
+const CH_POLICY={deny_all:"拒绝所有人",allow_all:"允许所有人",allow_list:"仅允许名单内",deny_list:"拒绝名单内的人"};
 function renderChannelList(){
   const box=$("#chlist");if(!box)return;
   box.innerHTML="";
@@ -655,11 +656,17 @@ function renderChannelList(){
       +'<span class="dim" style="font-size:11px">'+esc(st)+'</span></div>'
       +'<div class="agfield"><span class="dim">App ID</span><input type="text" data-f="app_id" spellcheck="false" value="'+esc(ch.app_id||"")+'" placeholder="cli_xxx"></div>'
       +'<div class="agfield"><span class="dim">App Secret</span><input type="password" data-f="app_secret" spellcheck="false" value="'+(ch.app_id?"●●●●":"")+'" placeholder="留空 = 不修改"></div>'
-      +'<div class="agfield"><span class="dim">DM 白名单</span><input type="text" data-f="allow_from" spellcheck="false" placeholder="ou_xxx, * 或留空拒绝所有人"></div>'
+      +'<div class="agfield"><span class="dim">DM 准入策略</span><select data-f="dm_policy">'
+      +Object.entries(CH_POLICY).map(([v,l])=>'<option value="'+v+'"'+((ch.dm_policy||"deny_all")===v?' selected':"")+'>'+l+'</option>').join("")+'</select></div>'
+      +'<div class="agfield" data-row="policy_list" style="display:'+((ch.dm_policy==="allow_list"||ch.dm_policy==="deny_list")?'flex':'none')+'"><span class="dim">名单</span><input type="text" data-f="policy_list" spellcheck="false" value="'+esc((ch.policy_list||[]).join(", "))+'" placeholder="open_id 列表，逗号分隔"></div>'
       +'<div class="agfield"><span class="dim">过程可见性</span><select data-f="show_process">'
       +["none","compact","full"].map(v=>'<option value="'+v+'">'+CH_PROC[v]+'</option>').join("")+'</select></div>'
       +'<div class="prow"><label style="font-size:12px;cursor:pointer"><input type="checkbox" data-f="enabled"'+(ch.enabled?" checked":"")+'> 启用</label></div>'
       +'<div class="prow"><button data-act="save">保存</button><button data-act="test">测试连接</button></div>';
+    /* 策略切到名单型时显隐名单输入框 */
+    d.querySelector('[data-f="dm_policy"]').onchange=e=>{
+      d.querySelector('[data-row="policy_list"]').style.display=(e.target.value==="allow_list"||e.target.value==="deny_list")?'flex':'none';
+    };
     /* 保存：全量 config；secret 未改动（占位符/留空）一律传空串——后端约定空串不覆盖已存凭证 */
     d.querySelector('[data-act="save"]').onclick=()=>{
       const gv=f=>{const el=d.querySelector('[data-f="'+f+'"]');return el?el.value:""};
@@ -669,7 +676,8 @@ function renderChannelList(){
         enabled:d.querySelector('[data-f="enabled"]').checked,
         app_id:gv("app_id").trim(),
         app_secret:sec,
-        allow_from:gv("allow_from").split(",").map(s=>s.trim()).filter(Boolean),
+        dm_policy:gv("dm_policy"),
+        policy_list:gv("policy_list").split(",").map(s=>s.trim()).filter(Boolean),
         show_process:gv("show_process")
       }});
       toast("已保存，通道重载中…");
