@@ -354,9 +354,14 @@ fn build_tool_list(config: &Config) -> Vec<Value> {
 
 // ---------- HTTP 路由 ----------
 
-/// GET /：内嵌的单页 UI（W3 填充，当前为占位壳）
-async fn index() -> Html<&'static str> {
-    Html(include_str!("web_ui.html"))
+/// GET /：内嵌的单页 UI。
+/// no-cache：HTML 编译期内嵌，每次发版后浏览器若拿旧缓存 JS 会静默丢新事件类型
+/// （8/25 实锤：旧页面无 gActRender，3593 条过程事件全部丢弃）——必须每次回源验证
+async fn index() -> impl axum::response::IntoResponse {
+    (
+        [("Cache-Control", "no-cache")],
+        Html(include_str!("web_ui.html")),
+    )
 }
 
 /// 上传扩展名白名单（只收文本类，v0.1 克制清单）
