@@ -147,6 +147,7 @@ textarea[readonly]{color:var(--dim)}
 .gact .gacth{font-size:11.5px;cursor:pointer;user-select:none;opacity:.85}
 .gact .gacth:hover{opacity:1}
 .gact .gacts{font-size:10px;color:var(--dim);border:1px solid var(--line);border-radius:6px;padding:0 6px;margin-left:4px}
+.gact .gacttools{font-size:10.5px;color:var(--fg);opacity:.8;margin-left:6px}
 .gact .gactb{max-height:260px;overflow-y:auto;padding:4px 0 2px}
 .gact.closed .gactb{display:none}
 .gact.closed .gacth::after{content:" ▸";color:var(--dim)}
@@ -957,6 +958,13 @@ function appendGroupEvent(ev){
    回放路径同函数，天然一致 */
 let gActCur=null;
 function gActClose(){gActCur=null}
+/* 头部工具标签：折叠态也能一眼看到调过哪些工具（name×次数） */
+function gActChips(box){
+  const el=box.querySelector(".gacttools");
+  const names=Object.keys(box._tools||{});
+  if(!el)return;
+  el.textContent=names.length?("· "+names.map(n=>n.replace(/^mcp_[a-z0-9_]*?_/,"").slice(0,24)+"×"+box._tools[n]).join(" ")):"";
+}
 function gActRender(ev){
   const g=store.groups[store.groupView]||{};
   const from=ev.from||"?";
@@ -966,13 +974,13 @@ function gActRender(ev){
     box.className="gact closed";box.dataset.from=from;
     const hd=document.createElement("div");
     hd.className="gacth";hd.style.color=st.clr;
-    hd.innerHTML=st.sym+" "+esc(st.disp)+" <span class=\"gacts\">过程</span>";
+    hd.innerHTML=st.sym+" "+esc(st.disp)+" <span class=\"gacts\">过程</span><span class=\"gacttools\"></span>";
     hd.onclick=()=>box.classList.toggle("closed");
     const body=document.createElement("div");
     body.className="gactb";
     box.appendChild(hd);box.appendChild(body);
     flow.appendChild(box);
-    gActCur=box;box._think=null;box._tool=null;box._n=0;
+    gActCur=box;box._think=null;box._tool=null;box._n=0;box._tools={};
     scrollBottom();
   }
   const box=gActCur,body=box.querySelector(".gactb");
@@ -990,13 +998,19 @@ function gActRender(ev){
     tb.scrollTop=tb.scrollHeight;
   }else if(ev.kind==="tool_call"||ev.kind=="tool_result"){
     let p={};try{p=JSON.parse(ev.text||"{}")}catch(e){}
+    /* 思考块就地收束：工具块按时间序插入，不被几千行思考增量压底；
+       工具后的思考开新块——时序观感与单聊一致（8/25 用户实测反馈修复） */
+    box._think=null;
     if(ev.kind==="tool_call"){
       const d=document.createElement("div");d.className="toolblk";
+      const args=typeof p.arguments==="string"?p.arguments:JSON.stringify(p.arguments||{});
       d.innerHTML='<div class="thead">'+toolIcon(p.name||"?")+
-        ' <span class="tn">'+esc(p.name||"?")+'</span> <span class="args">'+esc(typeof p.arguments==="string"?String(p.arguments).slice(0,80):JSON.stringify(p.arguments||{}).slice(0,80))+"</span></div>"+
+        ' <span class="tn">'+esc(p.name||"?")+'</span> <span class="args">'+esc(String(args).slice(0,80))+"</span></div>"+
         '<div class="tbody"></div>';
       d.querySelector(".thead").onclick=()=>d.classList.toggle("open");
       body.appendChild(d);box._tool=d;
+      const tn=p.name||"?";box._tools[tn]=(box._tools[tn]||0)+1;
+      gActChips(box);
     }else{
       const t=box._tool;
       const out=String(p.output??"");
