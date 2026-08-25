@@ -607,6 +607,11 @@ async fn run_serve(config_path: Option<String>) -> MainResult<()> {
 async fn main() -> MainResult<()> {
     let cli = Cli::parse();
 
+    // rustls 0.23：crypto provider 必须进程级显式安装（否则首次 wss/TLS 握手
+    // panic=abort → 服务直接崩。2026-08-25 频道测试触发崩溃循环 19 次的教训）。
+    // Cargo.toml 已选 ring feature，这里再显式装一次，双保险防依赖树变化稀释
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // serve 子命令：不进交互/单次流程，自己管配置加载（initialize 请求可覆盖）
     if let Some(Commands::Serve) = &cli.command {
         return run_serve(cli.config.clone()).await;

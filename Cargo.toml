@@ -39,6 +39,10 @@ axum = { version = "0.7", features = ["ws", "multipart"] }
 
 # 飞书 WS 长连接（channels 模块）
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# rustls 显式选 ring provider（2026-08-25 崩溃循环修复：rustls 0.23 起 crypto
+# provider 不再隐式确定，tokio-tungstenite 的 feature 不带 provider，
+# 首次 wss 握手 panic=abort → 服务崩溃循环 19 次）
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 # L3 向量索引（可选，feature gate）
 rusqlite = { version = "0.31" }
