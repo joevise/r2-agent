@@ -1445,8 +1445,11 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
 // 私聊消息路由到它自己的持久 AgentSession（每 (agent, open_id) 一个），回复发回飞书。
 // dm_sessions 与 state.agent 主槽位完全隔离：main console 会话不受任何影响。
 
-/// DM prompt 超时（秒）
-const DM_PROMPT_TIMEOUT_SECS: u64 = 120;
+/// DM prompt 超时（秒）。8/25 用户实测：复杂任务（思考+工具链）120s 截断太短——
+/// 提到 600s 与后台任务同档；Console 单聊本就无超时
+const DM_PROMPT_TIMEOUT_SECS: u64 = 600;
+/// none 档心跳间隔：静默处理超 2 分钟时告知用户还活着（compact/full 有过程流不需）
+const DM_HEARTBEAT_SECS: u64 = 120;
 /// 单个 DM 会话排队上限（满了回"忙"）
 const DM_QUEUE_MAX: usize = 8;
 /// full 档思考流累计多少字发一段
@@ -1655,8 +1658,10 @@ async fn handle_dm(
             .await;
         return;
     }
-    // 收到确认：贴 Typing 表情（成功后回复完换 👍；失败静默不影响主链路）
-    let _ = client.add_reaction(&dm.message_id, "Typing").await;
+    // 收到确认：贴 Typing 表情（成功后回复完换 👍；失败记日志方便诊断权限缺失）
+    if let Err(e) = client.add_reaction(&dm.message_id, "Typing").await {
+        eprintln!("[feishu] Typing 表情贴失败（检查 im:message.reaction:write 权限是否开通并重新发布）：{e}");
+    }
     // b. 非文本消息（图片等 text 为空）
     if dm.text.trim().is_empty() {
         let _ = client.send_text(&dm.open_id, "v1 只支持文本消息").await;
@@ -1802,32 +1807,54 @@ async fn run_dm_prompt(
             }
         }
     });
-    // prompt 主体（超时 120s）
-    let result = tokio::time::timeout(
-        Duration::from_secs(DM_PROMPT_TIMEOUT_SECS),
-        session.prompt(text),
-    )
-    .await;
-    if result.is_ok() {
+    // prompt 主体：deadline 兜底 + none 档心跳（select 循环，心跳不打断 prompt）
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(DM_PROMPT_TIMEOUT_SECS);
+    let mut prompt_fut = Box::pin(session.prompt(text));
+    let timed_out;
+    let result = loop {
+        tokio::select! {
+            r = &mut prompt_fut => {
+                timed_out = false;
+                break r;
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                timed_out = true;
+                break Ok(String::new());
+            }
+            _ = tokio::time::sleep(Duration::from_secs(DM_HEARTBEAT_SECS)) => {
+                // none 档静默期防“假死”观感（compact/full 本身有过程流）
+                if mode == ShowProcess::None {
+                    let _ = client.send_text(open_id, "⏳ 仍在处理中…").await;
+                }
+            }
+        }
+    };
+    if !timed_out {
         // 等消费任务收尾（flush 残余思考流）；Done/Error 后它自行退出
         let _ = tokio::time::timeout(Duration::from_secs(2), consumer).await;
     } else {
         consumer.abort();
     }
     // f. 最终回复 / 错误摘要；完成后贴 👍 换掉收到时的 Typing 表情（成功确认）
-    match result {
-        Ok(Ok(reply)) => {
-            let _ = client.send_text(open_id, &reply).await;
-            let _ = client.add_reaction(message_id, "THUMBSUP").await;
-        }
-        Ok(Err(e)) => {
-            let brief: String = e.chars().take(200).collect();
-            let _ = client.send_text(open_id, &format!("（出错：{brief}）")).await;
-        }
-        Err(_) => {
-            let _ = client
-                .send_text(open_id, "（超时 120 秒，未能完成回复）")
-                .await;
+    if timed_out {
+        let _ = client
+            .send_text(
+                open_id,
+                &format!("（超时 {DM_PROMPT_TIMEOUT_SECS} 秒，未能完成回复）"),
+            )
+            .await;
+    } else {
+        match result {
+            Ok(reply) => {
+                let _ = client.send_text(open_id, &reply).await;
+                if let Err(e) = client.add_reaction(message_id, "THUMBSUP").await {
+                    eprintln!("[feishu] 👍 表情贴失败：{e}");
+                }
+            }
+            Err(e) => {
+                let brief: String = e.chars().take(200).collect();
+                let _ = client.send_text(open_id, &format!("（出错：{brief}）")).await;
+            }
         }
     }
 }
