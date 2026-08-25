@@ -863,7 +863,11 @@ async fn connect_and_run(inner: &Arc<Inner>, ep: &EndpointInfo) -> Result<String
                         }
                     }
                     Some(Ok(Message::Close(_))) => return Ok("对端关闭".to_string()),
-                    Some(Ok(_)) => {} // ping/pong/text 等忽略（tungstenite 自动回协议层 pong）
+                    // 协议层 ping/pong/text 也算活性（node-sdk 同款：任何入站帧都
+                    // clearLiveness——只认 Binary 会把健康连接误杀，3 分钟周期断连实锤）
+                    Some(Ok(_)) => {
+                        last_inbound = Instant::now();
+                    }
                     Some(Err(e)) => return Err(format!("WS 读错误: {e}")),
                     None => return Ok("流结束".to_string()),
                 }
