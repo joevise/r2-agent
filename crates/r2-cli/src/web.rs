@@ -1596,6 +1596,9 @@ fn speaking_to_force_next(g: &groups::GroupConfig, target: &str) -> Option<Strin
 /// 单事件文本化（群上下文用）
 fn event_text(e: &GroupEvent) -> String {
     match e {
+        // 过程事件是给人看的可观测数据，不进 LLM 群上下文（防膨胀）；
+        // 空串在 stream_context 拼接时破过滤掉
+        GroupEvent::MemberActivity { .. } => String::new(),
         GroupEvent::Message { from, text, .. } => format!("{from}: {text}"),
         GroupEvent::Mention {
             from,
@@ -1623,8 +1626,13 @@ fn event_text(e: &GroupEvent) -> String {
 /// 群上下文：最近 max_events 条、max_chars 字符上限（从头部截断保最近）
 fn stream_context(dir: &Path, max_events: usize, max_chars: usize) -> String {
     let events = groups::read_stream(dir);
+    // 过程事件（思考/工具）不进上下文：结论已沉淀在 Message/Summary 里
+    let events: Vec<&GroupEvent> = events
+        .iter()
+        .filter(|e| !matches!(e, GroupEvent::MemberActivity { .. }))
+        .collect();
     let start = events.len().saturating_sub(max_events);
-    let s = events[start..].iter().map(event_text).collect::<Vec<_>>().join("\n");
+    let s = events[start..].iter().map(|e| event_text(e)).filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n");
     if s.chars().count() <= max_chars {
         return s;
     }
@@ -1739,6 +1747,44 @@ fn group_note_failure(state: &WebState, sid: &str, dir: &Path, streak: u32, err:
     true
 }
 
+/// 成员过程事件转发：AgentSession 事件流 → MemberActivity（全量存档 + 实时广播）。
+/// thinking 增量逐条转发（前端合并渲染，回放同样合并）；工具调用/结果带完整参数与输出。
+/// 挂在会话生命周期上，会话 drop 后自动退出；返回 JoinHandle 供调用方在轮次结束时 abort。
+fn spawn_activity_forward(
+    state: &Arc<WebState>,
+    sid: &str,
+    dir: &Path,
+    from: &str,
+    session: &AgentSession,
+) -> tokio::task::JoinHandle<()> {
+    let mut rx = session.subscribe();
+    let state = state.clone();
+    let sid = sid.to_string();
+    let dir = dir.to_path_buf();
+    let from = from.to_string();
+    tokio::spawn(async move {
+        while let Ok(e) = rx.recv().await {
+            let ev = match e {
+                r2_core::AgentEvent::Thinking(t) => {
+                    GroupEvent::member_activity(&from, "thinking", &t)
+                }
+                r2_core::AgentEvent::ToolCall { name, arguments } => {
+                    let payload =
+                        serde_json::json!({"name": name, "arguments": arguments}).to_string();
+                    GroupEvent::member_activity(&from, "tool_call", &payload)
+                }
+                r2_core::AgentEvent::ToolResult { name, output } => {
+                    let payload =
+                        serde_json::json!({"name": name, "output": output}).to_string();
+                    GroupEvent::member_activity(&from, "tool_result", &payload)
+                }
+                _ => continue,
+            };
+            let _ = append_and_broadcast(&state, &sid, &dir, &ev);
+        }
+    })
+}
+
 /// 收敛：main persona 读全流生成 Summary → state summarized
 async fn run_group_summary(state: &Arc<WebState>, sid: &str) {
     let dir = group_dir_path(&state.session_dir, sid);
@@ -1753,12 +1799,15 @@ async fn run_group_summary(state: &Arc<WebState>, sid: &str) {
     let prompt = build_summary_prompt(&g, &dir);
     let outcome = match AgentSession::new(cfg) {
         Ok(mut s) => {
-            match tokio::time::timeout(
+            // 小结轮过程同样全量可观测（from=main）
+            let fwd = spawn_activity_forward(state, sid, &dir, MAIN, &s);
+            let r = tokio::time::timeout(
                 std::time::Duration::from_secs(GROUP_TURN_TIMEOUT_SECS),
                 s.prompt(&prompt),
             )
-            .await
-            {
+            .await;
+            fwd.abort();
+            match r {
                 Ok(Ok(text)) => Some(text),
                 Ok(Err(e)) => {
                     let _ = append_and_broadcast(state, sid, &dir, &GroupEvent::error(&format!("小结生成失败：{e}")));
@@ -1834,9 +1883,11 @@ async fn run_group_turn(state: Arc<WebState>, sid: String, seq: u64) {
             }
         };
         // usage 捕获（UsageUpdate 在 Done 前发出，会话级累计；本会话只跑一轮，直接取值）
+        // 过程事件捕获（全量存档）：思考/工具调用/结果 → MemberActivity 进 stream.jsonl + 实时广播
         let usage = Arc::new(StdMutex::new(r2_core::types::UsageStats::default()));
         let usage2 = usage.clone();
         let mut rx = session.subscribe();
+        let fwd = spawn_activity_forward(&state, &sid, &dir, &name, &session);
         let cap = tokio::spawn(async move {
             while let Ok(e) = rx.recv().await {
                 if let r2_core::AgentEvent::UsageUpdate(u) = e {
@@ -1850,6 +1901,7 @@ async fn run_group_turn(state: Arc<WebState>, sid: String, seq: u64) {
         )
         .await;
         cap.abort();
+        fwd.abort();
 
         let text = match result {
             Ok(Ok(text)) => text,
@@ -2012,12 +2064,15 @@ async fn run_group_subtask(state: Arc<WebState>, sid: String, to: String, prompt
     );
     let outcome = match AgentSession::new(cfg) {
         Ok(mut s) => {
-            match tokio::time::timeout(
+            // 子任务执行过程同样全量可观测（from=受任成员）
+            let fwd = spawn_activity_forward(&state, &sid, &dir, &to, &s);
+            let r = tokio::time::timeout(
                 std::time::Duration::from_secs(GROUP_TURN_TIMEOUT_SECS),
                 s.prompt(&full),
             )
-            .await
-            {
+            .await;
+            fwd.abort();
+            match r {
                 Ok(Ok(text)) => Some(text),
                 Ok(Err(e)) => {
                     let _ = append_and_broadcast(&state, &sid, &dir, &GroupEvent::error(&format!("子任务执行失败（{to}）：{e}")));

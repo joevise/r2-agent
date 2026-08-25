@@ -140,6 +140,15 @@ fn default_state() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GroupEvent {
+    /// 成员轮次过程事件（全量存档：思考全文/工具调用/结果，可观测可回放）
+    MemberActivity {
+        from: String,
+        /// thinking | tool_call | tool_result
+        kind: String,
+        /// thinking=全文；tool_call=JSON{name,arguments}；tool_result=JSON{name,output}
+        text: String,
+        ts: u64,
+    },
     /// 普通发言，from = "user" 或成员名
     Message { from: String, text: String, ts: u64 },
     /// @提及（唤醒权只属于人，引擎层校验）
@@ -171,6 +180,15 @@ pub enum GroupEvent {
 }
 
 impl GroupEvent {
+    pub fn member_activity(from: &str, kind: &str, text: &str) -> Self {
+        Self::MemberActivity {
+            from: from.into(),
+            kind: kind.into(),
+            text: text.into(),
+            ts: now_ts(),
+        }
+    }
+
     pub fn message(from: &str, text: &str) -> Self {
         Self::Message {
             from: from.into(),
@@ -713,6 +731,38 @@ mod tests {
         match &events[2] {
             GroupEvent::Subtask { state, .. } => assert_eq!(state, "pending"),
             other => panic!("期望 subtask，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_member_activity_roundtrip() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        append_event(dir, &GroupEvent::message("user", "议题")).unwrap();
+        append_event(dir, &GroupEvent::member_activity("cfo", "thinking", "让我算算…")).unwrap();
+        append_event(
+            dir,
+            &GroupEvent::member_activity(
+                "cfo",
+                "tool_call",
+                "{\"name\":\"bash\",\"arguments\":{\"cmd\":\"ls\"}}",
+            ),
+        )
+        .unwrap();
+        append_event(dir, &GroupEvent::message("cfo", "结论")).unwrap();
+        let events = read_stream(dir);
+        assert_eq!(events.len(), 4);
+        match &events[1] {
+            GroupEvent::MemberActivity { from, kind, text, .. } => {
+                assert_eq!((from.as_str(), kind.as_str()), ("cfo", "thinking"));
+                assert_eq!(text, "让我算算…");
+            }
+            other => panic!("期望 member_activity，实际 {other:?}"),
+        }
+        // 老事件不受影响
+        match &events[3] {
+            GroupEvent::Message { from, .. } => assert_eq!(from, "cfo"),
+            other => panic!("期望 message，实际 {other:?}"),
         }
     }
 

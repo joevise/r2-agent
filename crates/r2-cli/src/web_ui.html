@@ -143,6 +143,14 @@ textarea[readonly]{color:var(--dim)}
 .gname{font-size:11.5px;margin-right:6px}
 .hl{color:#e0b070;background:rgba(224,176,112,.12);border-radius:3px;padding:0 2px}
 .gsum{margin:10px 0;border:1px dashed var(--line);border-radius:8px;padding:8px 12px;color:var(--dim)}
+.gact{margin:4px 0 4px 8px;border-left:2px solid var(--line);padding-left:8px;opacity:.92}
+.gact .gacth{font-size:11.5px;cursor:pointer;user-select:none;opacity:.85}
+.gact .gacth:hover{opacity:1}
+.gact .gacts{font-size:10px;color:var(--dim);border:1px solid var(--line);border-radius:6px;padding:0 6px;margin-left:4px}
+.gact .gactb{max-height:260px;overflow-y:auto;padding:4px 0 2px}
+.gact.closed .gactb{display:none}
+.gact.closed .gacth::after{content:" ▸";color:var(--dim)}
+.gact:not(.closed) .gacth::after{content:" ▾";color:var(--dim)}
 .gsum .gsumh{text-align:center;color:var(--fg);font-size:11px;letter-spacing:2px}
 .gsum .gsumb{white-space:pre-wrap;word-break:break-all;margin-top:4px}
 /* skills */
@@ -927,8 +935,9 @@ function renderSubtask(ev){
 function appendGroupEvent(ev){
   if(!ev||!ev.type)return;
   switch(ev.type){
-    case"message":gmsgRender(ev,false);break;
-    case"mention":gmsgRender(ev,true);break;
+    case"member_activity":gActRender(ev);break;
+    case"message":gmsgRender(ev,false);gActClose();break;
+    case"mention":gmsgRender(ev,true);gActClose();break;
     case"summary":{
       const d=document.createElement("div");d.className="gsum";
       d.innerHTML='<div class="gsumh">── 总结 ──</div><div class="gsumb">'+esc(ev.text||"")+'</div>';
@@ -940,6 +949,62 @@ function appendGroupEvent(ev){
     case"subtask":renderSubtask(ev);break;
     default:break;
   }
+}
+/* 成员过程渲染：同一成员的连续过程事件归入一个折叠容器（头部可点开合）
+   - thinking 增量 → 容器内 thinkblk 续写
+   - tool_call/tool_result → 容器内 toolblk（单聊同款样式）
+   - 该成员正式发言（Message）时关闭容器，下轮过程新建
+   回放路径同函数，天然一致 */
+let gActCur=null;
+function gActClose(){gActCur=null}
+function gActRender(ev){
+  const g=store.groups[store.groupView]||{};
+  const from=ev.from||"?";
+  const st=memberStyle(g,from);
+  if(!gActCur||gActCur.dataset.from!==from){
+    const box=document.createElement("div");
+    box.className="gact closed";box.dataset.from=from;
+    const hd=document.createElement("div");
+    hd.className="gacth";hd.style.color=st.clr;
+    hd.innerHTML=st.sym+" "+esc(st.disp)+" <span class=\"gacts\">过程</span>";
+    hd.onclick=()=>box.classList.toggle("closed");
+    const body=document.createElement("div");
+    body.className="gactb";
+    box.appendChild(hd);box.appendChild(body);
+    flow.appendChild(box);
+    gActCur=box;box._think=null;box._tool=null;box._n=0;
+    scrollBottom();
+  }
+  const box=gActCur,body=box.querySelector(".gactb");
+  box._n++;
+  box.querySelector(".gacts").textContent="过程 ×"+box._n;
+  if(ev.kind==="thinking"){
+    if(!box._think){
+      const t=document.createElement("div");t.className="thinkblk";
+      t.innerHTML='<div class="thead">💭 思考</div><div class="tbody"></div>';
+      t.querySelector(".thead").onclick=()=>t.classList.toggle("closed");
+      body.appendChild(t);box._think=t;
+    }
+    const tb=box._think.querySelector(".tbody");
+    tb.appendChild(document.createTextNode(ev.text||""));
+    tb.scrollTop=tb.scrollHeight;
+  }else if(ev.kind==="tool_call"||ev.kind=="tool_result"){
+    let p={};try{p=JSON.parse(ev.text||"{}")}catch(e){}
+    if(ev.kind==="tool_call"){
+      const d=document.createElement("div");d.className="toolblk";
+      d.innerHTML='<div class="thead">'+toolIcon(p.name||"?")+
+        ' <span class="tn">'+esc(p.name||"?")+'</span> <span class="args">'+esc(typeof p.arguments==="string"?String(p.arguments).slice(0,80):JSON.stringify(p.arguments||{}).slice(0,80))+"</span></div>"+
+        '<div class="tbody"></div>';
+      d.querySelector(".thead").onclick=()=>d.classList.toggle("open");
+      body.appendChild(d);box._tool=d;
+    }else{
+      const t=box._tool;
+      const out=String(p.output??"");
+      if(t){t.querySelector(".tbody").textContent=out;t.classList.add("open");box._tool=null}
+      else{const n=document.createElement("div");n.className="toolblk open";n.innerHTML='<div class="thead">'+toolIcon(p.name||"?")+' <span class="tn">'+esc(p.name||"?")+"</span></div><div class=\"tbody\"></div>";n.querySelector(".tbody").textContent=out;body.appendChild(n)}
+    }
+  }
+  scrollBottom();
 }
 function onGroupEvent(j){
   const id=j.id,ev=j.event;
