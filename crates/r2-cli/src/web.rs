@@ -26,6 +26,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
+use toml;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 /// 上传大小上限：10MB
@@ -104,6 +105,22 @@ fn apply_persona(name: &str, cfg: &mut Config) {
             }
         }
     }
+    // 分身自己的 MCP.toml 叠加（一亩三分地读侧：agent 用 mcp 工具装的 server
+    // 写在自己目录，这里 upsert 进会话配置；同名覆盖全局，幂等可重复调用）
+    let mcp_toml = dir.join("MCP.toml");
+    if let Ok(content) = std::fs::read_to_string(&mcp_toml) {
+        if let Ok(v) = toml::from_str::<toml::Value>(&content) {
+            let servers: Vec<config::McpServerConfig> = v
+                .get("mcp")
+                .and_then(|m| m.get("servers"))
+                .and_then(|s| s.clone().try_into().ok())
+                .unwrap_or_default();
+            for s in servers {
+                cfg.mcp.servers.retain(|x| x.name != s.name);
+                cfg.mcp.servers.push(s);
+            }
+        }
+    }
 }
 
 /// 当前生效配置副本（含当前 agent 的分身叠加）
@@ -119,9 +136,11 @@ fn config_snapshot_fresh_mcp(state: &WebState) -> Config {
     let mut cfg = config_snapshot(state);
     if let Some(p) = cfg.source_path.clone() {
         if let Ok(fresh) = Config::load_from_file(&p) {
-            cfg.mcp = fresh.mcp;
+            cfg.mcp = fresh.mcp; // 全局原文（此时不含分身条目）
         }
     }
+    // 全局刷新会抹掉 apply_persona 的分身合并，重放一次（幂等）
+    apply_persona(&current_agent_name(state), &mut cfg);
     cfg
 }
 
@@ -343,7 +362,7 @@ fn state_json(state: &WebState) -> Value {
 /// 启动时构造工具清单快照（与 Agent 同源的注册表，含 MCP 连接）
 fn build_tool_list(config: &Config) -> Vec<Value> {
     let work_dir = config::expand_tilde(&config.agent.work_dir);
-    let Ok(mut registry) = ToolRegistry::new_default(&work_dir, &config.sandbox, config.source_path.as_deref()) else {
+    let Ok(mut registry) = ToolRegistry::new_default(&work_dir, &config.sandbox, config.mcp_write_path().as_deref()) else {
         return Vec::new();
     };
     registry.connect_mcp(&config.mcp);
@@ -1693,12 +1712,12 @@ async fn handle_dm(
             // 飞书会话 = 该 agent 的一个普通会话：config 快照 + apply_persona
             // （session.dir 指向 ~/.r2/agents/<agent>/sessions，历史可审计、Console 可见）
             let mut cfg = state.config.lock().expect("config 锁中毒").clone();
-            apply_persona(&agent, &mut cfg);
             if let Some(p) = cfg.source_path.clone() {
                 if let Ok(fresh) = Config::load_from_file(&p) {
-                    cfg.mcp = fresh.mcp; // 与 config_snapshot_fresh_mcp 同款：mcp 段从源文件刷新
+                    cfg.mcp = fresh.mcp; // 全局原文（不含分身条目）
                 }
             }
+            apply_persona(&agent, &mut cfg); // 含分身 MCP.toml upsert（同 config_snapshot_fresh_mcp）
             let session = match AgentSession::new(cfg) {
                 Ok(s) => s,
                 Err(e) => {

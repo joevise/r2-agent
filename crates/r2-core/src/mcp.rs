@@ -38,6 +38,7 @@ impl McpConnection {
     pub fn connect(cfg: &McpServerConfig) -> Result<Self, String> {
         let mut child = Command::new(&cfg.command)
             .args(&cfg.args)
+            .envs(&cfg.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // stderr 丢弃：不接盘会写满管道把 server 卡死；调试用 RUST_LOG 看 tracing
@@ -470,6 +471,7 @@ mod tests {
             name: "ghost".to_string(),
             command: "/nonexistent/mcp-server".to_string(),
             args: vec![],
+            env: Default::default(),
         };
         let result = McpConnection::connect(&cfg);
         assert!(result.is_err());

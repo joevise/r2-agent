@@ -72,6 +72,15 @@ impl McpAdminTool {
             let args: Vec<String> = s.args.iter().map(|a| Self::toml_quote(a)).collect();
             out.push_str(&format!("args = [{}]\n", args.join(", ")));
         }
+        if !s.env.is_empty() {
+            // 内联表：与 config.toml 现有 env = { KEY = "value" } 风格一致
+            let pairs: Vec<String> = s
+                .env
+                .iter()
+                .map(|(k, v)| format!("{} = {}", k, Self::toml_quote(v)))
+                .collect();
+            out.push_str(&format!("env = {{ {} }}\n", pairs.join(", ")));
+        }
         out
     }
 
@@ -102,6 +111,16 @@ impl McpAdminTool {
                     .collect()
             })
             .unwrap_or_default();
+        // 可选环境变量注入（如 API key：{"TAVILY_API_KEY": "tvly-..."}）
+        let env: std::collections::HashMap<String, String> = input
+            .get("env")
+            .and_then(|v| v.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let path = self.resolve_path();
         match self.current_servers(&path) {
@@ -119,6 +138,7 @@ impl McpAdminTool {
             name: name.clone(),
             command,
             args,
+            env,
         };
         // append：文件不存在则创建（新文件只含本块，仍是合法 TOML）
         let append = Self::server_block(&server);

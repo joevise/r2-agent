@@ -41,8 +41,11 @@ const ENV_WHITELIST: &[&str] = &[
     "R2_CGROUP_JOIN",
 ];
 
-/// 清洗后的 PATH：防止用户 PATH 注入
-const SANDBOX_PATH: &str = "/usr/bin:/bin";
+/// 清洗后的系统 PATH 前缀：防止用户 PATH 注入。
+/// HOME 相关目录在 clean_env 里运行时拼接（const 里写不了 ~）：
+/// ~/.local/bin 和 ~/.hermes/node/bin 是 node/npx/npm 所在地，不拼上沙箱内
+/// npx 会 command not found（跑 MCP / 装包都靠它）
+const SANDBOX_SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/local/bin:/snap/bin";
 
 /// 沙箱配置快照（从 Config 提取，bash 工具持有）
 pub struct Sandbox {
@@ -282,7 +285,11 @@ fn clean_env(cmd: &mut tokio::process::Command) {
     for (k, v) in kept {
         cmd.env(k, v);
     }
-    cmd.env("PATH", SANDBOX_PATH);
+    let home = std::env::var("HOME").unwrap_or_default();
+    cmd.env(
+        "PATH",
+        format!("{SANDBOX_SYSTEM_PATH}:{home}/.local/bin:{home}/.hermes/node/bin"),
+    );
 }
 
 /// 设置单个 rlimit（pre_exec 闭包内调用，返回 io 错误会中止 exec）

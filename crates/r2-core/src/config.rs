@@ -186,6 +186,10 @@ pub struct McpServerConfig {
     /// 命令参数
     #[serde(default)]
     pub args: Vec<String>,
+    /// 环境变量注入（MCP 子进程环境；同名变量覆盖 r2 进程继承值）。
+    /// MCP 子进程不受沙箱清洗影响（不走 clean_env），原样继承 r2 环境 + 本字段追加
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
 }
 
 fn default_provider() -> String {
@@ -238,13 +242,18 @@ fn default_max_processes() -> usize {
     0
 }
 fn default_max_memory_mb() -> usize {
-    512
+    // 2048：node/npx 工具链虚拟地址空间轻松过 1G，512 会让 npm install OOM
+    2048
 }
 fn default_cpu_time_secs() -> u32 {
-    60
+    // 300：npm install/pip install 的编译步骤 CPU 时间可超 60s（RLIMIT_CPU
+    // 是 CPU 时间非墙钟，IO 等待不计）
+    300
 }
 fn default_max_file_size_mb() -> u32 {
-    100
+    // 2048：npm 大包解压超 100MB（实测 110MB 包被掐）；防写爆磁盘的目的
+    // 由 2G 上限 + 磁盘配额兜底，不再卡正常安装
+    2048
 }
 fn default_cgroup() -> bool {
     // 默认开：cgroup v2 可用时硬限 pids（fork 炸弹真空填补）；不可用自动降级不失败
@@ -363,6 +372,16 @@ pub fn expand_tilde(path: &str) -> String {
 }
 
 impl Config {
+    /// MCP 配置写回路径：分身会话 → 自己目录的 MCP.toml（一亩三分地：
+    /// agent 用 mcp 工具装的 server 只属于自己，不漏给其他分身）；
+    /// main → 全局 config.toml。mcp_admin 工具按此路径持久化
+    pub fn mcp_write_path(&self) -> Option<String> {
+        if let Some(d) = &self.agent.persona_dir {
+            return Some(format!("{d}/MCP.toml"));
+        }
+        self.source_path.clone()
+    }
+
     /// 生成默认配置
     pub fn default_config() -> Self {
         Self {

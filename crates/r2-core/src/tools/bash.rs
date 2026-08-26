@@ -9,7 +9,7 @@ use tokio::process::Command;
 /// 输出上限：64KB
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 /// 超时上限（秒）：参数覆盖也不能超过该值
-const MAX_TIMEOUT_SECS: u64 = 120;
+const MAX_TIMEOUT_SECS: u64 = 600;
 
 /// bash 工具：参数 {"command": "ls -la", "timeout_secs": 可选}
 pub struct BashTool {
@@ -262,7 +262,8 @@ impl Tool for BashTool {
 
     fn description(&self) -> &str {
         "在工作目录内执行 bash 命令。返回 exit_code 和 stdout+stderr（超 64KB 截断）。\
-         默认超时 30s，可用 timeout_secs 覆盖（上限 120s）。"
+         默认超时 30s，可用 timeout_secs 覆盖（上限 600s）。\
+         长任务（npm install / pip install / 大下载）记得显式传 timeout_secs=300~600。"
     }
 
     fn schema(&self) -> serde_json::Value {
@@ -270,7 +271,7 @@ impl Tool for BashTool {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "要执行的 bash 命令"},
-                "timeout_secs": {"type": "integer", "description": "超时秒数（可选，默认 30，上限 120）"}
+                "timeout_secs": {"type": "integer", "description": "超时秒数（可选，默认 30，上限 600；长任务如 npm install 建议 300-600）"}
             },
             "required": ["command"]
         })
