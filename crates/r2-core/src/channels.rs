@@ -423,12 +423,17 @@ impl FeishuClient {
             "body": { "elements": elements }
         });
         let create_url = format!("{}/open-apis/cardkit/v1/cards", self.inner.cfg.domain);
+        // ⚠️ 包装格式（8/26 实测踩坑）：外层 {type:"card_json", data:"<卡JSON字符串>"}——
+        //    data 必须二次序列化为字符串，传嵌套对象会被 99992402 字段校验拒收
         let resp = self
             .inner
             .http
             .post(&create_url)
             .bearer_auth(&token)
-            .json(&serde_json::json!({ "data": card_json }))
+            .json(&serde_json::json!({
+                "type": "card_json",
+                "data": card_json.to_string(),
+            }))
             .send()
             .await
             .map_err(|e| format!("ERROR: 建卡请求失败: {e}"))?;
@@ -526,7 +531,8 @@ impl StreamingCard {
         self.close_streaming().await
     }
 
-    /// 关闭流式模式（卡片定格；finalize 内部调用，也可单独用）
+    /// 关闭流式模式（卡片定格；finalize 内部调用，也可单独用）。
+    /// ⚠️ 必须带 sequence+uuid（8/26 实测：缺 sequence 报 99992402 field validation）
     pub async fn close_streaming(&self) -> Result<(), String> {
         let token = get_token(&self.inner).await?;
         let seq = self.sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -540,7 +546,11 @@ impl StreamingCard {
             .http
             .patch(&url)
             .bearer_auth(&token)
-            .json(&serde_json::json!({ "settings": settings.to_string() }))
+            .json(&serde_json::json!({
+                "settings": settings.to_string(),
+                "sequence": seq,
+                "uuid": format!("c_{}_{}", self.card_id, seq),
+            }))
             .send()
             .await
             .map_err(|e| format!("ERROR: 关闭流式模式失败: {e}"))?;
