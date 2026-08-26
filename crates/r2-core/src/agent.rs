@@ -267,7 +267,6 @@ impl Agent {
         let mut tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox, config.source_path.as_deref())
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         tools.connect_mcp(&config.mcp);
-        tools.connect_feishu_tools(config.agent.persona_dir.as_deref());
         let session = Session::create(&crate::config::expand_tilde(&config.session.dir)).ok();
         #[cfg(feature = "l3-memory")]
         let (memory, embedding) = Self::init_memory(&config);
@@ -317,7 +316,6 @@ impl Agent {
         let mut tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox, config.source_path.as_deref())
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         tools.connect_mcp(&config.mcp);
-        tools.connect_feishu_tools(config.agent.persona_dir.as_deref());
         println!("已恢复会话 {session_id}（{count} 条历史消息）");
         #[cfg(feature = "l3-memory")]
         let (memory, embedding) = Self::init_memory(&config);
@@ -369,7 +367,6 @@ impl Agent {
         let mut tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox, config.source_path.as_deref())
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         tools.connect_mcp(&config.mcp);
-        tools.connect_feishu_tools(config.agent.persona_dir.as_deref());
         println!("已从会话 {parent_session_id} 分叉（继承 {count} 条消息，新会话 {new_id}）");
         #[cfg(feature = "l3-memory")]
         let (memory, embedding) = Self::init_memory(&config);

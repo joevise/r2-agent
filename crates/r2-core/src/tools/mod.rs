@@ -2,7 +2,6 @@
 
 mod bash;
 mod edit;
-mod feishu;
 mod mcp_admin;
 mod read;
 mod summon;
@@ -62,25 +61,6 @@ impl ToolRegistry {
     /// 注册一个外部工具（MCP 适配器用）
     pub(crate) fn push_tool(&mut self, tool: Box<dyn Tool>) {
         self.tools.push(tool);
-    }
-
-    /// 飞书工具族注入（v0.10.4）：有 persona 的会话挂 feishu_send_message/
-    /// feishu_create_doc，以本分身通道的机器人身份调 API。执行时查
-    /// CHANNEL_REGISTRY（通道没启用→工具报明确错误，不会误导 agent 要凭证）。
-    /// main 无 persona_dir 不挂（main 不绑通道）
-    pub(crate) fn connect_feishu_tools(&mut self, persona_dir: Option<&str>) {
-        let Some(dir) = persona_dir else { return };
-        let Some(name) = std::path::Path::new(dir)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .filter(|s| !s.is_empty() && *s != crate::agents::MAIN)
-        else {
-            return;
-        };
-        self.tools
-            .push(Box::new(feishu::FeishuSendTool::new(name)));
-        self.tools
-            .push(Box::new(feishu::FeishuDocTool::new(name)));
     }
 
     /// 导出全部工具的 schema（发给模型）
