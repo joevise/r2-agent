@@ -351,6 +351,78 @@ impl FeishuClient {
         Ok(())
     }
 
+    /// 创建飞书在线文档（Markdown 简化转块：标题/列表/代码/正文；行内样式 v1 不解析）。
+    /// 返回文档 URL。需应用侧 docx:document 权限（错误信息会带一键开通链接）
+    pub async fn create_doc(&self, title: &str, markdown: &str) -> Result<String, String> {
+        let token = get_token(&self.inner).await?;
+        // ① 建空文档
+        let url = format!("{}/open-apis/docx/v1/documents", self.inner.cfg.domain);
+        let resp = self
+            .inner
+            .http
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "title": title }))
+            .send()
+            .await
+            .map_err(|e| format!("ERROR: 建文档请求失败: {e}"))?;
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("ERROR: 建文档响应解析失败: {e}"))?;
+        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            let msg = v
+                .pointer("/error/permission_violations/0/subject")
+                .and_then(|x| x.as_str())
+                .map(|s| format!("缺权限 {s}（到飞书开放平台开通后重新发布）"))
+                .or_else(|| v.get("msg").and_then(|m| m.as_str()).map(String::from))
+                .unwrap_or_else(|| "unknown".into());
+            return Err(format!("ERROR: 建文档失败：{msg}"));
+        }
+        let doc_id = v
+            .pointer("/data/document/document_id")
+            .and_then(|x| x.as_str())
+            .ok_or("ERROR: 建文档响应缺 document_id")?
+            .to_string();
+        // ② Markdown → 块（每批最多 50 块）
+        let blocks = md_to_docx_blocks(markdown);
+        for (i, chunk) in blocks.chunks(50).enumerate() {
+            let url = format!(
+                "{}/open-apis/docx/v1/documents/{doc_id}/blocks/{doc_id}/children",
+                self.inner.cfg.domain
+            );
+            let resp = self
+                .inner
+                .http
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&serde_json::json!({ "children": chunk, "index": i * 50 }))
+                .send()
+                .await
+                .map_err(|e| format!("ERROR: 写文档块请求失败: {e}"))?;
+            let v: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("ERROR: 写文档块响应解析失败: {e}"))?;
+            let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+            if code != 0 {
+                let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown");
+                return Err(format!("ERROR: 写文档块失败 code={code} msg={msg}"));
+            }
+        }
+        // ③ 文档 URL（open.feishu.cn → feishu.cn；海外版同理）
+        let host = self
+            .inner
+            .cfg
+            .domain
+            .trim_start_matches("https://")
+            .trim_start_matches("open.")
+            .trim_end_matches('/')
+            .to_string();
+        Ok(format!("https://{host}/docx/{doc_id}"))
+    }
+
     pub async fn send_text(&self, open_id: &str, text: &str) -> Result<(), String> {
         let token = get_token(&self.inner).await?;
         let url = format!(
@@ -657,6 +729,107 @@ impl Drop for FeishuClient {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// 进程级通道客户端注册表：agent 名 → FeishuClient。
+/// web.rs 频道管理器启停时登记/注销；工具层（feishu_send_message 等）
+/// 按当前 persona 名查找——工具与通道共享同一凭证与 token 缓存，零重复配置
+static CHANNEL_REGISTRY: std::sync::OnceLock<Mutex<HashMap<String, Arc<FeishuClient>>>> =
+    std::sync::OnceLock::new();
+
+/// 登记（频道启动时；同名覆盖）
+pub fn register_channel_client(agent: &str, client: Arc<FeishuClient>) {
+    CHANNEL_REGISTRY
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(agent.to_string(), client);
+}
+
+/// 注销（频道停止时）
+pub fn unregister_channel_client(agent: &str) {
+    if let Some(m) = CHANNEL_REGISTRY.get() {
+        m.lock().unwrap().remove(agent);
+    }
+}
+
+/// 查找（工具执行时；未启用频道返回 None → 工具报错提示）
+pub fn channel_client(agent: &str) -> Option<Arc<FeishuClient>> {
+    CHANNEL_REGISTRY
+        .get()
+        .and_then(|m| m.lock().unwrap().get(agent).cloned())
+}
+
+/// Markdown → 飞书 docx 块（简化映射：#/##/### 标题、- 列表、``` 代码块、其余正文）。
+/// 行内样式（**加粗**等）v1 不解析原样保留（飞书 text_run 要按段拆样式，成本高收益低）
+fn md_to_docx_blocks(markdown: &str) -> Vec<serde_json::Value> {
+    let text_run = |s: &str| {
+        serde_json::json!({
+            "text_run": { "content": s, "text_element_style": {} }
+        })
+    };
+    let mut blocks = Vec::new();
+    let mut code_buf: Vec<String> = Vec::new();
+    let mut in_code = false;
+    for line in markdown.lines() {
+        if line.trim_start().starts_with("```") {
+            if in_code {
+                // 代码块结束 → 整块提交（block_type=14 code）
+                blocks.push(serde_json::json!({
+                    "block_type": 14,
+                    "code": {
+                        "style": {},
+                        "elements": [text_run(&code_buf.join("\n"))]
+                    }
+                }));
+                code_buf.clear();
+            }
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            code_buf.push(line.to_string());
+            continue;
+        }
+        let t = line.trim();
+        let (bt, key) = if t.starts_with("### ") {
+            (3, "heading3")
+        } else if t.starts_with("## ") {
+            (4, "heading2")
+        } else if t.starts_with("# ") {
+            (5, "heading1")
+        } else if t.starts_with('-') || t.starts_with("* ") {
+            (12, "bullet")
+        } else if t.is_empty() {
+            continue; // 空行不建块（docx 段落自带间距）
+        } else {
+            (2, "text")
+        };
+        let content = t
+            .trim_start_matches('#')
+            .trim_start_matches("- ")
+            .trim_start_matches("* ")
+            .trim_start_matches('-')
+            .trim();
+        blocks.push(serde_json::json!({
+            "block_type": bt,
+            key: {
+                "elements": [text_run(content)],
+                "style": {}
+            }
+        }));
+    }
+    // 未闭合的代码块收尾
+    if !code_buf.is_empty() {
+        blocks.push(serde_json::json!({
+            "block_type": 14,
+            "code": {
+                "style": {},
+                "elements": [text_run(&code_buf.join("\n"))]
+            }
+        }));
+    }
+    blocks
 }
 
 /// 按字符数切分文本（不切 UTF-8 边界）

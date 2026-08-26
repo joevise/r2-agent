@@ -1590,6 +1590,8 @@ fn start_feishu_channels(state: &Arc<WebState>) {
     for k in stale {
         if let Some(rt) = table.remove(&k) {
             rt.client.stop();
+            // 同步注销全局注册表（工具层立刻感知通道已下线）
+            r2_core::channels::unregister_channel_client(&k);
         }
     }
     // ② 上新/重启
@@ -1603,12 +1605,16 @@ fn start_feishu_channels(state: &Arc<WebState>) {
         }
         if let Some(old) = table.remove(&name) {
             old.client.stop();
+            r2_core::channels::unregister_channel_client(&name);
         }
         let client = Arc::new(FeishuClient::new(FeishuConfig {
             app_id: cf.app_id.clone(),
             app_secret: cf.app_secret.clone(),
             domain: String::new(), // 空 = 默认 https://open.feishu.cn
         }));
+        // 登记全局注册表：feishu_send_message/feishu_create_doc 工具按 agent 名
+        // 查到这里——工具与通道共享同一凭证与 token 缓存，agent 零配置成本
+        r2_core::channels::register_channel_client(&name, client.clone());
         // on_message 是同步 Fn：里面 tokio::spawn 包异步工作
         let st = state.clone();
         let agent = name.clone();
