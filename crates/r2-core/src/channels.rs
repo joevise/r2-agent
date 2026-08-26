@@ -520,15 +520,28 @@ impl StreamingCard {
         self.flush(true).await
     }
 
-    /// 收尾（不节流）：主区定格 final_text + 保留 note 小字现状 + 关闭 streaming_mode。
+    /// 收尾（不节流）：主区定格 final_text + note 变身状态行（note_override 传 Some 时
+    /// 替换 note 内容——思考流退场，状态行登场）+ 关闭 streaming_mode。
     /// 错误/超时路径同样用它（final_text 传错误消息，用户在卡片主区直接看到）
-    pub async fn finalize(&mut self, final_text: &str) -> Result<(), String> {
+    pub async fn finalize(
+        &mut self,
+        final_text: &str,
+        note_override: Option<&str>,
+    ) -> Result<(), String> {
         self.content_text = final_text.to_string();
+        if let Some(n) = note_override {
+            self.note_text = n.to_string();
+        }
         if self.has_note {
             self.put_note().await?;
         }
         self.put_content().await?;
         self.close_streaming().await
+    }
+
+    /// 这张卡有没有 note 小字区（调用方决定状态行放哪）
+    pub fn has_note(&self) -> bool {
+        self.has_note
     }
 
     /// 关闭流式模式（卡片定格；finalize 内部调用，也可单独用）。

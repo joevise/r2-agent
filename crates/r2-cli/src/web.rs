@@ -1518,6 +1518,17 @@ fn tool_call_summary(name: &str, arguments: &str) -> String {
     format!("🔧 {name} {args}")
 }
 
+/// token 数紧凑格式：999 → 999，1234 → 1.2k，1234567 → 1.2m（状态行用）
+fn fmt_tok(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}m", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 /// 通道状态 → 前端字符串（failed 附带原因）
 fn channel_status_str(st: &ChannelStatus) -> String {
     match st {
@@ -1757,14 +1768,18 @@ async fn run_dm_prompt(
     let mode = show_process_mode(&cf.show_process);
     // ① 流式卡片（Card Kit）：主区=最终回复 markdown 流式渲染，note=灰色小字思考流。
     //    建/发卡任一步失败 → 降级纯文本路径（主链路不受影响），日志留座
-    //    v0.10.2：compact 档 note=工具状态单行；full 档 note=思考流+工具标记；none 无 note
+    //    v0.10.3：note 区两段生命——生成中=过程流，完成后=状态行（模型/token/缓存/费用）
+    //    （none 档也建 note：生成中留空，收尾时变身状态行）
     let card_holder: Arc<tokio::sync::Mutex<Option<r2_core::channels::StreamingCard>>> =
         Arc::new(tokio::sync::Mutex::new(None));
-    match client.start_streaming_card(open_id, mode >= ShowProcess::Compact).await {
+    match client.start_streaming_card(open_id, true).await {
         Ok(c) => *card_holder.lock().await = Some(c),
         Err(e) => eprintln!("[feishu] 流式卡片创建失败，降级纯文本：{e}"),
     }
     let has_card = card_holder.try_lock().map(|g| g.is_some()).unwrap_or(false);
+    // 用量快照：UsageUpdate 在 Done 前发出，消费任务写入，收尾时读出拼状态行
+    let usage_snap: Arc<StdMutex<Option<r2_core::types::UsageStats>>> =
+        Arc::new(StdMutex::new(None));
     // ② 事件消费任务：转发 Console + 卡片流式更新（降级时走纯文本过程消息）
     let mut rx = session.subscribe();
     let etx = state.event_tx.clone();
@@ -1772,6 +1787,7 @@ async fn run_dm_prompt(
     let oid = open_id.to_string();
     let agent2 = agent.to_string();
     let cards = card_holder.clone();
+    let usnap = usage_snap.clone();
     let consumer = tokio::spawn(async move {
         let mut thinking_buf = String::new();
         let mut main_buf = String::new();
@@ -1829,6 +1845,9 @@ async fn run_dm_prompt(
                                     .await;
                             }
                         }
+                        AgentEvent::UsageUpdate(u) => {
+                            *usnap.lock().unwrap() = Some(u.clone());
+                        }
                         AgentEvent::Done { .. } => {
                             // 收尾：flush 残余思考流（降级路径）后退出
                             if mode == ShowProcess::Full && !thinking_buf.is_empty() {
@@ -1876,25 +1895,51 @@ async fn run_dm_prompt(
     } else {
         consumer.abort();
     }
-    // ④ 收尾：卡片路径 finalize（主区定格最终回复+关流式）；降级路径纯文本
+    // ④ 收尾：卡片路径 finalize（主区定格最终回复 + note 变身状态行 + 关流式）；降级路径纯文本
     let succeeded = !timed_out && result.is_ok();
+    // 状态行：模型/token/缓存命中/费用（estimate_cost 与 Console 顶栏同源）
+    let model_name = state.config.lock().expect("config 锁中毒").current_model().to_string();
+    let usage_now = usage_snap.lock().unwrap().clone();
+    let status_line = match &usage_now {
+        Some(u) => {
+            let cache_pct = if u.input_tokens > 0 {
+                u.cached_tokens * 100 / u.input_tokens
+            } else {
+                0
+            };
+            let cost = r2_core::models::estimate_cost(&model_name, u)
+                .map(|c| format!(" · ≈¥{c:.2}"))
+                .unwrap_or_default();
+            format!(
+                "🤖 {model_name} · ↑{} ↓{} tok · 💾 cache {cache_pct}%{cost}",
+                fmt_tok(u.input_tokens),
+                fmt_tok(u.output_tokens)
+            )
+        }
+        None => format!("🤖 {model_name}"),
+    };
     let card_opt = card_holder.lock().await.take();
     if let Some(mut c) = card_opt {
         if timed_out {
             let _ = c
-                .finalize(&format!("（超时 {DM_PROMPT_TIMEOUT_SECS} 秒，未能完成回复）"))
+                .finalize(
+                    &format!("（超时 {DM_PROMPT_TIMEOUT_SECS} 秒，未能完成回复）"),
+                    Some(status_line.as_str()),
+                )
                 .await;
         } else {
             match &result {
                 Ok(reply) => {
-                    if let Err(e) = c.finalize(reply).await {
+                    if let Err(e) = c.finalize(reply, Some(status_line.as_str())).await {
                         eprintln!("[feishu] 卡片收尾失败，改发文本：{e}");
                         let _ = client.send_text(open_id, reply).await;
                     }
                 }
                 Err(e) => {
                     let brief: String = e.chars().take(200).collect();
-                    let _ = c.finalize(&format!("（出错：{brief}）")).await;
+                    let _ = c
+                        .finalize(&format!("（出错：{brief}）"), Some(status_line.as_str()))
+                        .await;
                 }
             }
         }
