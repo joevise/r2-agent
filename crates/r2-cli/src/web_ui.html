@@ -103,6 +103,9 @@ textarea[readonly]{color:var(--dim)}
 #p-channel input[type=text],#p-channel input[type=password],#p-channel select{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);padding:4px 6px;width:100%;outline:none}
 #p-channel input:focus,#p-channel select:focus{border-color:var(--dim)}
 .chcard{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:10px}
+.chcard[data-dirty="1"]{border-color:#e0b070}
+.chdirty{display:none;font-size:10.5px;color:#e0b070;margin-left:auto}
+.chcard[data-dirty="1"] .chdirty{display:inline}
 .chhead{display:flex;align-items:center;gap:8px;margin-bottom:4px}
 .chprov{font-size:10.5px;border:1px solid var(--line);border-radius:10px;padding:0 6px;color:#7ab8d0}
 .chdot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--dim)}
@@ -623,6 +626,11 @@ async function loadAgentFiles(){
     $("#ag-status").textContent="";
   }catch(e){$("#ag-status").textContent="加载失败"}
 }
+/* 未保存提示：编辑任何字段即在状态位亮出（loadAgentFiles 赋值不触发 input） */
+["ag-soul","ag-display","ag-desc","ag-model"].forEach(id=>{
+  const el=document.getElementById(id);
+  if(el)el.addEventListener("input",()=>{$("#ag-status").textContent="未保存"});
+});
 $("#ag-save").onclick=async()=>{
   const name=agentSel,body={name,soul:$("#ag-soul").value};
   if(name!=="main"){
@@ -643,17 +651,24 @@ const CH_PROC={none:"只回最终回复",compact:"工具调用小结",full:"含�
 const CH_POLICY={deny_all:"拒绝所有人",allow_all:"允许所有人",allow_list:"仅允许名单内",deny_list:"拒绝名单内的人"};
 function renderChannelList(){
   const box=$("#chlist");if(!box)return;
+  /* 脏卡片现场值快照：广播触发的重渲不冲掉正在编辑的表单（改了没保存的东西绝不丢） */
+  const dirtySnap={};
+  box.querySelectorAll('.chcard[data-dirty="1"]').forEach(c=>{
+    const f={};
+    c.querySelectorAll("[data-f]").forEach(el=>f[el.dataset.f]=el.type==="checkbox"?el.checked:el.value);
+    dirtySnap[c.dataset.agent]=f;
+  });
   box.innerHTML="";
   const agents=store.agents||[];
   if(!agents.length){box.innerHTML='<div class="empty">暂无分身——先到「分身」页召唤，再回来绑定飞书机器人</div>';return}
   for(const a of agents){
     const ch=(store.channels||[]).find(c=>c.agent===a.name)||{};
     const st=ch.status||"stopped";
-    const d=document.createElement("div");d.className="chcard";
+    const d=document.createElement("div");d.className="chcard";d.dataset.agent=a.name;
     d.innerHTML='<div class="chhead"><b>'+esc(a.display_name||a.name)+'</b>'
       +'<span class="chprov">飞书</span>'
       +'<span class="chdot chdot-'+esc(st)+'" title="'+esc(st)+'"></span>'
-      +'<span class="dim" style="font-size:11px">'+esc(st)+'</span></div>'
+      +'<span class="dim" style="font-size:11px">'+esc(st)+'</span><span class="chdirty">● 未保存</span></div>'
       +'<div class="agfield"><span class="dim">App ID</span><input type="text" data-f="app_id" spellcheck="false" value="'+esc(ch.app_id||"")+'" placeholder="cli_xxx"></div>'
       +'<div class="agfield"><span class="dim">App Secret</span><input type="password" data-f="app_secret" spellcheck="false" value="'+(ch.app_id?"●●●●":"")+'" placeholder="留空 = 不修改"></div>'
       +'<div class="agfield"><span class="dim">DM 准入策略</span><select data-f="dm_policy">'
@@ -663,6 +678,22 @@ function renderChannelList(){
       +["none","compact","full"].map(v=>'<option value="'+v+'"'+((ch.show_process||"compact")===v?' selected':"")+'>'+CH_PROC[v]+'</option>').join("")+'</select></div>'
       +'<div class="prow"><label style="font-size:12px;cursor:pointer"><input type="checkbox" data-f="enabled"'+(ch.enabled?" checked":"")+'> 启用</label></div>'
       +'<div class="prow"><button data-act="save">保存</button><button data-act="test">测试连接</button></div>';
+    /* 恢复脏卡片编辑值（广播重渲后表单内容不丢），并同步名单框显隐 */
+    const snap=dirtySnap[a.name];
+    if(snap){
+      d.querySelectorAll("[data-f]").forEach(el=>{
+        if(el.dataset.f in snap){
+          if(el.type==="checkbox")el.checked=snap[el.dataset.f];
+          else el.value=snap[el.dataset.f];
+        }
+      });
+      d.dataset.dirty="1";
+      const pl=d.querySelector('[data-row="policy_list"]');
+      if(pl)pl.style.display=(snap.dm_policy==="allow_list"||snap.dm_policy==="deny_list")?'flex':'none';
+    }
+    /* 未保存标记：任何输入 → 黄边 + 头部「未保存」徽标 */
+    d.addEventListener("input",()=>d.dataset.dirty="1");
+    d.addEventListener("change",()=>d.dataset.dirty="1");
     /* 策略切到名单型时显隐名单输入框 */
     d.querySelector('[data-f="dm_policy"]').onchange=e=>{
       d.querySelector('[data-row="policy_list"]').style.display=(e.target.value==="allow_list"||e.target.value==="deny_list")?'flex':'none';
@@ -1333,6 +1364,18 @@ function connect(){
       case"group_open":onGroupOpen(j);break;
       case"group_event":onGroupEvent(j);break;
       case"group_state":onGroupState(j);break;
+      /* 频道：保存成功回包 → store 就地合并新配置（不用刷新页面；状态点由
+         channel_status 广播驱动），并清掉该卡片的脏标记 */
+      case"channel_set":{
+        if(j.ok&&j.config){
+          const cs=(store.channels||[]).find(c=>c.agent===j.agent);
+          if(cs)Object.assign(cs,j.config);
+          else store.channels.push(Object.assign({agent:j.agent,status:"stopped"},j.config));
+          const card=document.querySelector('.chcard[data-agent="'+j.agent+'"]');
+          if(card)delete card.dataset.dirty;
+        }
+        break;
+      }
       /* 频道：连接测试回包 → toast + 重渲（恢复按钮/状态点） */
       case"channel_test":
         toast(j.ok?"✅ 连接成功":"❌ "+(j.detail||"连接失败"));

@@ -1435,8 +1435,24 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
                     match agents::save_profile(&p) {
                         Ok(()) => {
                             start_feishu_channels(state);
-                            ws_send(sink, json!({"t": "channel_set", "agent": agent, "ok": true}))
-                                .await;
+                            // 回包带保存后的配置（前端就地更新 store，不用刷新页面）
+                            let cf = &p.channel_feishu;
+                            ws_send(
+                                sink,
+                                json!({
+                                    "t": "channel_set", "agent": agent, "ok": true,
+                                    "config": {
+                                        "enabled": cf.enabled,
+                                        "app_id": cf.app_id,
+                                        "dm_policy": cf.effective_policy().0,
+                                        "policy_list": cf.effective_policy().1,
+                                        "show_process": cf.show_process,
+                                    }
+                                }),
+                            )
+                            .await;
+                            // 全量广播：其他打开的标签页也同步新配置/新通道状态
+                            broadcast_state(state);
                         }
                         Err(e) => ws_error(sink, &format!("保存档案失败：{e}")).await,
                     }
@@ -1609,6 +1625,13 @@ fn start_feishu_channels(state: &Arc<WebState>) {
     for k in stale {
         if let Some(rt) = table.remove(&k) {
             rt.client.stop();
+            // 停用后没有后续 start（永远不会有状态回调）→ 主动广播 stopped，
+            // 前端状态点实时熄灭，不用刷新页面
+            let _ = state.event_tx.send(json!({
+                "t": "channel_status",
+                "agent": k,
+                "status": "stopped",
+            }));
         }
     }
     // ② 上新/重启
