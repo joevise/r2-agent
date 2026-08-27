@@ -332,6 +332,11 @@ fn state_json(state: &WebState) -> Value {
     };
     json!({
         "model": cfg.current_model(),
+        // 可切换模型档案（下拉/命令用；只给名字与模型名，绝不带 key）
+        "model_profiles": cfg.model.profiles.iter()
+            .map(|p| json!({"name": p.name, "model": p.model}))
+            .collect::<Vec<_>>(),
+        "active_profile": cfg.model.active_profile,
         "agents": agents::list_profiles().iter().map(agents::profile_json).collect::<Vec<_>>(),
         "current_agent": current_agent_name(state),
         "channels": channels_json(state),
@@ -773,6 +778,7 @@ enum ClientMsg {
     Fork { parent: String, upto: Option<usize> },
     DeleteSession(String),
     SetModel(String),
+    SetProfile(String),
     TaskApprove(String),
     TaskReject(String),
     TaskPause(String),
@@ -835,6 +841,7 @@ fn parse_client_msg(text: &str) -> Result<ClientMsg, String> {
     "agent_reject" => Ok(ClientMsg::AgentReject(get_str(&v, "name")?.to_string())),
     "agent_switch" => Ok(ClientMsg::AgentSwitch(get_str(&v, "name")?.to_string())),
         "set_model" => Ok(ClientMsg::SetModel(get_str(&v, "model")?.to_string())),
+        "set_profile" => Ok(ClientMsg::SetProfile(get_str(&v, "name")?.to_string())),
         "group_create" => {
             let title = get_str(&v, "title")?.to_string();
             let arr = v
@@ -1164,6 +1171,41 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
             let mut init = state_json(state);
             init["t"] = json!("init");
             let _ = state.event_tx.send(init);
+        }
+        ClientMsg::SetProfile(name) => {
+            // 应用模型档案（跨 provider 整套切换）+ 持久化 + 会话重建（历史保留）
+            let apply_result = {
+                let mut cfg = state.config.lock().expect("config 锁中毒");
+                cfg.apply_profile(&name).map(|_| {
+                    if let Some(p) = cfg.source_path.clone() {
+                        if let Err(e) = persist_active_profile(&p, &name) {
+                            eprintln!("[console] active_profile 持久化失败：{e}");
+                        }
+                    }
+                    cfg.current_model().to_string()
+                })
+            };
+            match apply_result {
+                Ok(model) => {
+                    let mut guard = state.agent.lock().await;
+                    let sid = guard.as_ref().and_then(|s| s.session_id().map(String::from));
+                    *state.steer_tx.lock().expect("steer 锁中毒") = None;
+                    *guard = None;
+                    if let Some(sid) = sid {
+                        let config = config_snapshot(state);
+                        match AgentSession::resume(config, &sid) {
+                            Ok(s) => install_session(state, &mut guard, s),
+                            Err(e) => broadcast_error(state, &format!("模型已切换，但会话重建失败：{e}")),
+                        }
+                    }
+                    drop(guard);
+                    let _ = state
+                        .event_tx
+                        .send(json!({"t": "model_changed", "model": model}));
+                    broadcast_state(state);
+                }
+                Err(e) => ws_error(sink, &e).await,
+            }
         }
         ClientMsg::SetModel(model) => {
             {
@@ -1544,6 +1586,174 @@ fn dm_key(agent: &str, open_id: &str) -> String {
     format!("{agent}|{open_id}")
 }
 
+/// DM 会话用的配置快照：全局运行时配置 + mcp 源文件刷新 + persona 叠加。
+/// handle_dm 创建分支与 /model 原地重建共用（保证两条路拿到同款 config）
+fn dm_config(state: &WebState, agent: &str) -> Config {
+    let mut cfg = state.config.lock().expect("config 锁中毒").clone();
+    if let Some(p) = cfg.source_path.clone() {
+        if let Ok(fresh) = Config::load_from_file(&p) {
+            cfg.mcp = fresh.mcp; // 全局原文（不含分身条目）
+        }
+    }
+    apply_persona(agent, &mut cfg); // 含分身 MCP.toml upsert
+    cfg
+}
+
+/// active_profile 持久化到 config.toml（文本手术：只动 active_profile 一行，
+/// 绝不整体序列化——用户的注释与字段顺序全部保留）。无该行则在 [model] 段头插入
+fn persist_active_profile(path: &str, name: &str) -> Result<(), String> {
+    let content = std::fs::read_to_string(path).map_err(|e| format!("读配置失败：{e}"))?;
+    let line = format!("active_profile = \"{name}\"");
+    let mut out: Vec<String> = Vec::new();
+    let mut replaced = false;
+    let mut in_model = false;
+    for l in content.lines() {
+        if l.trim_start().starts_with("[model]") && !l.trim_start().starts_with("[model.") {
+            in_model = true;
+            out.push(l.to_string());
+            if !replaced {
+                out.push(line.clone());
+                replaced = true;
+            }
+            continue;
+        }
+        if l.trim_start().starts_with('[') && !l.trim_start().starts_with("[model") {
+            in_model = false;
+        }
+        if !replaced && in_model && l.trim_start().starts_with("active_profile") {
+            out.push(line.clone());
+            replaced = true;
+            continue;
+        }
+        out.push(l.to_string());
+    }
+    if !replaced {
+        return Err("config.toml 缺 [model] 段，无法持久化 active_profile".into());
+    }
+    let mut s = out.join("\n");
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
+    std::fs::write(path, s).map_err(|e| format!("写配置失败：{e}"))
+}
+
+/// 飞书 DM 斜杠命令（纯文本入口无 UI 控件，命令是刚需；Console/CLI 不需要）。
+/// 返回 Some(回复文本) = 命令已处理，不再进 prompt
+async fn dm_slash_command(
+    state: &Arc<WebState>,
+    agent: &str,
+    dm_sess: &Arc<DmSession>,
+    client: &Arc<FeishuClient>,
+    open_id: &str,
+    text: &str,
+) -> Option<String> {
+    let t = text.trim();
+    if !t.starts_with('/') {
+        return None;
+    }
+    let (cmd, arg) = match t.find(' ') {
+        Some(i) => (&t[..i], t[i + 1..].trim()),
+        None => (t, ""),
+    };
+    match cmd {
+        "/help" => Some(
+            "📋 可用命令：\n             /model [名字] — 查看/切换模型（不带参数列出可用档案）\n             /new — 开启新话题（历史自动归档）\n             /status — 当前模型/会话/通道状态\n             /help — 本帮助"
+                .to_string(),
+        ),
+        "/status" => {
+            let cfg = state.config.lock().expect("config 锁中毒").clone();
+            let prof = if cfg.model.active_profile.is_empty() {
+                "（单模型配置）".to_string()
+            } else {
+                cfg.model.active_profile.clone()
+            };
+            let ch_status = {
+                let table = state.channels.lock().expect("通道锁中毒");
+                table
+                    .get(agent)
+                    .map(|rt| channel_status_str(&rt.status))
+                    .unwrap_or_else(|| "stopped".into())
+            };
+            let busy = dm_sess.session.try_lock().is_err();
+            let queued = dm_sess.pending.lock().expect("排队锁中毒").len();
+            Some(format!(
+                "🤖 模型：{}（档案 {prof}）\n📭 会话：{}（排队 {queued} 条）\n🔌 通道：{ch_status}\n📦 沙箱：{}",
+                cfg.current_model(),
+                if busy { "处理中" } else { "空闲" },
+                cfg.sandbox.level,
+            ))
+        }
+        "/new" => {
+            let mut guard = match dm_sess.session.try_lock() {
+                Ok(g) => g,
+                Err(_) => return Some("（正在处理消息，完成后在发 /new）".into()),
+            };
+            let cfg = dm_config(state, agent);
+            match AgentSession::new(cfg) {
+                Ok(s) => {
+                    let sid = s.session_id().map(|x| x[..8.min(x.len())].to_string()).unwrap_or_default();
+                    *guard = s;
+                    Some(format!("🆕 新话题已开启（{sid}…）——历史已归档，我们从头开始"))
+                }
+                Err(e) => Some(format!("（新建会话失败：{e}）")),
+            }
+        }
+        "/model" => {
+            let apply = |name: &str| -> Result<String, String> {
+                let mut cfg = state.config.lock().expect("config 锁中毒");
+                cfg.apply_profile(name)?;
+                if let Some(p) = cfg.source_path.clone() {
+                    if let Err(e) = persist_active_profile(&p, name) {
+                        eprintln!("[feishu] active_profile 持久化失败（本次会话仍生效）：{e}");
+                    }
+                }
+                Ok(format!("模型已切换为 {}（{name}）", cfg.current_model()))
+            };
+            let msg = if arg.is_empty() {
+                let cfg = state.config.lock().expect("config 锁中毒").clone();
+                if cfg.model.profiles.is_empty() {
+                    "（config.toml 未配置 [[model.profiles]]，只有单模型：{}）".replace("{}", cfg.current_model())
+                } else {
+                    let list: Vec<String> = cfg
+                        .model
+                        .profiles
+                        .iter()
+                        .map(|p| {
+                            let cur = if p.name == cfg.model.active_profile { " ✓当前" } else { "" };
+                            format!("· {} → {}{cur}", p.name, p.model)
+                        })
+                        .collect();
+                    format!("可用模型档案：\n{}\n用法：/model 档案名", list.join("\n"))
+                }
+            } else {
+                match apply(arg) {
+                    Ok(m) => m,
+                    Err(e) => return Some(format!("（{e}）")),
+                }
+            };
+            if arg.is_empty() {
+                return Some(msg);
+            }
+            // 已切换：空闲则原地重建会话（历史保留，新模型下一条消息生效）
+            let mut guard = match dm_sess.session.try_lock() {
+                Ok(g) => g,
+                Err(_) => return Some(format!("{msg}\n（正在处理消息，当前会话不动；下一条新消息用新模型）")),
+            };
+            let sid = guard.session_id().map(String::from);
+            let cfg = dm_config(state, agent);
+            let rebuilt = match sid {
+                Some(id) => AgentSession::resume(cfg, &id).map(|s| *guard = s),
+                None => AgentSession::new(cfg).map(|s| *guard = s),
+            };
+            match rebuilt {
+                Ok(()) => Some(format!("{msg}\n会话已按新模型重建（历史保留）")),
+                Err(e) => Some(format!("{msg}\n（会话重建失败：{e}；新消息将新建会话）")),
+            }
+        }
+        _ => Some(format!("未知命令 {cmd}——/help 查看可用命令")),
+    }
+}
+
 /// compact 档工具调用摘要：🔧 工具名 + 参数前 60 字（只发调用不发结果）
 fn tool_call_summary(name: &str, arguments: &str) -> String {
     let mut args: String = arguments.chars().take(60).collect();
@@ -1720,6 +1930,24 @@ async fn handle_dm(
         let _ = client.send_text(&dm.open_id, "v1 只支持文本消息").await;
         return;
     }
+    // b2. 斜杠命令（/model /new /status /help）：纯文本入口的控件，
+    //     处理完直接回复，不进 prompt、不占会话
+    {
+        let dm_sess0 = state
+            .dm_sessions
+            .lock()
+            .expect("dm 锁中毒")
+            .get(&dm_key(&agent, &dm.open_id))
+            .cloned();
+        if let Some(ds) = dm_sess0 {
+            if let Some(reply) =
+                dm_slash_command(&state, &agent, &ds, &client, &dm.open_id, &dm.text).await
+            {
+                let _ = client.send_text(&dm.open_id, &reply).await;
+                return;
+            }
+        }
+    }
     // c. 会话获取：每 (agent, open_id) 一个持久 AgentSession
     let key = dm_key(&agent, &dm.open_id);
     let existing = state
@@ -1734,13 +1962,7 @@ async fn handle_dm(
             // 锁外创建：AgentSession::new 可能做 MCP 冷启动（秒级），不能卡 dm_sessions 锁。
             // 飞书会话 = 该 agent 的一个普通会话：config 快照 + apply_persona
             // （session.dir 指向 ~/.r2/agents/<agent>/sessions，历史可审计、Console 可见）
-            let mut cfg = state.config.lock().expect("config 锁中毒").clone();
-            if let Some(p) = cfg.source_path.clone() {
-                if let Ok(fresh) = Config::load_from_file(&p) {
-                    cfg.mcp = fresh.mcp; // 全局原文（不含分身条目）
-                }
-            }
-            apply_persona(&agent, &mut cfg); // 含分身 MCP.toml upsert（同 config_snapshot_fresh_mcp）
+            let cfg = dm_config(&state, &agent);
             let session = match AgentSession::new(cfg) {
                 Ok(s) => s,
                 Err(e) => {

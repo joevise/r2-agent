@@ -43,6 +43,29 @@ pub struct ModelConfig {
     /// Anthropic 接口配置
     #[serde(default)]
     pub anthropic: AnthropicConfig,
+    /// 可切换模型档案（Console 下拉 / 飞书 /model 用；空 = 只用上面的单模型配置）
+    #[serde(default)]
+    pub profiles: Vec<ModelProfile>,
+    /// 启动时激活的档案名（空 = 单模型配置；找不到只告警回退，不炸启动）
+    #[serde(default)]
+    pub active_profile: String,
+}
+
+/// 一套可切换的模型档案：名字 + 完整接入参数（跨 provider 均可）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ModelProfile {
+    /// 档案名（下拉与 /model 命令用，如 glm-5.2 / kimi-k3）
+    pub name: String,
+    /// openai_compat | anthropic
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    /// API 基础地址
+    pub base_url: String,
+    /// API 密钥
+    #[serde(default)]
+    pub api_key: String,
+    /// 模型名
+    pub model: String,
 }
 
 /// OpenAI 兼容接口配置
@@ -275,6 +298,8 @@ impl Default for ModelConfig {
             provider: default_provider(),
             openai_compat: OpenAiCompatConfig::default(),
             anthropic: AnthropicConfig::default(),
+            profiles: Vec::new(),
+            active_profile: String::new(),
         }
     }
 }
@@ -416,6 +441,45 @@ impl Config {
         crate::sandbox::SandboxLevel::parse(&self.sandbox.level)?;
         self.session.dir = expand_tilde(&self.session.dir);
         self.agent.work_dir = expand_tilde(&self.agent.work_dir);
+        self.resolve_auto_budget();
+        // 启动激活档案（找不到只告警回退单模型配置，不阻断启动）
+        if !self.model.active_profile.is_empty() {
+            let name = self.model.active_profile.clone();
+            if let Err(e) = self.apply_profile(&name) {
+                tracing::warn!("active_profile「{name}」应用失败，回退单模型配置：{e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// 应用指定模型档案：整套接入参数（provider/base_url/key/model）替换 +
+    /// token 预算按新模型重算。Console set_profile / 飞书 /model /
+    /// post_process(active_profile) 三处复用。找不到档案返回带可用列表的错误
+    pub fn apply_profile(&mut self, name: &str) -> Result<(), String> {
+        let Some(p) = self.model.profiles.iter().find(|x| x.name == name).cloned() else {
+            let avail: Vec<&str> = self.model.profiles.iter().map(|x| x.name.as_str()).collect();
+            return Err(if avail.is_empty() {
+                format!("没有名为「{name}」的模型档案（config.toml 未配置 [[model.profiles]]）")
+            } else {
+                format!("没有名为「{name}」的模型档案（可用：{}）", avail.join("、"))
+            });
+        };
+        self.model.provider = p.provider.clone();
+        match p.provider.as_str() {
+            "anthropic" => {
+                self.model.anthropic.base_url = p.base_url.clone();
+                self.model.anthropic.api_key = p.api_key.clone();
+                self.model.anthropic.model = p.model.clone();
+            }
+            _ => {
+                self.model.openai_compat.base_url = p.base_url.clone();
+                self.model.openai_compat.api_key = p.api_key.clone();
+                self.model.openai_compat.model = p.model.clone();
+            }
+        }
+        self.model.active_profile = name.to_string();
+        // 预算按新模型窗口重算（原值是旧模型推的）
+        self.agent.max_total_tokens = 0;
         self.resolve_auto_budget();
         Ok(())
     }

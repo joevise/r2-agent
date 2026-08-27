@@ -529,6 +529,7 @@ function renderTools(){
 /* ---------- prompt ---------- */
 function applyState(st){
   store.model=st.model||"";$("#model").textContent=store.model||"—";
+  store.modelProfiles=st.model_profiles||[];store.activeProfile=st.active_profile||"";
   store.tasks=st.tasks||[];renderTaskBadge();
   if(st.history)renderHistory(st.history);
   /* history 为空（agent 刚切换、无进行中会话）时必须清屏——
@@ -1404,8 +1405,40 @@ setInterval(()=>{
 },5000);
 /* ---------- 顶栏 ---------- */
 $("#model").onclick=()=>{
-  const m=prompt("输入模型名，如 glm-5.2 / kimi-k3",store.model);
-  if(m&&m.trim())wsSend({t:"set_model",model:m.trim()});
+  /* 模型档案下拉：有 [[model.profiles]] 时点选切换（跨 provider 整套替换）；
+     无档案/选「手动输入」回退旧行为（当前 provider 内改模型名） */
+  const profs=store.modelProfiles||[];
+  const manual=()=>{
+    const m=prompt("输入模型名，如 glm-5.2 / kimi-k3",store.model);
+    if(m&&m.trim())wsSend({t:"set_model",model:m.trim()});
+  };
+  if(!profs.length){manual();return}
+  let m=document.getElementById("model-menu");
+  if(m){m.remove();return}
+  m=document.createElement("div");
+  m.id="model-menu";
+  const ar=$("#model").getBoundingClientRect();
+  m.style.cssText=`position:fixed;top:${Math.round(ar.bottom+6)}px;left:${Math.min(Math.round(ar.left),Math.max(8,innerWidth-200))}px;z-index:99;border:1px solid var(--line);background:var(--bg);min-width:190px;padding:4px 0;box-shadow:0 4px 14px rgba(0,0,0,.5)`;
+  for(const pr of profs){
+    const it=document.createElement("div");
+    const cur=pr.name===store.activeProfile;
+    it.style.cssText="padding:6px 14px;cursor:pointer;font-size:12.5px;display:flex;justify-content:space-between;gap:12px;color:"+(cur?"var(--white)":"var(--fg)");
+    const nm=document.createElement("span");nm.textContent=pr.name;
+    const md=document.createElement("span");md.className="dim";md.style.fontSize="11px";md.textContent=pr.model;
+    it.append(nm,md);
+    if(cur){const ok=document.createElement("span");ok.textContent="✓";it.append(ok)}
+    it.onmouseenter=()=>it.style.background="#1a2332";
+    it.onmouseleave=()=>it.style.background="transparent";
+    it.onclick=()=>{m.remove();if(!cur)wsSend({t:"set_profile",name:pr.name})};
+    m.appendChild(it);
+  }
+  const it2=document.createElement("div");
+  it2.style.cssText="padding:6px 14px;cursor:pointer;font-size:12px;color:var(--dim);border-top:1px solid var(--line);margin-top:2px";
+  it2.textContent="✎ 手动输入模型名…";
+  it2.onclick=()=>{m.remove();manual()};
+  m.appendChild(it2);
+  document.body.appendChild(m);
+  setTimeout(()=>document.addEventListener("click",function ev(e){if(!m.contains(e.target)){m.remove();document.removeEventListener("click",ev)}}),0);
 };
 /* ---------- 输入区 ---------- */
 const input=$("#input");
