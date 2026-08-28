@@ -352,6 +352,7 @@ fn state_json(state: &WebState) -> Value {
             "max_memory_mb": cfg.sandbox.max_memory_mb,
             "cpu_time_secs": cfg.sandbox.cpu_time_secs,
             "max_file_size_mb": cfg.sandbox.max_file_size_mb,
+            "cgroup_memory_mb": cfg.sandbox.cgroup_memory_mb,
         },
         "prompt_sections": {
             "core": sections.core,
@@ -779,6 +780,14 @@ enum ClientMsg {
     DeleteSession(String),
     SetModel(String),
     SetProfile(String),
+    SandboxSet {
+        bash_timeout_secs: u64,
+        max_processes: usize,
+        max_memory_mb: usize,
+        cpu_time_secs: u32,
+        max_file_size_mb: u32,
+        cgroup_memory_mb: u32,
+    },
     TaskApprove(String),
     TaskReject(String),
     TaskPause(String),
@@ -842,6 +851,21 @@ fn parse_client_msg(text: &str) -> Result<ClientMsg, String> {
     "agent_switch" => Ok(ClientMsg::AgentSwitch(get_str(&v, "name")?.to_string())),
         "set_model" => Ok(ClientMsg::SetModel(get_str(&v, "model")?.to_string())),
         "set_profile" => Ok(ClientMsg::SetProfile(get_str(&v, "name")?.to_string())),
+        "sandbox_set" => {
+            let num = |k: &str| -> Result<u64, String> {
+                v.get(k)
+                    .and_then(|x| x.as_u64())
+                    .ok_or_else(|| format!("缺少数字字段 {k}"))
+            };
+            Ok(ClientMsg::SandboxSet {
+                bash_timeout_secs: num("bash_timeout_secs")?,
+                max_processes: num("max_processes")? as usize,
+                max_memory_mb: num("max_memory_mb")? as usize,
+                cpu_time_secs: num("cpu_time_secs")? as u32,
+                max_file_size_mb: num("max_file_size_mb")? as u32,
+                cgroup_memory_mb: num("cgroup_memory_mb")? as u32,
+            })
+        }
         "group_create" => {
             let title = get_str(&v, "title")?.to_string();
             let arr = v
@@ -1171,6 +1195,46 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
             let mut init = state_json(state);
             init["t"] = json!("init");
             let _ = state.event_tx.send(init);
+        }
+        ClientMsg::SandboxSet {
+            bash_timeout_secs,
+            max_processes,
+            max_memory_mb,
+            cpu_time_secs,
+            max_file_size_mb,
+            cgroup_memory_mb,
+        } => {
+            // 运行时配置即时更新（新会话生效——BashTool 持构建时快照）+ 持久化
+            let persist_err = {
+                let mut cfg = state.config.lock().expect("config 锁中毒");
+                cfg.sandbox.bash_timeout_secs = bash_timeout_secs;
+                cfg.sandbox.max_processes = max_processes;
+                cfg.sandbox.max_memory_mb = max_memory_mb;
+                cfg.sandbox.cpu_time_secs = cpu_time_secs;
+                cfg.sandbox.max_file_size_mb = max_file_size_mb;
+                cfg.sandbox.cgroup_memory_mb = cgroup_memory_mb;
+                let path = cfg.source_path.clone();
+                drop(cfg);
+                path.and_then(|p| {
+                    persist_sandbox(
+                        &p,
+                        &[
+                            ("bash_timeout_secs", bash_timeout_secs.to_string()),
+                            ("max_processes", max_processes.to_string()),
+                            ("max_memory_mb", max_memory_mb.to_string()),
+                            ("cpu_time_secs", cpu_time_secs.to_string()),
+                            ("max_file_size_mb", max_file_size_mb.to_string()),
+                            ("cgroup_memory_mb", cgroup_memory_mb.to_string()),
+                        ],
+                    )
+                    .err()
+                })
+            };
+            if let Some(e) = persist_err {
+                eprintln!("[console] sandbox 持久化失败（运行时已生效）：{e}");
+            }
+            broadcast_state(state);
+            ws_send(sink, json!({"t": "sandbox_set", "ok": true})).await;
         }
         ClientMsg::SetProfile(name) => {
             // 应用模型档案（跨 provider 整套切换）+ 持久化 + 会话重建（历史保留）
@@ -1634,6 +1698,55 @@ fn persist_active_profile(path: &str, name: &str) -> Result<(), String> {
         return Err("config.toml 缺 [model] 段，无法持久化 active_profile".into());
     }
     let mut s = out.join("\n");
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
+    std::fs::write(path, s).map_err(|e| format!("写配置失败：{e}"))
+}
+
+/// [sandbox] 段多键持久化（文本手术：有则替换、无则段头后插入，
+/// 绝不整体序列化——level 与用户注释原样保留）
+fn persist_sandbox(path: &str, vals: &[(&str, String)]) -> Result<(), String> {
+    let content = std::fs::read_to_string(path).map_err(|e| format!("读配置失败：{e}"))?;
+    let mut lines: Vec<String> = Vec::new();
+    let mut in_section = false;
+    let mut done: Vec<&str> = Vec::new();
+    let mut header_idx: Option<usize> = None;
+    for l in content.lines() {
+        let t = l.trim_start();
+        if t.starts_with('[') {
+            in_section = t == "[sandbox]";
+            if in_section && header_idx.is_none() {
+                header_idx = Some(lines.len());
+            }
+        } else if in_section {
+            if let Some(eq) = t.find('=') {
+                let key = t[..eq].trim();
+                if let Some((_, val)) = vals.iter().find(|(k, _)| *k == key) {
+                    lines.push(format!("{key} = {val}"));
+                    done.push(key);
+                    continue;
+                }
+            }
+        }
+        lines.push(l.to_string());
+    }
+    let h = match header_idx {
+        Some(h) => h,
+        None => {
+            lines.push(String::new());
+            lines.push("[sandbox]".to_string());
+            lines.len() - 1
+        }
+    };
+    let mut insert_at = h + 1;
+    for (k, v) in vals {
+        if !done.contains(&k) {
+            lines.insert(insert_at, format!("{k} = {v}"));
+            insert_at += 1;
+        }
+    }
+    let mut s = lines.join("\n");
     if !s.ends_with('\n') {
         s.push('\n');
     }

@@ -178,6 +178,11 @@ pub struct SandboxConfig {
     /// cgroup v2 pids 限制开关（默认开；无 root / 非 v2 / 只读时自动降级回 rlimits）
     #[serde(default = "default_cgroup")]
     pub cgroup: bool,
+    /// cgroup v2 物理内存护栏（MB，0=不限）。与 RLIMIT_AS 的本质区别：
+    /// memory.max 按 RSS（实际物理占用）计费，不误伤 JIT 的虚拟内存预留。
+    /// bash 命令挂临时 cgroup 组生效；cgroup 不可用时降级（无护栏不阻断执行）
+    #[serde(default)]
+    pub cgroup_memory_mb: u32,
     /// bash 高危命令启发式拦截（默认关，向后兼容；开启后拦截 rm -rf / 等明显逃逸模式）
     #[serde(default)]
     pub bash_restrict_workdir: bool,
@@ -265,18 +270,21 @@ fn default_max_processes() -> usize {
     0
 }
 fn default_max_memory_mb() -> usize {
-    // 2048：node/npx 工具链虚拟地址空间轻松过 1G，512 会让 npm install OOM
-    2048
+    // 0 = 不设 RLIMIT_AS。虚拟地址空间限制对 JIT（V8/JSC/LLVM/rustc）是误伤：
+    // 它们启动即预留 4-16GB VA（物理占用远小于此），任何硬限值都是打地鼠。
+    // 物理内存护栏走 cgroup_memory_mb（RSS 计费，不误伤预留）。
+    // 另一台机器实测教训：512MB 硬限让 opencode/node 全灭
+    0
 }
 fn default_cpu_time_secs() -> u32 {
-    // 300：npm install/pip install 的编译步骤 CPU 时间可超 60s（RLIMIT_CPU
-    // 是 CPU 时间非墙钟，IO 等待不计）
-    300
+    // 0 = 不设 RLIMIT_CPU。大编译单进程可超 300s CPU；防死循环由 bash
+    // 墙钟超时（bash_timeout_secs / timeout_secs 参数）兜底
+    0
 }
 fn default_max_file_size_mb() -> u32 {
-    // 2048：npm 大包解压超 100MB（实测 110MB 包被掐）；防写爆磁盘的目的
-    // 由 2G 上限 + 磁盘配额兜底，不再卡正常安装
-    2048
+    // 0 = 不设 RLIMIT_FSIZE。node 117MB / opencode 184MB / 模型文件百 MB
+    // 级是常态，硬限值永远追着包大小改没意义；磁盘保护交给磁盘水位监控
+    0
 }
 fn default_cgroup() -> bool {
     // 默认开：cgroup v2 可用时硬限 pids（fork 炸弹真空填补）；不可用自动降级不失败
@@ -369,6 +377,7 @@ impl Default for SandboxConfig {
             cpu_time_secs: default_cpu_time_secs(),
             max_file_size_mb: default_max_file_size_mb(),
             cgroup: default_cgroup(),
+            cgroup_memory_mb: 0,
             bash_restrict_workdir: false,
         }
     }

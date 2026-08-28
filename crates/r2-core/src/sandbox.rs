@@ -62,6 +62,8 @@ pub struct Sandbox {
     pub strict: bool,
     /// cgroup v2 pids 限制开关（失败自动降级 rlimits，不影响执行）
     pub cgroup: bool,
+    /// cgroup v2 物理内存护栏 MB（0=不限；RSS 计费，不误伤 JIT 的 VA 预留）
+    pub cgroup_memory_mb: u32,
 }
 
 impl Sandbox {
@@ -76,6 +78,7 @@ impl Sandbox {
             max_file_size_mb: cfg.max_file_size_mb,
             strict: level == SandboxLevel::Strict,
             cgroup: cfg.cgroup,
+            cgroup_memory_mb: cfg.cgroup_memory_mb,
         })
     }
 
@@ -190,7 +193,12 @@ fn pids_max_value(max_processes: u32) -> String {
 
 /// 把 pid 挂入 r2 专属 cgroup 并写入 pids.max（root 参数便于测试注入 mock fs）。
 /// 任一步失败返回 Err，调用方降级为 rlimits，不影响命令执行。
-fn attach_to_cgroup_at(root: &Path, max_processes: u32, pid: u32) -> Result<(), String> {
+fn attach_to_cgroup_at(
+    root: &Path,
+    max_processes: u32,
+    memory_limit_mb: u32,
+    pid: u32,
+) -> Result<(), String> {
     if !is_cgroup_v2(root) {
         return Err(format!("{} 非 cgroup v2 unified 挂载", root.display()));
     }
@@ -206,6 +214,13 @@ fn attach_to_cgroup_at(root: &Path, max_processes: u32, pid: u32) -> Result<(), 
     }
     std::fs::write(group.join("pids.max"), pids_max_value(max_processes))
         .map_err(|e| format!("写 pids.max 失败：{e}"))?;
+    // 物理内存护栏（RSS 计费，不误伤 JIT 的 VA 预留）；0 = 不写（组默认 max 不限）。
+    // 写失败按 cgroup 不可用处理（调用方降级告警，不阻断执行）
+    if memory_limit_mb > 0 {
+        let bytes = u64::from(memory_limit_mb) * 1024 * 1024;
+        std::fs::write(group.join("memory.max"), bytes.to_string())
+            .map_err(|e| format!("写 memory.max 失败：{e}"))?;
+    }
     // 子进程一旦进组，其全部后代继承该组，fork 炸弹被 pids.max 掐死
     std::fs::write(group.join("cgroup.procs"), pid.to_string())
         .map_err(|e| format!("写 cgroup.procs 失败：{e}"))?;
@@ -215,7 +230,11 @@ fn attach_to_cgroup_at(root: &Path, max_processes: u32, pid: u32) -> Result<(), 
 /// bash 子进程 spawn 后立即调用：挂入 cgroup 限 pids。
 /// 返回 Some(warn) 表示降级（非 root / 非 v2 / 只读等），None 表示成功。
 /// 清理说明：临时组不主动删除——systemd 会回收空组，主动删与进程退出有竞态。
-pub fn attach_child_to_cgroup(max_processes: u32, pid: u32) -> Option<String> {
+pub fn attach_child_to_cgroup(
+    max_processes: u32,
+    memory_limit_mb: u32,
+    pid: u32,
+) -> Option<String> {
     // supervisor 场景：直接入会话组（会话级 pids/memory 统一核算整棵子树）
     if let Ok(group) = std::env::var("R2_CGROUP_JOIN") {
         let path = std::path::PathBuf::from(&group);
@@ -229,7 +248,7 @@ pub fn attach_child_to_cgroup(max_processes: u32, pid: u32) -> Option<String> {
     let Some(dir) = current_cgroup_dir() else {
         return Some("[sandbox] cgroup 无可用层级（systemd 锁定），降级 rlimits".to_string());
     };
-    match attach_to_cgroup_at(&dir, max_processes, pid) {
+    match attach_to_cgroup_at(&dir, max_processes, memory_limit_mb, pid) {
         Ok(()) => None,
         Err(e) => Some(format!("[sandbox] cgroup 不可用（{e}），降级 rlimits")),
     }
@@ -320,9 +339,18 @@ fn install_pre_exec(cmd: &mut tokio::process::Command, sbx: &Sandbox, use_seccom
             if nproc > 0 { 
                 set_rlimit(libc::RLIMIT_NPROC, nproc)?; 
             }
-            set_rlimit(libc::RLIMIT_AS, mem)?;
-            set_rlimit(libc::RLIMIT_CPU, cpu)?;
-            set_rlimit(libc::RLIMIT_FSIZE, fsize)?;
+            // 0 = 不设。RLIMIT_AS 计虚拟地址空间，JIT（V8/rustc）预留 4-16GB VA
+            // 是常态，任何硬限值都误伤；物理护栏走 cgroup memory.max（RSS 计费）。
+            // FSIZE 同理：包/模型文件百 MB 级常态。CPU 由 bash 墙钟超时兜底
+            if mem > 0 {
+                set_rlimit(libc::RLIMIT_AS, mem)?;
+            }
+            if cpu > 0 {
+                set_rlimit(libc::RLIMIT_CPU, cpu)?;
+            }
+            if fsize > 0 {
+                set_rlimit(libc::RLIMIT_FSIZE, fsize)?;
+            }
             #[cfg(feature = "sandbox-strict")]
             if use_seccomp {
                 install_seccomp().map_err(std::io::Error::other)?;
@@ -578,7 +606,7 @@ mod tests {
         // mock v2 挂载点：建组 + pids.max + cgroup.procs 全链路成功
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("cgroup.controllers"), "pids").unwrap();
-        attach_to_cgroup_at(tmp.path(), 64, 12345).unwrap();
+        attach_to_cgroup_at(tmp.path(), 64, 0, 12345).unwrap();
         // v0.4.1 起单层组结构：r2-agent-{pid}（两层结构有 subtree_control 竞态）
         let group = tmp.path().join(format!("{CGROUP_AGENT_DIR}-12345"));
         assert_eq!(std::fs::read_to_string(group.join("pids.max")).unwrap(), "64");
@@ -587,7 +615,7 @@ mod tests {
             "12345"
         );
         // 幂等：同 pid 再挂一次复用已有组
-        attach_to_cgroup_at(tmp.path(), 0, 12345).unwrap();
+        attach_to_cgroup_at(tmp.path(), 0, 0, 12345).unwrap();
         assert_eq!(std::fs::read_to_string(group.join("pids.max")).unwrap(), "max");
     }
 
@@ -595,7 +623,7 @@ mod tests {
     fn test_attach_non_v2_errors_not_panics() {
         // 非 v2 根（空目录）→ Err 降级，不 panic
         let tmp = tempfile::tempdir().unwrap();
-        let err = attach_to_cgroup_at(tmp.path(), 64, 1).unwrap_err();
+        let err = attach_to_cgroup_at(tmp.path(), 64, 0, 1).unwrap_err();
         assert!(err.contains("非 cgroup v2"), "got: {err}");
     }
 
@@ -609,7 +637,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("cgroup.controllers"), "pids").unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
-        let result = attach_to_cgroup_at(tmp.path(), 64, 1);
+        let result = attach_to_cgroup_at(tmp.path(), 64, 0, 1);
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err(), "只读 fs 应降级：{result:?}");
     }

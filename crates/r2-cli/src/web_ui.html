@@ -435,9 +435,10 @@ function renderUsage(){
 function renderSandbox(){
   const s=store.sandbox,el=$("#sandbox");
   if(!s){el.textContent="SANDBOX: —";el.title="";return}
-  el.textContent="SANDBOX: "+(s.level||"off");
-  el.title="level: "+s.level+"\nbash_timeout: "+s.bash_timeout_secs+"s\nmax_processes: "+s.max_processes+
-    "\nmax_memory: "+s.max_memory_mb+"MB\ncpu_time: "+s.cpu_time_secs+"s\nmax_file_size: "+s.max_file_size_mb+"MB";
+  const guard=(s.cgroup_memory_mb||0)>0;
+  el.textContent="SANDBOX: "+(s.level||"off")+(guard?" 🛡"+s.cgroup_memory_mb+"M":" 🔓");
+  el.title="点击配置资源限额（0 = 不限）\nlevel: "+s.level+"\nbash超时: "+s.bash_timeout_secs+"s\n进程数: "+s.max_processes+"\n虚拟内存: "+s.max_memory_mb+"MB\nCPU: "+s.cpu_time_secs+"s\n单文件: "+s.max_file_size_mb+"MB\ncgroup内存护栏: "+(s.cgroup_memory_mb||0)+"MB";
+  el.style.cursor="pointer";
 }
 function setRunning(b){
   store.running=b;
@@ -451,6 +452,53 @@ function toast(msg){
   const t=$("#toast");t.textContent=msg;t.style.display="block";
   clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.style.display="none",3000);
 }
+/* 沙箱资源限额编辑：0 = 不限（JIT/大包友好）；cgroup 护栏按物理 RSS 计费 */
+$("#sandbox").onclick=()=>{
+  const s=store.sandbox||{};
+  let m=document.getElementById("sbx-menu");
+  if(m){m.remove();return}
+  m=document.createElement("div");
+  m.id="sbx-menu";
+  const ar=$("#sandbox").getBoundingClientRect();
+  m.style.cssText=`position:fixed;top:${Math.round(ar.bottom+6)}px;left:${Math.max(8,Math.min(Math.round(ar.left),innerWidth-240))}px;z-index:99;border:1px solid var(--line);background:var(--bg);min-width:225px;padding:10px 12px;box-shadow:0 4px 14px rgba(0,0,0,.5);font-size:12px`;
+  const FIELDS=[
+    ["bash_timeout_secs","bash 超时(秒)",s.bash_timeout_secs],
+    ["max_memory_mb","虚拟内存 MB(0=不限)",s.max_memory_mb],
+    ["max_file_size_mb","单文件 MB(0=不限)",s.max_file_size_mb],
+    ["cpu_time_secs","CPU 秒(0=不限)",s.cpu_time_secs],
+    ["max_processes","进程数(0=不限)",s.max_processes],
+    ["cgroup_memory_mb","cgroup内存护栏MB(0=关)",s.cgroup_memory_mb||0],
+  ];
+  const hint=document.createElement("div");
+  hint.style.cssText="margin-bottom:8px;color:var(--dim);font-size:11px";
+  hint.textContent="资源限额（0=不限；新会话生效）";
+  m.appendChild(hint);
+  const inputs={};
+  for(const [k,label,val] of FIELDS){
+    const row=document.createElement("div");
+    row.style.cssText="display:flex;justify-content:space-between;align-items:center;gap:8px;margin:4px 0";
+    const lb=document.createElement("span");lb.textContent=label;lb.style.color="var(--fg)";
+    const inp=document.createElement("input");
+    inp.type="number";inp.value=(val??0);inp.min="0";
+    inp.style.cssText="width:72px;background:#11161d;border:1px solid var(--line);color:var(--fg);border-radius:4px;padding:3px 6px;font-size:11.5px;text-align:right";
+    row.append(lb,inp);m.appendChild(row);inputs[k]=inp;
+  }
+  const btns=document.createElement("div");
+  btns.style.cssText="display:flex;gap:8px;margin-top:10px;justify-content:flex-end";
+  const no=document.createElement("button");
+  no.textContent="取消";no.style.cssText="padding:4px 14px;font-size:12px";
+  no.onclick=()=>m.remove();
+  const ok=document.createElement("button");
+  ok.textContent="保存";ok.style.cssText="padding:4px 14px;font-size:12px";
+  ok.onclick=()=>{
+    const o={t:"sandbox_set"};
+    for(const [k] of FIELDS){o[k]=Math.max(0,parseInt(inputs[k].value||"0",10))}
+    wsSend(o);m.remove();toast("已保存（新会话生效）");
+  };
+  btns.append(no,ok);m.appendChild(btns);
+  document.body.appendChild(m);
+  setTimeout(()=>document.addEventListener("click",function ev(e){if(!m.contains(e.target)){m.remove();document.removeEventListener("click",ev)}}),0);
+};
 /* ---------- tabs ---------- */
 document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{
   store.tab=b.dataset.p;
@@ -1341,6 +1389,7 @@ function connect(){
         store.agents=j.agents||store.agents;store.currentAgent=j.current_agent||store.currentAgent;
         renderAgentSel();renderAgentList();renderAgentBadge();
         store.sessions=j.sessions||store.sessions;renderSessions();
+        if(j.sandbox){store.sandbox=j.sandbox;renderSandbox()}
         break;
       case"event":onEvent(j.evt||{});break;
       case"sessions":store.sessions=j.list||[];renderSessions();break;

@@ -197,7 +197,13 @@ impl BashTool {
             && self.sandbox.level != crate::sandbox::SandboxLevel::Off
             && !ns_installed
         {
-            pid.and_then(|p| crate::sandbox::attach_child_to_cgroup(self.sandbox.max_processes, p))
+            pid.and_then(|p| {
+                crate::sandbox::attach_child_to_cgroup(
+                    self.sandbox.max_processes,
+                    self.sandbox.cgroup_memory_mb,
+                    p,
+                )
+            })
         } else {
             None
         };
