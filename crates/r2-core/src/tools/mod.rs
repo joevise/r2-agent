@@ -2,6 +2,7 @@
 
 mod bash;
 mod edit;
+mod history;
 mod mcp_admin;
 mod read;
 mod summon;
@@ -38,6 +39,7 @@ impl ToolRegistry {
         work_dir: &str,
         sandbox_cfg: &crate::config::SandboxConfig,
         config_path: Option<&str>,
+        session_dir: &str,
     ) -> Result<Self, String> {
         let sandbox = crate::sandbox::Sandbox::from_config(sandbox_cfg)?;
         Ok(Self {
@@ -45,6 +47,7 @@ impl ToolRegistry {
                 Box::new(read::ReadTool::new(work_dir)),
                 Box::new(write::WriteTool::new(work_dir)),
                 Box::new(edit::EditTool::new(work_dir)),
+                Box::new(history::HistoryTool::new(session_dir)),
                 Box::new(bash::BashTool::new(
                     work_dir,
                     sandbox_cfg.bash_timeout_secs,
@@ -157,7 +160,7 @@ mod tests {
             level: "off".to_string(),
             ..Default::default()
         };
-        ToolRegistry::new_default(dir.to_str().unwrap(), &cfg, None).unwrap()
+        ToolRegistry::new_default(dir.to_str().unwrap(), &cfg, None, "/tmp/r2-test-sessions").unwrap()
     }
 
     #[tokio::test]
@@ -191,13 +194,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let reg = make_registry(tmp.path());
         let schemas = reg.schemas();
-        // v0.9.0 加 summon 工具：7 个（read/write/edit/bash/mcp_admin/task/summon）
-        assert_eq!(schemas.len(), 7);
+        // v0.11.0 加 history 工具：8 个（read/write/edit/history/bash/mcp_admin/task/summon）
+        assert_eq!(schemas.len(), 8);
         let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"read"));
         assert!(names.contains(&"write"));
         assert!(names.contains(&"edit"));
         assert!(names.contains(&"bash"));
+        assert!(names.contains(&"history"));
         assert!(names.contains(&"task"));
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"mcp"));

@@ -35,6 +35,8 @@ pub struct PromptSections {
     pub custom: Option<String>,
     /// 已安装技能清单（动态扫描 ~/.r2/skills，每次构建 prompt 时刷新）
     pub skills: Option<String>,
+    /// 长期记忆 MEMORY.md（work_dir 跨会话持久层，v0.11.0）
+    pub memory: Option<String>,
 }
 
 /// 用给定 home 展开路径开头的 ~（测试可注入假 home，隔离真实 ~/.r2）
@@ -163,6 +165,7 @@ fn build_system_prompt_with_home(config: &Config, home: &str) -> (String, Prompt
         agents: None,
         custom: None,
         skills: None,
+        memory: None,
     };
 
     // 技能层：动态扫描 ~/.r2/skills（装了自动可见，删了自动消失，零维护）。
@@ -189,6 +192,22 @@ fn build_system_prompt_with_home(config: &Config, home: &str) -> (String, Prompt
          · 你的目标与技能会出现在成长档案里，持续积累成为你的一部分。",
     );
 
+    // 长期记忆层（v0.11.0）：work_dir/MEMORY.md 跨会话持久，agent 自维护。
+    // 文件为空/不存在也注入规则——否则 agent 永远不知道该建立记忆
+    // （实测病灶：换会话/重启即失忆，用户问「记得吗」只能瞎编）
+    let work_dir = expand_with_home(&config.agent.work_dir, home);
+    let mem_text = read_layer(&format!("{work_dir}/MEMORY.md"))
+        .unwrap_or_else(|| "（空——遇到值得记住的事，主动建立本文件）".to_string());
+    full.push_str("\n\n[长期记忆 MEMORY.md]\n");
+    full.push_str(&mem_text);
+    sections.memory = Some(mem_text);
+    full.push_str(
+        "\n\n[记忆规则]\n\
+         · 用户身份与偏好、项目背景、重要决策与结论、踩过的坑：主动写入 work_dir/MEMORY.md\
+         （用 write/edit 工具追加或编辑，绝不整篇覆盖丢失旧记忆）——它跨会话持久，是你的长期记忆\n\
+         · 用户问「之前说过什么 / 你还记得吗」类问题：先用 history 工具查历史会话再回答，禁止凭空编造",
+    );
+
     // config [agent] system_prompt 非空：显式覆盖，SOUL / AGENTS 两层跳过
     let custom = config.agent.system_prompt.trim();
     if !custom.is_empty() {
@@ -210,7 +229,6 @@ fn build_system_prompt_with_home(config: &Config, home: &str) -> (String, Prompt
         full.push_str(&soul);
         sections.soul = Some(soul);
     }
-    let work_dir = expand_with_home(&config.agent.work_dir, home);
     if let Some(agents) = read_layer(&format!("{work_dir}/AGENTS.md")) {
         full.push_str("\n\n[AGENTS.md 项目上下文]\n");
         full.push_str(&agents);
@@ -264,7 +282,7 @@ impl Agent {
         let max_tokens = config.agent.max_total_tokens;
         let (system_prompt, _sections) = build_system_prompt(&config);
         let context = ContextManager::new(&system_prompt, max_tokens, config.context.l1_threshold);
-        let mut tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox, config.mcp_write_path().as_deref())
+        let mut tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox, config.mcp_write_path().as_deref(), &config.session.dir)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         tools.connect_mcp(&config.mcp);
         let session = Session::create(&crate::config::expand_tilde(&config.session.dir)).ok();
@@ -313,7 +331,7 @@ impl Agent {
             max_tokens,
             config.context.l1_threshold,
         );
-        let mut tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox, config.mcp_write_path().as_deref())
+        let mut tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox, config.mcp_write_path().as_deref(), &config.session.dir)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         tools.connect_mcp(&config.mcp);
         println!("已恢复会话 {session_id}（{count} 条历史消息）");
@@ -364,7 +382,7 @@ impl Agent {
             max_tokens,
             config.context.l1_threshold,
         );
-        let mut tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox, config.mcp_write_path().as_deref())
+        let mut tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox, config.mcp_write_path().as_deref(), &config.session.dir)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         tools.connect_mcp(&config.mcp);
         println!("已从会话 {parent_session_id} 分叉（继承 {count} 条消息，新会话 {new_id}）");
@@ -1411,8 +1429,9 @@ mod tests {
         let agents = sections.agents.expect("应有 AGENTS 段");
         assert!(agents.len() <= MAX_LAYER_BYTES + 64, "截断后超长：{}", agents.len());
         assert!(agents.ends_with("已截断）"));
-        // 成长系统段（~400B）恒定附加于 core 之后：边界放宽到 +1024 覆盖恒定段
-        assert!(full.len() < sections.core.len() + MAX_LAYER_BYTES + 1024);
+        // 成长系统段（~400B）+ 记忆规则块（~500B）恒定附加于 core 之后：
+        // 边界放宽到 +2048 覆盖恒定段（v0.11.0 记忆层）
+        assert!(full.len() < sections.core.len() + MAX_LAYER_BYTES + 2048);
     }
 
     #[test]

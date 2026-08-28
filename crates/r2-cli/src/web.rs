@@ -360,6 +360,7 @@ fn state_json(state: &WebState) -> Value {
             "agents": sections.agents,
             "skills": sections.skills,
             "custom": sections.custom,
+            "memory": sections.memory,
         },
         "running": running,
     })
@@ -368,7 +369,7 @@ fn state_json(state: &WebState) -> Value {
 /// 启动时构造工具清单快照（与 Agent 同源的注册表，含 MCP 连接）
 fn build_tool_list(config: &Config) -> Vec<Value> {
     let work_dir = config::expand_tilde(&config.agent.work_dir);
-    let Ok(mut registry) = ToolRegistry::new_default(&work_dir, &config.sandbox, config.mcp_write_path().as_deref()) else {
+    let Ok(mut registry) = ToolRegistry::new_default(&work_dir, &config.sandbox, config.mcp_write_path().as_deref(), &config.session.dir) else {
         return Vec::new();
     };
     registry.connect_mcp(&config.mcp);

@@ -528,7 +528,7 @@ mod tests {
             "secret 泄漏到沙箱环境：{text}"
         );
         assert!(
-            text.contains(&format!("PATH={SANDBOX_PATH}")),
+            text.contains(&format!("PATH={SANDBOX_SYSTEM_PATH}")),
             "PATH 未被清洗：{text}"
         );
     }
