@@ -403,6 +403,21 @@ impl Agent {
         self.steer_rx = Some(rx);
     }
 
+    /// 取走未消费的 steer 消息（run 结束后宿主调用补投递——用户消息绝不静默丢）。
+    /// 与 run 开头的排空互补：那边丢"非运行期注入"，这边把"收尾窗口落入"的还回去
+    pub fn take_stale_steers(&mut self) -> Vec<String> {
+        match self.steer_rx.as_mut() {
+            Some(rx) => {
+                let mut out = Vec::new();
+                while let Ok(x) = rx.try_recv() {
+                    out.push(x);
+                }
+                out
+            }
+            None => Vec::new(),
+        }
+    }
+
     /// 测试注入 Mock Provider（不走 create_provider 工厂）
     #[cfg(test)]
     pub(crate) fn set_provider(&mut self, p: Box<dyn ModelProvider>) {

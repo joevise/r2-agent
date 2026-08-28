@@ -101,6 +101,11 @@ impl AgentSession {
         self.steer_tx.clone()
     }
 
+    /// run 结束后取走未消费的 steer（宿主补投递用——绝不丢用户消息）
+    pub fn take_stale_steers(&mut self) -> Vec<String> {
+        self.agent.take_stale_steers()
+    }
+
     /// 清空当前上下文（等价于 CLI 的 /clear）：新建会话文件 + 重置 L1
     pub fn reset_context(&mut self) {
         self.agent.reset_context();

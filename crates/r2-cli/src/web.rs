@@ -1549,6 +1549,9 @@ struct DmSession {
     session: Mutex<AgentSession>,
     /// 会话级排队：FIFO，元素 (text, message_id)——排队消息完成时贴各自的 👍
     pending: StdMutex<VecDeque<(String, String)>>,
+    /// steer 发送端（与 session 内部通道同源克隆）：在途消息插话不打断排队机制，
+    /// 也不用锁 session（运行中锁被 prompt 持有）。/new /model 重建会话后刷新
+    steer_tx: StdMutex<tokio::sync::mpsc::Sender<String>>,
 }
 
 /// show_process 分档（带序：None < Compact < Full，便于 >= 判断）
@@ -1642,7 +1645,7 @@ fn persist_active_profile(path: &str, name: &str) -> Result<(), String> {
 async fn dm_slash_command(
     state: &Arc<WebState>,
     agent: &str,
-    dm_sess: &Arc<DmSession>,
+    dm_sess: Option<&Arc<DmSession>>,
     client: &Arc<FeishuClient>,
     open_id: &str,
     text: &str,
@@ -1657,7 +1660,7 @@ async fn dm_slash_command(
     };
     match cmd {
         "/help" => Some(
-            "📋 可用命令：\n             /model [名字] — 查看/切换模型（不带参数列出可用档案）\n             /new — 开启新话题（历史自动归档）\n             /status — 当前模型/会话/通道状态\n             /help — 本帮助"
+            "📋 可用命令：\n             /model [名字] — 查看/切换模型（不带参数列出可用档案）\n             /new — 开启新话题（历史自动归档）\n             /status — 当前模型/会话/通道状态\n             /help — 本帮助\n\n💡 回复进行中直接发消息 = ⚡ 插话转向（不用等它跑完）"
                 .to_string(),
         ),
         "/status" => {
@@ -1674,8 +1677,13 @@ async fn dm_slash_command(
                     .map(|rt| channel_status_str(&rt.status))
                     .unwrap_or_else(|| "stopped".into())
             };
-            let busy = dm_sess.session.try_lock().is_err();
-            let queued = dm_sess.pending.lock().expect("排队锁中毒").len();
+            let (busy, queued) = match dm_sess {
+                Some(d) => (
+                    d.session.try_lock().is_err(),
+                    d.pending.lock().expect("排队锁中毒").len(),
+                ),
+                None => (false, 0),
+            };
             Some(format!(
                 "🤖 模型：{}（档案 {prof}）\n📭 会话：{}（排队 {queued} 条）\n🔌 通道：{ch_status}\n📦 沙箱：{}",
                 cfg.current_model(),
@@ -1684,7 +1692,10 @@ async fn dm_slash_command(
             ))
         }
         "/new" => {
-            let mut guard = match dm_sess.session.try_lock() {
+            let Some(d) = dm_sess else {
+                return Some("当前没有进行中的会话，直接发消息即可".into());
+            };
+            let mut guard = match d.session.try_lock() {
                 Ok(g) => g,
                 Err(_) => return Some("（正在处理消息，完成后在发 /new）".into()),
             };
@@ -1692,7 +1703,9 @@ async fn dm_slash_command(
             match AgentSession::new(cfg) {
                 Ok(s) => {
                     let sid = s.session_id().map(|x| x[..8.min(x.len())].to_string()).unwrap_or_default();
+                    let steer = s.steer_handle();
                     *guard = s;
+                    *d.steer_tx.lock().expect("steer 锁中毒") = steer;
                     Some(format!("🆕 新话题已开启（{sid}…）——历史已归档，我们从头开始"))
                 }
                 Err(e) => Some(format!("（新建会话失败：{e}）")),
@@ -1734,19 +1747,27 @@ async fn dm_slash_command(
             if arg.is_empty() {
                 return Some(msg);
             }
-            // 已切换：空闲则原地重建会话（历史保留，新模型下一条消息生效）
-            let mut guard = match dm_sess.session.try_lock() {
+            // 已切换：空闲则原地重建会话（历史保留 + steer 通道刷新）
+            let Some(d) = dm_sess else {
+                return Some(format!("{msg}\n（当前无会话，下一条消息将以新模型开始）"));
+            };
+            let mut guard = match d.session.try_lock() {
                 Ok(g) => g,
                 Err(_) => return Some(format!("{msg}\n（正在处理消息，当前会话不动；下一条新消息用新模型）")),
             };
             let sid = guard.session_id().map(String::from);
             let cfg = dm_config(state, agent);
             let rebuilt = match sid {
-                Some(id) => AgentSession::resume(cfg, &id).map(|s| *guard = s),
-                None => AgentSession::new(cfg).map(|s| *guard = s),
+                Some(id) => AgentSession::resume(cfg, &id),
+                None => AgentSession::new(cfg),
             };
             match rebuilt {
-                Ok(()) => Some(format!("{msg}\n会话已按新模型重建（历史保留）")),
+                Ok(s) => {
+                    let steer = s.steer_handle();
+                    *guard = s;
+                    *d.steer_tx.lock().expect("steer 锁中毒") = steer;
+                    Some(format!("{msg}\n会话已按新模型重建（历史保留）"))
+                }
                 Err(e) => Some(format!("{msg}\n（会话重建失败：{e}；新消息将新建会话）")),
             }
         }
@@ -1921,17 +1942,13 @@ async fn handle_dm(
             .await;
         return;
     }
-    // 收到确认：贴 Typing 表情（成功后回复完换 👍；失败记日志方便诊断权限缺失）
-    if let Err(e) = client.add_reaction(&dm.message_id, "Typing").await {
-        eprintln!("[feishu] Typing 表情贴失败（检查 im:message.reaction:write 权限是否开通并重新发布）：{e}");
-    }
     // b. 非文本消息（图片等 text 为空）
     if dm.text.trim().is_empty() {
         let _ = client.send_text(&dm.open_id, "v1 只支持文本消息").await;
         return;
     }
     // b2. 斜杠命令（/model /new /status /help）：纯文本入口的控件，
-    //     处理完直接回复，不进 prompt、不占会话
+    //     处理完直接回复，不进 prompt、不占会话；无会话时（首条 /help）也可用
     {
         let dm_sess0 = state
             .dm_sessions
@@ -1939,14 +1956,23 @@ async fn handle_dm(
             .expect("dm 锁中毒")
             .get(&dm_key(&agent, &dm.open_id))
             .cloned();
-        if let Some(ds) = dm_sess0 {
-            if let Some(reply) =
-                dm_slash_command(&state, &agent, &ds, &client, &dm.open_id, &dm.text).await
-            {
-                let _ = client.send_text(&dm.open_id, &reply).await;
-                return;
-            }
+        if let Some(reply) = dm_slash_command(
+            &state,
+            &agent,
+            dm_sess0.as_ref(),
+            &client,
+            &dm.open_id,
+            &dm.text,
+        )
+        .await
+        {
+            let _ = client.send_text(&dm.open_id, &reply).await;
+            return;
         }
+    }
+    // 收到确认：贴 Typing 表情（成功后回复完换 👍；失败记日志方便诊断权限缺失）
+    if let Err(e) = client.add_reaction(&dm.message_id, "Typing").await {
+        eprintln!("[feishu] Typing 表情贴失败（检查 im:message.reaction:write 权限是否开通并重新发布）：{e}");
     }
     // c. 会话获取：每 (agent, open_id) 一个持久 AgentSession
     let key = dm_key(&agent, &dm.open_id);
@@ -1976,18 +2002,33 @@ async fn handle_dm(
             // 并发下同 key 只留一个（后到者丢弃自己建的，复用先入者）
             map.entry(key)
                 .or_insert_with(|| {
+                    let steer = session.steer_handle();
                     Arc::new(DmSession {
                         session: Mutex::new(session),
                         pending: StdMutex::new(VecDeque::new()),
+                        steer_tx: StdMutex::new(steer),
                     })
                 })
                 .clone()
         }
     };
-    // g. prompt 在途 → 排队（本 DM 会话级 FIFO，满了回"忙"）
+    // g. prompt 在途 → steer 插话（对齐 Console 语义：在途消息=转向指令，
+    //    打断当前流注入 [用户中途指令]）；通道满/关闭才回落排队 FIFO
     let mut guard = match dm_sess.session.try_lock() {
         Ok(g) => g,
         Err(_) => {
+            if dm_sess
+                .steer_tx
+                .lock()
+                .expect("steer 锁中毒")
+                .try_send(dm.text.clone())
+                .is_ok()
+            {
+                let _ = client
+                    .send_text(&dm.open_id, "⚡ 已插入当前回复（转向中）")
+                    .await;
+                return;
+            }
             // 队列入队/判满在锁内做完即放锁（std guard 不可跨 await）
             let full = {
                 let mut q = dm_sess.pending.lock().expect("排队锁中毒");
@@ -2009,6 +2050,14 @@ async fn handle_dm(
     loop {
         let (text, mid) = &item;
         run_dm_prompt(&state, &agent, &cf, &client, &dm.open_id, mid, &mut guard, text).await;
+        // 收尾窗口落进来的 steer（本轮 run 没来得及消费）转为排队补投——用户消息绝不静默丢
+        for x in guard.take_stale_steers() {
+            dm_sess
+                .pending
+                .lock()
+                .expect("排队锁中毒")
+                .push_back((x, String::new()));
+        }
         let next = dm_sess.pending.lock().expect("排队锁中毒").pop_front();
         match next {
             Some(x) => item = x,
@@ -2111,6 +2160,12 @@ async fn run_dm_prompt(
                         }
                         AgentEvent::UsageUpdate(u) => {
                             *usnap.lock().unwrap() = Some(u.clone());
+                        }
+                        // ⚡ 插话反馈：note 区瞬时提示（finalize 时被状态行替换）
+                        AgentEvent::Steered(_) => {
+                            if let Some(c) = card_guard.as_mut() {
+                                let _ = c.update_note("⚡ 收到用户中途指令，转向中…").await;
+                            }
                         }
                         AgentEvent::Done { .. } => {
                             // 收尾：flush 残余思考流（降级路径）后退出
@@ -2227,7 +2282,7 @@ async fn run_dm_prompt(
     }
     // 成功完成贴 👍（换掉收到时的 Typing；失败记日志方便诊断权限缺失）
     // （result 在上方 match 已部分 move，成功标志提前存）
-    if succeeded {
+    if succeeded && !message_id.is_empty() {
         if let Err(e) = client.add_reaction(message_id, "THUMBSUP").await {
             eprintln!("[feishu] 👍 表情贴失败：{e}");
         }
