@@ -1653,6 +1653,29 @@ fn dm_key(agent: &str, open_id: &str) -> String {
     format!("{agent}|{open_id}")
 }
 
+/// DM 会话指针持久化：(agent, open_id) → 当前 session id 落盘。
+/// dm_sessions 是内存表，服务重启即清空——没有指针，重启后第一条消息
+/// 会 AgentSession::new 开全新会话，历史永远没人 resume（用户实测：
+/// 每次重启飞书对话就失忆）。有指针则 resume 同一会话，记忆跨重启连续
+fn dm_sid_path(agent: &str, open_id: &str) -> std::path::PathBuf {
+    agents::profile_dir(agent).join("dm").join(format!("{open_id}.sid"))
+}
+
+fn read_dm_sid(agent: &str, open_id: &str) -> Option<String> {
+    std::fs::read_to_string(dm_sid_path(agent, open_id))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn write_dm_sid(agent: &str, open_id: &str, sid: &str) {
+    let p = dm_sid_path(agent, open_id);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, sid);
+}
+
 /// DM 会话用的配置快照：全局运行时配置 + mcp 源文件刷新 + persona 叠加。
 /// handle_dm 创建分支与 /model 原地重建共用（保证两条路拿到同款 config）
 fn dm_config(state: &WebState, agent: &str) -> Config {
@@ -1817,6 +1840,9 @@ async fn dm_slash_command(
                 Ok(s) => {
                     let sid = s.session_id().map(|x| x[..8.min(x.len())].to_string()).unwrap_or_default();
                     let steer = s.steer_handle();
+                    if let Some(full) = s.session_id() {
+                        write_dm_sid(agent, open_id, full);
+                    }
                     *guard = s;
                     *d.steer_tx.lock().expect("steer 锁中毒") = steer;
                     Some(format!("🆕 新话题已开启（{sid}…）——历史已归档，我们从头开始"))
@@ -2101,8 +2127,14 @@ async fn handle_dm(
             // 锁外创建：AgentSession::new 可能做 MCP 冷启动（秒级），不能卡 dm_sessions 锁。
             // 飞书会话 = 该 agent 的一个普通会话：config 快照 + apply_persona
             // （session.dir 指向 ~/.r2/agents/<agent>/sessions，历史可审计、Console 可见）
-            let cfg = dm_config(&state, &agent);
-            let session = match AgentSession::new(cfg) {
+            // 会话指针：重启后 resume 同一会话（飞书连续记忆跨重启）；
+            // 无指针（首次）或会话文件丢失/损坏 → 新开并落新指针
+            let session = match read_dm_sid(&agent, &dm.open_id) {
+                Some(sid) => AgentSession::resume(dm_config(&state, &agent), &sid)
+                    .or_else(|_| AgentSession::new(dm_config(&state, &agent))),
+                None => AgentSession::new(dm_config(&state, &agent)),
+            };
+            let session = match session {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = client
@@ -2111,6 +2143,9 @@ async fn handle_dm(
                     return;
                 }
             };
+            if let Some(sid) = session.session_id() {
+                write_dm_sid(&agent, &dm.open_id, sid);
+            }
             let mut map = state.dm_sessions.lock().expect("dm 锁中毒");
             // 并发下同 key 只留一个（后到者丢弃自己建的，复用先入者）
             map.entry(key)
