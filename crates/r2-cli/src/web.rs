@@ -398,21 +398,10 @@ async fn index() -> impl axum::response::IntoResponse {
     )
 }
 
-/// 上传扩展名白名单（只收文本类，v0.1 克制清单）
-fn is_allowed_upload(filename: &str) -> bool {
-    const ALLOWED: &[&str] = &[
-        "txt", "md", "rs", "py", "js", "ts", "json", "csv", "toml", "yaml", "yml", "log",
-    ];
-    Path::new(filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| ALLOWED.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
-}
-
-/// 飞书 DM 文件白名单（比 Console 宽：zip/pdf/图片都要能传——用户要 agent
-/// 处理的是真实文件不是纯文本；执行体 exe/dll 天然不在表内）
-fn feishu_file_allowed(name: &str) -> bool {
+/// 文件上传白名单（Console 拖拽上传与飞书 DM 共用，v0.11.2 统一）：
+/// 文本/代码 + 压缩包 + 文档 + 数据 + 图片——用户要 agent 处理的是真实文件，
+/// 不是纯文本；执行体（exe/dll/bin）天然不在表内
+fn is_allowed_file(name: &str) -> bool {
     const ALLOWED: &[&str] = &[
         // 文本/代码
         "txt", "md", "rs", "py", "js", "ts", "json", "csv", "toml", "yaml", "yml", "log",
@@ -464,7 +453,7 @@ async fn receive_dm_file(
             .and_then(|s| s.to_str())
             .unwrap_or("file")
             .to_string();
-        if !feishu_file_allowed(&n) {
+        if !is_allowed_file(&n) {
             return Err(format!(
                 "（暂不支持该文件类型：{n}。支持：文本/代码、压缩包(zip/tar/gz/7z)、文档(pdf/docx/xlsx/pptx)、图片、数据文件）"
             ));
@@ -522,7 +511,7 @@ async fn upload(State(state): State<Arc<WebState>>, mut multipart: Multipart) ->
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
-        if file_name.is_empty() || !is_allowed_upload(&file_name) {
+        if file_name.is_empty() || !is_allowed_file(&file_name) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": format!("不允许的文件类型：{file_name}")})),
@@ -3612,13 +3601,17 @@ mod tests {
 
     #[test]
     fn test_upload_extension_whitelist() {
-        // 白名单内（大小写不敏感）
-        for name in ["a.txt", "b.md", "c.rs", "d.py", "e.js", "f.ts", "g.json", "h.csv", "i.toml", "j.yaml", "k.yml", "l.log", "M.MD"] {
-            assert!(is_allowed_upload(name), "{name} 应被允许");
+        // 白名单内（大小写不敏感；v0.11.2 起含压缩包/文档/图片，与飞书 DM 共用）
+        for name in [
+            "a.txt", "b.md", "c.rs", "d.py", "g.json", "M.MD", "w.html",
+            "data.zip", "backup.tar.gz", "report.pdf", "doc.docx", "sheet.xlsx", "slide.pptx",
+            "pic.png", "photo.jpg", "anim.gif", "db.sqlite", "log.ndjson",
+        ] {
+            assert!(is_allowed_file(name), "{name} 应被允许");
         }
-        // 白名单外 / 无扩展名
-        for name in ["x.exe", "y.png", "z.bin", "noext", "w.html", ".hidden"] {
-            assert!(!is_allowed_upload(name), "{name} 应被拒绝");
+        // 白名单外 / 无扩展名 / 执行体
+        for name in ["x.exe", "y.dll", "z.bat", "noext", ".hidden", "run.sh.bin"] {
+            assert!(!is_allowed_file(name), "{name} 应被拒绝");
         }
     }
 
