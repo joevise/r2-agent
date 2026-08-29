@@ -59,6 +59,12 @@ pub struct FeishuDm {
     pub message_id: String,
     /// message_type=="text" 时解析出的正文；其它类型为空串
     pub text: String,
+    /// 原始消息类型（text/image/file/post…）——文件落地用（v0.11.1）
+    pub msg_type: String,
+    /// image 消息的 image_key / file 消息的 file_key（资源下载用）
+    pub resource_key: String,
+    /// file 消息的原文件名（image 无 → 空串）
+    pub file_name: String,
 }
 
 /// 通道状态
@@ -349,6 +355,47 @@ impl FeishuClient {
             return Err(format!("ERROR: 贴表情失败 code={code} msg={msg}"));
         }
         Ok(())
+    }
+
+    /// 下载消息里的资源文件（图片/文件）。res_type: "image" | "file"。
+    /// 成功返回原始字节；权限缺失等错误原样透传（含 code/msg 便于定位）
+    pub async fn download_resource(
+        &self,
+        message_id: &str,
+        file_key: &str,
+        res_type: &str,
+    ) -> Result<Vec<u8>, String> {
+        let token = get_token(&self.inner).await?;
+        let url = format!(
+            "{}/open-apis/im/v1/messages/{message_id}/resources/{file_key}",
+            self.inner.cfg.domain
+        );
+        let resp = self
+            .inner
+            .http
+            .get(&url)
+            .query(&[("type", res_type)])
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| format!("ERROR: 资源下载请求失败: {e}"))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("ERROR: 资源下载读取失败: {e}"))?;
+        // 成功 = 二进制流原样返回；失败 = JSON（code!=0）。
+        // 小心正常 JSON 文件上传的边角：错误体必有顶层 code 数字字段
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Some(code) = v.get("code").and_then(|c| c.as_i64()) {
+                if code != 0 {
+                    let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown");
+                    return Err(format!(
+                        "ERROR: 资源下载失败 code={code} msg={msg}\n（常见原因：应用未开通「获取消息中的资源文件」权限，到开放平台添加后重新发布）"
+                    ));
+                }
+            }
+        }
+        Ok(bytes.to_vec())
     }
 
     pub async fn send_text(&self, open_id: &str, text: &str) -> Result<(), String> {
@@ -1028,24 +1075,56 @@ fn parse_event(payload: &[u8]) -> Option<FeishuDm> {
         .get("message_type")
         .and_then(|m| m.as_str())
         .unwrap_or("");
-    // content 本身是转义的 JSON 字符串：{"text":"..."}
+    // content 本身是转义的 JSON 字符串：{"text":"..."} / {"image_key":"..."}
+    // / {"file_key":"...","file_name":"xxx.zip"}
+    let content_json = msg
+        .get("content")
+        .and_then(|c| c.as_str())
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok());
     let text = if msg_type == "text" {
-        msg.get("content")
-            .and_then(|c| c.as_str())
-            .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
-            .and_then(|c| {
-                c.get("text")
-                    .and_then(|t| t.as_str())
-                    .map(|t| t.to_string())
-            })
+        content_json
+            .as_ref()
+            .and_then(|c| c.get("text"))
+            .and_then(|t| t.as_str())
+            .map(|t| t.to_string())
             .unwrap_or_default()
     } else {
         String::new()
+    };
+    // 资源字段：image → image_key；file → file_key + file_name（v0.11.1 文件落地）
+    let (resource_key, file_name) = match msg_type {
+        "image" => (
+            content_json
+                .as_ref()
+                .and_then(|c| c.get("image_key"))
+                .and_then(|k| k.as_str())
+                .unwrap_or("")
+                .to_string(),
+            String::new(),
+        ),
+        "file" => (
+            content_json
+                .as_ref()
+                .and_then(|c| c.get("file_key"))
+                .and_then(|k| k.as_str())
+                .unwrap_or("")
+                .to_string(),
+            content_json
+                .as_ref()
+                .and_then(|c| c.get("file_name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("file")
+                .to_string(),
+        ),
+        _ => (String::new(), String::new()),
     };
     Some(FeishuDm {
         open_id,
         message_id,
         text,
+        msg_type: msg_type.to_string(),
+        resource_key,
+        file_name,
     })
 }
 
@@ -1419,10 +1498,18 @@ mod tests {
         assert_eq!(dm.open_id, "ou_xxx");
         assert_eq!(dm.message_id, "om_xxx");
         assert_eq!(dm.text, "用户消息");
-        // 非文本类型 text 为空串
+        // 非文本类型 text 为空串，但资源字段要解析出来（v0.11.1 文件落地）
         let payload2 = br#"{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_1"}},"message":{"message_id":"om_2","message_type":"image","content":"{\"image_key\":\"k\"}"}}}"#;
         let dm2 = parse_event(payload2).expect("图片事件应解析");
         assert_eq!(dm2.text, "");
+        assert_eq!(dm2.msg_type, "image");
+        assert_eq!(dm2.resource_key, "k");
+        // file 类型：file_key + file_name
+        let payload4 = br#"{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_1"}},"message":{"message_id":"om_4","message_type":"file","content":"{\"file_key\":\"fk_1\",\"file_name\":\"data.zip\"}"}}}"#;
+        let dm4 = parse_event(payload4).expect("文件事件应解析");
+        assert_eq!(dm4.msg_type, "file");
+        assert_eq!(dm4.resource_key, "fk_1");
+        assert_eq!(dm4.file_name, "data.zip");
         // 非消息事件返回 None
         let payload3 = br#"{"header":{"event_type":"im.chat.updated"},"event":{}}"#;
         assert!(parse_event(payload3).is_none());

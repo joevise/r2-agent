@@ -410,6 +410,101 @@ fn is_allowed_upload(filename: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 飞书 DM 文件白名单（比 Console 宽：zip/pdf/图片都要能传——用户要 agent
+/// 处理的是真实文件不是纯文本；执行体 exe/dll 天然不在表内）
+fn feishu_file_allowed(name: &str) -> bool {
+    const ALLOWED: &[&str] = &[
+        // 文本/代码
+        "txt", "md", "rs", "py", "js", "ts", "json", "csv", "toml", "yaml", "yml", "log",
+        "html", "css", "xml", "sql", "sh", "c", "h", "cpp", "go", "java", "rb", "php", "lua",
+        // 压缩包
+        "zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar",
+        // 文档
+        "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "epub",
+        // 数据
+        "db", "sqlite", "sqlite3", "parquet", "ndjson",
+        // 图片（file 通道传图）
+        "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg",
+    ];
+    Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| ALLOWED.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// 图片魔数 → 扩展名（飞书 image 消息无名，按内容判型；兜底 .jpg）
+fn image_ext_from_magic(b: &[u8]) -> &'static str {
+    if b.starts_with(&[0x89, b'P', b'N', b'G']) {
+        ".png"
+    } else if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        ".jpg"
+    } else if b.starts_with(b"GIF8") {
+        ".gif"
+    } else if b.len() > 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        ".webp"
+    } else {
+        ".jpg"
+    }
+}
+
+/// 飞书 DM 文件/图片落地（v0.11.1 P0）：下载资源 → 存 {persona}/work/uploads/
+/// → 返回合成 prompt（告知 agent 文件在哪、怎么处理）。失败带原因回给用户
+async fn receive_dm_file(
+    agent: &str,
+    client: &Arc<FeishuClient>,
+    dm: &FeishuDm,
+) -> Result<String, String> {
+    let is_image = dm.msg_type == "image";
+    let file_name = if is_image {
+        String::new() // 图片无文件名，下载后按魔数命名
+    } else {
+        let n = Path::new(&dm.file_name)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .to_string();
+        if !feishu_file_allowed(&n) {
+            return Err(format!(
+                "（暂不支持该文件类型：{n}。支持：文本/代码、压缩包(zip/tar/gz/7z)、文档(pdf/docx/xlsx/pptx)、图片、数据文件）"
+            ));
+        }
+        n
+    };
+    let res_type = if is_image { "image" } else { "file" };
+    let bytes = client
+        .download_resource(&dm.message_id, &dm.resource_key, res_type)
+        .await?;
+    if bytes.len() > MAX_UPLOAD {
+        return Err(format!(
+            "（文件 {:.1}MB 超过 {}MB 上限）",
+            bytes.len() as f64 / 1048576.0,
+            MAX_UPLOAD / 1048576
+        ));
+    }
+    let dir = agents::profile_dir(agent).join("work").join("uploads");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("（创建 uploads 目录失败：{e}）"))?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let name = if is_image {
+        format!("{ts}_image{}", image_ext_from_magic(&bytes))
+    } else {
+        format!("{ts}_{file_name}")
+    };
+    std::fs::write(dir.join(&name), &bytes).map_err(|e| format!("（写入文件失败：{e}）"))?;
+    let size = if bytes.len() >= 1048576 {
+        format!("{:.1}MB", bytes.len() as f64 / 1048576.0)
+    } else {
+        format!("{:.0}KB", bytes.len() as f64 / 1024.0)
+    };
+    let kind = if is_image { "图片" } else { "文件" };
+    Ok(format!(
+        "[用户发来{kind}] uploads/{name}（{size}），已存到你的工作目录。请按用户后续指示处理（bash 可解压/查看，read 可读文本内容）。"
+    ))
+}
+
 /// POST /upload：multipart 文件 → {work_dir}/uploads/{时间戳}_{原名}
 async fn upload(State(state): State<Arc<WebState>>, mut multipart: Multipart) -> (StatusCode, Json<Value>) {
     loop {
@@ -2082,11 +2177,27 @@ async fn handle_dm(
             .await;
         return;
     }
-    // b. 非文本消息（图片等 text 为空）
-    if dm.text.trim().is_empty() {
-        let _ = client.send_text(&dm.open_id, "v1 只支持文本消息").await;
+    // b. 非文本消息：文件/图片 → 下载落地到工作目录（v0.11.1 P0），
+    //    合成 prompt 告知 agent；其他类型（语音/表情等）友好提示
+    let prompt_text = if dm.msg_type == "file" || dm.msg_type == "image" {
+        match receive_dm_file(&agent, &client, &dm).await {
+            Ok(note) => note,
+            Err(e) => {
+                let _ = client.send_text(&dm.open_id, &e).await;
+                return;
+            }
+        }
+    } else if dm.text.trim().is_empty() {
+        let _ = client
+            .send_text(
+                &dm.open_id,
+                &format!("暂不支持该消息类型（{}），支持：文本/文件/图片", dm.msg_type),
+            )
+            .await;
         return;
-    }
+    } else {
+        dm.text.clone()
+    };
     // b2. 斜杠命令（/model /new /status /help）：纯文本入口的控件，
     //     处理完直接回复，不进 prompt、不占会话；无会话时（首条 /help）也可用
     {
@@ -2184,7 +2295,7 @@ async fn handle_dm(
                 if q.len() >= DM_QUEUE_MAX {
                     true
                 } else {
-                    q.push_back((dm.text, dm.message_id.clone()));
+                    q.push_back((prompt_text.clone(), dm.message_id.clone()));
                     false
                 }
             };
@@ -2195,7 +2306,7 @@ async fn handle_dm(
         }
     };
     // d-f. 串行跑本 DM 的消息（含排队续发，同 spawn_prompt 的收尾续发语义）
-    let mut item = (dm.text, dm.message_id.clone());
+    let mut item = (prompt_text, dm.message_id.clone());
     loop {
         let (text, mid) = &item;
         run_dm_prompt(&state, &agent, &cf, &client, &dm.open_id, mid, &mut guard, text).await;
