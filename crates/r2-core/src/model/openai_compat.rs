@@ -156,15 +156,22 @@ fn parse_data_payload(payload: &str) -> ModelResult<Vec<StreamChunk>> {
 }
 
 /// SSE 增量解析器：维护缓冲区，按事件边界（\n\n）切分，处理跨网络块的事件
+
+/// 字节缓冲中找 SSE 事件分隔符 b"\n\n" 的位置（切分点天然在 ASCII 边界）
+fn find_event_sep(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\n\n")
+}
+
 struct SseParser {
-    /// 未完整事件的残留字节
-    buffer: String,
+    /// 未完整事件的残留字节（字节级：切分前不转 String，防多字节字符被
+    /// 网络 chunk 边界切开产生 U+FFFD）
+    buffer: Vec<u8>,
 }
 
 impl SseParser {
     fn new() -> Self {
         Self {
-            buffer: String::new(),
+            buffer: Vec::new(),
         }
     }
 
@@ -187,12 +194,16 @@ impl SseParser {
 
     /// 喂入网络字节块，返回本次解析出的 chunks
     fn feed(&mut self, bytes: &[u8]) -> Vec<ModelResult<StreamChunk>> {
-        self.buffer.push_str(&String::from_utf8_lossy(bytes));
+        // 字节级缓冲：网络 chunk 边界不保证落在 UTF-8 字符边界——先转 String
+        // 会把被 TCP 切开的汉字永久替换成 U+FFFD（用户实测"两个问号"根因）。
+        // 攒字节、按完整事件（\n\n 分隔，ASCII 安全边界）切出后再转字符串
+        self.buffer.extend_from_slice(bytes);
         let mut out = Vec::new();
-        while let Some(pos) = self.buffer.find("\n\n") {
-            let event: String = self.buffer.drain(..pos).collect();
+        while let Some(pos) = find_event_sep(&self.buffer) {
+            let event_bytes: Vec<u8> = self.buffer.drain(..pos).collect();
             // 去掉分隔用的 "\n\n"
             self.buffer.drain(..2.min(self.buffer.len()));
+            let event = String::from_utf8_lossy(&event_bytes).into_owned();
             self.handle_event(&event, &mut out);
         }
         out
@@ -201,7 +212,8 @@ impl SseParser {
     /// 流结束时冲刷残留缓冲区（末尾可能没有 \n\n）
     fn finish(&mut self) -> Vec<ModelResult<StreamChunk>> {
         let mut out = Vec::new();
-        let rest = std::mem::take(&mut self.buffer);
+        let rest = String::from_utf8_lossy(&self.buffer).into_owned();
+        self.buffer.clear();
         let trimmed = rest.trim();
         if !trimmed.is_empty() {
             self.handle_event(trimmed, &mut out);
@@ -342,6 +354,27 @@ impl ModelProvider for OpenAiCompatProvider {
 
 #[cfg(test)]
 mod tests {
+    /// 回归测试（用户实测"两个问号"）：TCP chunk 边界把汉字切开时，
+    /// 字节级缓冲必须无损还原——绝不允许 U+FFFD 进回复
+    #[test]
+    fn sse_feed_splits_utf8_across_chunks() {
+        let mut stream = r#"data: {"choices":[{"delta":{"content":"你好世界，测试中文流式"}}]}"#.as_bytes().to_vec();
+        stream.extend_from_slice(b"\n\n");
+        let mid = stream.len() / 2;
+        let mut p = SseParser::new();
+        let c1 = p.feed(&stream[..mid]);
+        let c2 = p.feed(&stream[mid..]);
+        assert!(c1.is_empty(), "半截事件不应解析：{c1:?}");
+        assert_eq!(c2.len(), 1, "拼齐后应出 1 个 chunk");
+        match &c2[0] {
+            Ok(StreamChunk::Delta(s)) => {
+                assert!(s.contains("你好世界") && !s.contains('\u{FFFD}'),
+                    "内容应无损且无替换符：{s:?}");
+            }
+            other => panic!("应为 Delta：{other:?}"),
+        }
+    }
+
     use super::*;
 
     /// 完整的 SSE 流文本（文本增量 + 工具调用分片 + 结束）

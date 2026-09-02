@@ -251,7 +251,13 @@ fn format_output(output: &std::process::Output) -> String {
     buf.extend_from_slice(&output.stderr);
     let truncated = buf.len() > MAX_OUTPUT_BYTES;
     if truncated {
-        buf.truncate(MAX_OUTPUT_BYTES);
+        // 回退到 UTF-8 字符边界——按字节硬切会把汉字切开产生 U+FFFD（两个问号）。
+        // 后续字节匹配 10xxxxxx（(b & 0xC0) == 0x80），回退越过它即落在字符起始
+        let mut end = MAX_OUTPUT_BYTES;
+        while end > 0 && (buf[end] & 0xC0) == 0x80 {
+            end -= 1;
+        }
+        buf.truncate(end);
     }
     let mut text = String::from_utf8_lossy(&buf).into_owned();
     if truncated {
