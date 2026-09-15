@@ -1047,6 +1047,49 @@ fn header_get<'a>(frame: &'a pb::Frame, key: &str) -> Option<&'a str> {
         .map(|h| h.value.as_str())
 }
 
+/// 飞书 post 富文本拍平成纯文本：title 一行 + 每段一行。
+/// text 取文字；a 取链接文字（丢 href）；at 转 @user_id；其他 tag 忽略。
+/// 任何结构异常都安全返回空串或已拼好的部分，不 panic。
+fn flatten_post_text(content: &Option<serde_json::Value>) -> String {
+    let Some(c) = content else { return String::new() };
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(title) = c.get("title").and_then(|t| t.as_str()) {
+        if !title.is_empty() {
+            lines.push(title.to_string());
+        }
+    }
+    let Some(rows) = c.get("content").and_then(|v| v.as_array()) else {
+        return lines.join("\n");
+    };
+    for row in rows {
+        let Some(elems) = row.as_array() else { continue };
+        let mut line = String::new();
+        for e in elems {
+            let tag = e.get("tag").and_then(|t| t.as_str()).unwrap_or("");
+            match tag {
+                "text" | "a" => {
+                    if let Some(t) = e.get("text").and_then(|t| t.as_str()) {
+                        line.push_str(t);
+                    }
+                }
+                "at" => {
+                    if let Some(uid) = e.get("user_id").and_then(|u| u.as_str()) {
+                        line.push('@');
+                        line.push_str(uid);
+                    } else {
+                        line.push_str("@user");
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !line.is_empty() {
+            lines.push(line);
+        }
+    }
+    lines.join("\n")
+}
+
 /// 解析 im.message.receive_v1 事件 JSON → FeishuDm；非该事件或解析失败返回 None
 fn parse_event(payload: &[u8]) -> Option<FeishuDm> {
     let v: serde_json::Value = serde_json::from_slice(payload).ok()?;
@@ -1088,6 +1131,8 @@ fn parse_event(payload: &[u8]) -> Option<FeishuDm> {
             .and_then(|t| t.as_str())
             .map(|t| t.to_string())
             .unwrap_or_default()
+    } else if msg_type == "post" {
+        flatten_post_text(&content_json)
     } else {
         String::new()
     };
@@ -1513,6 +1558,18 @@ mod tests {
         // 非消息事件返回 None
         let payload3 = br#"{"header":{"event_type":"im.chat.updated"},"event":{}}"#;
         assert!(parse_event(payload3).is_none());
+    }
+
+    #[test]
+    fn parse_event_post() {
+        // post 富文本：title 一行 + 每段一行；a 取链接文字丢 href
+        let payload = r#"{"header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_1"}},"message":{"message_id":"om_post","message_type":"post","content":"{\"title\":\"关于命名\",\"content\":[[{\"tag\":\"text\",\"text\":\"我觉得非常好。\"}],[{\"tag\":\"text\",\"text\":\"看看\"},{\"tag\":\"a\",\"text\":\"飞书\",\"href\":\"https://x\"}],[{\"tag\":\"text\",\"text\":\"1. 取耳熟能详的名字\"}]]}"}}}"#.as_bytes();
+        let dm = parse_event(payload).expect("post 事件应解析");
+        assert_eq!(dm.msg_type, "post");
+        assert_eq!(
+            dm.text,
+            "关于命名\n我觉得非常好。\n看看飞书\n1. 取耳熟能详的名字"
+        );
     }
 
     #[test]
