@@ -16,7 +16,7 @@ jobs:
         include:
           - { os: ubuntu-24.04,     target: x86_64-unknown-linux-gnu,  artifact: r2-linux-x86_64 }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, artifact: r2-linux-aarch64 }
-          - { os: macos-13,         target: x86_64-apple-darwin,       artifact: r2-macos-x86_64 }
+          - { os: macos-14,         target: x86_64-apple-darwin,       artifact: r2-macos-x86_64 }
           - { os: macos-14,         target: aarch64-apple-darwin,      artifact: r2-macos-aarch64 }
     runs-on: ${{ matrix.os }}
     steps:
