@@ -1,0 +1,52 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, artifact: r2-linux-x86_64 }
+          - { os: ubuntu-24.04, target: aarch64-unknown-linux-gnu,  artifact: r2-linux-aarch64 }
+          - { os: macos-13,     target: x86_64-apple-darwin,        artifact: r2-macos-x86_64 }
+          - { os: macos-14,     target: aarch64-apple-darwin,       artifact: r2-macos-aarch64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: "${{ matrix.target }}"
+      # linux aarch64 交叉编译需要 gcc-aarch64-linux-gnu（gnu linker）
+      - name: Install cross toolchain (linux aarch64 only)
+        if: matrix.os == 'ubuntu-24.04' && matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }} -p r2-cli
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/r2 dist/
+          cat > dist/PLATFORM.md <<'MD'
+          # 平台支持矩阵
+          | 能力 | Linux | macOS |
+          |---|---|---|
+          | namespace 隔离（Strict 假根/断网） | ✅ | ❌ 自动降级 |
+          | seccomp 白名单 | ✅（sandbox-strict） | ❌ 自动降级 |
+          | cgroup 资源护栏 | ✅ | ❌ 自动降级 |
+          | rlimit（内存/CPU/文件） | ✅ | ✅ |
+          | 墙钟超时组杀 | ✅ | ✅ |
+          | 环境清洗/输出截断 | ✅ | ✅ |
+          MD
+          tar czf ${{ matrix.artifact }}.tar.gz -C dist .
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: "${{ matrix.artifact }}.tar.gz"

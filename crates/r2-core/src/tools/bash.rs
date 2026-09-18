@@ -78,6 +78,7 @@ fn find_dangerous_pattern(command: &str) -> Option<&'static str> {
 
 /// 读 /proc/<pid>/stat，返回 (pgrp, starttime)。
 /// comm 可含空格与括号，必须从最后一个 ')' 之后解析。
+#[cfg(target_os = "linux")]
 fn proc_stat_pgrp_starttime(pid: u32) -> Option<(u32, u64)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = stat.rsplit_once(')')?.1;
@@ -86,6 +87,12 @@ fn proc_stat_pgrp_starttime(pid: u32) -> Option<(u32, u64)> {
     let pgrp = f.get(2)?.parse().ok()?;
     let starttime = f.get(19)?.parse().ok()?;
     Some((pgrp, starttime))
+}
+
+/// macOS 无 /proc，进程身份验证降级（组杀逻辑见 is_still_our_group_leader）
+#[cfg(not(target_os = "linux"))]
+fn proc_stat_pgrp_starttime(_pid: u32) -> Option<(u32, u64)> {
+    None
 }
 
 /// 子进程的 /proc starttime（出生时钟滴答；PID 复用后必变，是身份验证黄金判据）
@@ -99,11 +106,20 @@ fn proc_stat_starttime(pid: u32) -> Option<u64> {
 /// （2026-08-21 桌面连坐死亡加固：PID 复用竞态下 kill -KILL -<旧pid>
 /// 可能命中被复用的进程组，撞上会话组即全灭。遗留窄窗口：kill_on_drop
 /// 对单个已回收 pid 的直接补杀仍在，但爆炸半径从“整组”降到“单进程”。）
+#[cfg(target_os = "linux")]
 fn is_still_our_group_leader(pid: u32, born: Option<u64>) -> bool {
     match (proc_stat_pgrp_starttime(pid), born) {
         (Some((pgrp, starttime)), Some(b)) => pgrp == pid && starttime == b,
         _ => false,
     }
+}
+
+/// macOS 无 /proc，pgrp/starttime 身份验证不可用——降级放行组杀。
+/// 安全性由 process_group(0)（子进程自建进程组）+ kill_on_drop 兜底，
+/// 不要把组杀逻辑废掉（超时必须能杀掉整棵进程树）。
+#[cfg(not(target_os = "linux"))]
+fn is_still_our_group_leader(_pid: u32, _born: Option<u64>) -> bool {
+    true
 }
 
 /// 一次执行的结果：进程输出 + 沙箱降级告警
@@ -555,6 +571,7 @@ mod tests {
     }
 
     /// v0.8.3 组杀加固：/proc stat 解析 + 身份验证
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_proc_stat_starttime_stable() {
         let me = std::process::id();
@@ -563,6 +580,7 @@ mod tests {
         assert_eq!(t1, t2, "同进程 starttime 应稳定");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_group_leader_verification_rejects() {
         // 不存在的 pid → 拒绝组杀
@@ -573,6 +591,7 @@ mod tests {
 
     /// 真实子进程验证：设了 process_group(0) 的是组长应通过；
     /// 未设的是组员（pgrp 继承自本进程）必须拒绝
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_group_leader_verification_real_child() {
         use std::os::unix::process::CommandExt;

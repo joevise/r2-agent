@@ -11,6 +11,12 @@
 use crate::config::SandboxConfig;
 use std::path::{Path, PathBuf};
 
+/// glibc 的 setrlimit 资源参数是枚举类型别名，BSD/macOS 是 c_int
+#[cfg(target_os = "linux")]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(not(target_os = "linux"))]
+type RlimitResource = libc::c_int;
+
 /// 沙箱级别
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxLevel {
@@ -45,7 +51,12 @@ const ENV_WHITELIST: &[&str] = &[
 /// HOME 相关目录在 clean_env 里运行时拼接（const 里写不了 ~）：
 /// ~/.local/bin 和 ~/.hermes/node/bin 是 node/npx/npm 所在地，不拼上沙箱内
 /// npx 会 command not found（跑 MCP / 装包都靠它）
+#[cfg(target_os = "linux")]
 const SANDBOX_SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/local/bin:/snap/bin";
+/// macOS 侧：无 /snap，补 /usr/sbin:/sbin 与 Homebrew 前缀
+#[cfg(not(target_os = "linux"))]
+const SANDBOX_SYSTEM_PATH: &str =
+    "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin";
 
 /// 沙箱配置快照（从 Config 提取，bash 工具持有）
 pub struct Sandbox {
@@ -111,10 +122,11 @@ impl Sandbox {
         }
         // container / strict 都应用：环境清洗 + rlimits
         clean_env(cmd);
-        let use_seccomp = self.strict && with_seccomp && cfg!(feature = "sandbox-strict");
+        let use_seccomp =
+            self.strict && with_seccomp && cfg!(all(feature = "sandbox-strict", target_os = "linux"));
         install_pre_exec(cmd, self, use_seccomp);
 
-        let warn = if self.strict && !cfg!(feature = "sandbox-strict") {
+        let warn = if self.strict && !cfg!(all(feature = "sandbox-strict", target_os = "linux")) {
             // 措辞准确性（8/23）：ns 隔离（假根/pid/net）与 cgroup 由 namespaces.rs 提供、
             // 不依赖此 feature；未编译仅意味着系统调用白名单缺失
             Some(
@@ -128,10 +140,12 @@ impl Sandbox {
 }
 
 /// cgroup v2 unified 挂载点
+#[cfg(target_os = "linux")]
 const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
 
 /// r2 专属 cgroup 组名（建在进程当前 cgroup 之下——用户级 systemd 委派场景
 /// 不能在挂载点根目录建组，必须在自己所在的组内建子组）
+#[cfg(target_os = "linux")]
 const CGROUP_AGENT_DIR: &str = "r2-agent";
 
 /// 找到"可以建组"的最近 cgroup 层：从当前进程所在组逐层向上，
@@ -140,6 +154,7 @@ const CGROUP_AGENT_DIR: &str = "r2-agent";
 /// 不允许内部建组，但其父层（如 user@1000.service）允许建"兄弟组"——
 /// 跨层把 bash 进程写入父层新建组完全合法。
 /// 全部失败返回 None（降级 rlimits）。
+#[cfg(target_os = "linux")]
 fn current_cgroup_dir() -> Option<PathBuf> {
     let Ok(content) = std::fs::read_to_string("/proc/self/cgroup") else {
         return None;
@@ -178,11 +193,13 @@ fn current_cgroup_dir() -> Option<PathBuf> {
 }
 
 /// 检测 root 是否为 cgroup v2 unified 挂载点（存在 cgroup.controllers）
+#[cfg(target_os = "linux")]
 fn is_cgroup_v2(root: &Path) -> bool {
     root.join("cgroup.controllers").exists()
 }
 
 /// pids.max 的写入值：0 = 不限（写 "max"）
+#[cfg(target_os = "linux")]
 fn pids_max_value(max_processes: u32) -> String {
     if max_processes == 0 {
         "max".to_string()
@@ -193,6 +210,7 @@ fn pids_max_value(max_processes: u32) -> String {
 
 /// 把 pid 挂入 r2 专属 cgroup 并写入 pids.max（root 参数便于测试注入 mock fs）。
 /// 任一步失败返回 Err，调用方降级为 rlimits，不影响命令执行。
+#[cfg(target_os = "linux")]
 fn attach_to_cgroup_at(
     root: &Path,
     max_processes: u32,
@@ -230,6 +248,7 @@ fn attach_to_cgroup_at(
 /// bash 子进程 spawn 后立即调用：挂入 cgroup 限 pids。
 /// 返回 Some(warn) 表示降级（非 root / 非 v2 / 只读等），None 表示成功。
 /// 清理说明：临时组不主动删除——systemd 会回收空组，主动删与进程退出有竞态。
+#[cfg(target_os = "linux")]
 pub fn attach_child_to_cgroup(
     max_processes: u32,
     memory_limit_mb: u32,
@@ -259,6 +278,7 @@ pub fn attach_child_to_cgroup(
 /// 使其后代 bash 直接入组，实现会话级资源核算。
 /// 内存说明：memory.max 对整棵子树生效（含 bash 后代）；OOM 时内核直接 SIGKILL，
 /// 因此默认不限（0），由调用方按需设置（云场景建议 512M+）。
+#[cfg(target_os = "linux")]
 pub fn create_session_cgroup(
     name_pid: u32,
     max_processes: u32,
@@ -295,6 +315,29 @@ pub fn create_session_cgroup(
     (mem_warn, Some(group))
 }
 
+/// macOS 降级 stub：cgroup 是 Linux 内核机制，返回与 Linux 失败路径相同的降级结果
+#[cfg(not(target_os = "linux"))]
+pub fn attach_child_to_cgroup(
+    _max_processes: u32,
+    _memory_limit_mb: u32,
+    _pid: u32,
+) -> Option<String> {
+    Some("[sandbox] macOS 不支持 cgroup，降级 rlimits".to_string())
+}
+
+/// macOS 降级 stub：cgroup 是 Linux 内核机制，返回与 Linux 失败路径相同的降级结果
+#[cfg(not(target_os = "linux"))]
+pub fn create_session_cgroup(
+    _name_pid: u32,
+    _max_processes: u32,
+    _memory_limit_mb: u64,
+) -> (Option<String>, Option<PathBuf>) {
+    (
+        Some("[sandbox] macOS 不支持 cgroup，会话资源限额降级 rlimits".to_string()),
+        None,
+    )
+}
+
 /// 环境变量清洗：只保留白名单，PATH 重设为固定值
 fn clean_env(cmd: &mut tokio::process::Command) {
     let kept: Vec<(String, String)> = std::env::vars()
@@ -312,7 +355,7 @@ fn clean_env(cmd: &mut tokio::process::Command) {
 }
 
 /// 设置单个 rlimit（pre_exec 闭包内调用，返回 io 错误会中止 exec）
-fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64) -> std::io::Result<()> {
+fn set_rlimit(resource: RlimitResource, value: u64) -> std::io::Result<()> {
     let lim = libc::rlimit {
         rlim_cur: value,
         rlim_max: value,
@@ -320,6 +363,18 @@ fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64) -> std::io::Resul
     // SAFETY: setrlimit 是异步信号安全的，pre_exec 上下文（fork 后 exec 前）调用合法
     if unsafe { libc::setrlimit(resource, &lim) } != 0 {
         return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// RLIMIT_NPROC（仅 Linux；macOS 的 XNU 内核不支持设置 NPROC，会 EINVAL）
+#[cfg(target_os = "linux")]
+fn set_nproc(nproc: u64) -> std::io::Result<()> {
+    if nproc > 0 {
+        // RLIMIT_NPROC 按"真实 UID 名下全部线程"计数（man 2 setrlimit）——
+        // 桌面/共享 UID 机器上 GUI 应用线程（飞书/Cursor 等）会把配额吃满，导致 fork 全部 EAGAIN。
+        // max_processes=0 表示不设此限制；仅单用途容器（r2 独占 uid）建议设 64-256。
+        set_rlimit(libc::RLIMIT_NPROC, nproc)?;
     }
     Ok(())
 }
@@ -333,12 +388,10 @@ fn install_pre_exec(cmd: &mut tokio::process::Command, sbx: &Sandbox, use_seccom
     // SAFETY: 闭包内只调用异步信号安全的 libc 函数与 seccomp 安装，符合 pre_exec 约束
     unsafe {
         cmd.pre_exec(move || {
-            // RLIMIT_NPROC 按"真实 UID 名下全部线程"计数（man 2 setrlimit）——
-            // 桌面/共享 UID 机器上 GUI 应用线程（飞书/Cursor 等）会把配额吃满，导致 fork 全部 EAGAIN。
-            // max_processes=0 表示不设此限制；仅单用途容器（r2 独占 uid）建议设 64-256。
-            if nproc > 0 { 
-                set_rlimit(libc::RLIMIT_NPROC, nproc)?; 
-            }
+            #[cfg(target_os = "linux")]
+            set_nproc(nproc)?;
+            #[cfg(not(target_os = "linux"))]
+            let _ = nproc;
             // 0 = 不设。RLIMIT_AS 计虚拟地址空间，JIT（V8/rustc）预留 4-16GB VA
             // 是常态，任何硬限值都误伤；物理护栏走 cgroup memory.max（RSS 计费）。
             // FSIZE 同理：包/模型文件百 MB 级常态。CPU 由 bash 墙钟超时兜底
@@ -351,11 +404,11 @@ fn install_pre_exec(cmd: &mut tokio::process::Command, sbx: &Sandbox, use_seccom
             if fsize > 0 {
                 set_rlimit(libc::RLIMIT_FSIZE, fsize)?;
             }
-            #[cfg(feature = "sandbox-strict")]
+            #[cfg(all(feature = "sandbox-strict", target_os = "linux"))]
             if use_seccomp {
                 install_seccomp().map_err(std::io::Error::other)?;
             }
-            #[cfg(not(feature = "sandbox-strict"))]
+            #[cfg(not(all(feature = "sandbox-strict", target_os = "linux")))]
             let _ = use_seccomp;
             Ok(())
         });
@@ -363,7 +416,8 @@ fn install_pre_exec(cmd: &mut tokio::process::Command, sbx: &Sandbox, use_seccom
 }
 
 /// seccomp 白名单 syscall（x86_64 为主；个别名字在某些架构不存在时静默跳过）
-#[cfg(feature = "sandbox-strict")]
+/// （seccomp 是 Linux 内核机制，macOS 不编译）
+#[cfg(all(feature = "sandbox-strict", target_os = "linux"))]
 const SECCOMP_WHITELIST: &[&str] = &[
     "read",
     "write",
@@ -435,7 +489,7 @@ const SECCOMP_WHITELIST: &[&str] = &[
 ];
 
 /// 安装 seccomp 过滤器：默认 KillProcess + 白名单 Allow
-#[cfg(feature = "sandbox-strict")]
+#[cfg(all(feature = "sandbox-strict", target_os = "linux"))]
 fn install_seccomp() -> Result<(), String> {
     use libseccomp::{ScmpAction, ScmpFilterContext, ScmpSyscall};
     let mut filter =
@@ -584,6 +638,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_cgroup_v2_detection() {
         let tmp = tempfile::tempdir().unwrap();
@@ -594,6 +649,7 @@ mod tests {
         assert!(is_cgroup_v2(tmp.path()));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_pids_max_value() {
         assert_eq!(pids_max_value(0), "max");
@@ -601,6 +657,7 @@ mod tests {
         assert_eq!(pids_max_value(256), "256");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_attach_mock_v2_success() {
         // mock v2 挂载点：建组 + pids.max + cgroup.procs 全链路成功
@@ -619,6 +676,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(group.join("pids.max")).unwrap(), "max");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_attach_non_v2_errors_not_panics() {
         // 非 v2 根（空目录）→ Err 降级，不 panic
@@ -627,6 +685,7 @@ mod tests {
         assert!(err.contains("非 cgroup v2"), "got: {err}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_attach_readonly_fs_degrades() {
         // mock 只读 fs：v2 文件存在但目录不可写 → Err 降级（root 下权限位失效，跳过）
@@ -642,7 +701,7 @@ mod tests {
         assert!(result.is_err(), "只读 fs 应降级：{result:?}");
     }
 
-    #[cfg(feature = "sandbox-strict")]
+    #[cfg(all(feature = "sandbox-strict", target_os = "linux"))]
     #[tokio::test]
     #[ignore = "手动验证：白名单下 echo 应正常"]
     async fn test_seccomp_echo_ok() {

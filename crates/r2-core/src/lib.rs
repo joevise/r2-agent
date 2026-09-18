@@ -27,7 +27,12 @@
 //! ## 特性（cargo features）
 //!
 //! - `l3-memory`：启用 L3 跨会话记忆（基于 SQLite 向量索引）
-//! - `sandbox-strict`：启用 strict 级 seccomp 沙箱（系统需安装 libseccomp-dev）
+//! - `sandbox-strict`：启用 strict 级 seccomp 沙箱（系统需安装 libseccomp-dev，仅 Linux）
+//!
+//! ## 平台支持
+//!
+//! Linux 全功能（namespace/seccomp/cgroup 沙箱）。macOS 可编译运行，沙箱降级为
+//! rlimit + 超时 + 环境变量清洗（无 namespace/seccomp/cgroup，这些是 Linux 内核机制）。
 
 pub mod agent;
 pub mod agents;

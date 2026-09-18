@@ -11,6 +11,9 @@
 //!
 //! 设计原则：Docker 的隔离本体就是 namespace+cgroup+seccomp——R2 已全部自实现，
 //! 不再雇 200MB 的管家。详见 docs/v05-cloud-sandbox-plan.md。
+//!
+//! 平台说明：namespace/cgroup 隔离仅 Linux 可用；macOS 下经 r2-core 降级 stub
+//! 自动退回 rlimits+环境清洗（create_session_cgroup 返回 None，入组代码不可达）。
 
 use r2_core::config::Config;
 use std::path::PathBuf;
@@ -123,6 +126,8 @@ pub fn run_sandbox(
 
     println!("═══ r2 自孵化沙箱会话 ═══");
     println!("  会话目录: {}", sess.display());
+    #[cfg(not(target_os = "linux"))]
+    println!("  ⚠ 沙箱会话的 namespace/cgroup 隔离仅支持 Linux，本机降级运行（rlimits+环境清洗仍生效）");
 
     // 1) 预建会话组（组名含 supervisor pid——spawn 前可知，可注入 env）
     let (cg_warn, group) = r2_core::sandbox::create_session_cgroup(

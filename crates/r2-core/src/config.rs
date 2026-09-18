@@ -175,12 +175,14 @@ pub struct SandboxConfig {
     /// 单文件写入上限（MB，RLIMIT_FSIZE，防写爆磁盘）
     #[serde(default = "default_max_file_size_mb")]
     pub max_file_size_mb: u32,
-    /// cgroup v2 pids 限制开关（默认开；无 root / 非 v2 / 只读时自动降级回 rlimits）
+    /// cgroup v2 pids 限制开关（默认开；无 root / 非 v2 / 只读时自动降级回 rlimits）。
+    /// 配置字段跨平台保留；macOS 下 cgroup 配置无效并降级（cgroup 是 Linux 内核机制）
     #[serde(default = "default_cgroup")]
     pub cgroup: bool,
     /// cgroup v2 物理内存护栏（MB，0=不限）。与 RLIMIT_AS 的本质区别：
     /// memory.max 按 RSS（实际物理占用）计费，不误伤 JIT 的虚拟内存预留。
-    /// bash 命令挂临时 cgroup 组生效；cgroup 不可用时降级（无护栏不阻断执行）
+    /// bash 命令挂临时 cgroup 组生效；cgroup 不可用时降级（无护栏不阻断执行）。
+    /// macOS 下无效并降级（同上）
     #[serde(default)]
     pub cgroup_memory_mb: u32,
     /// bash 高危命令启发式拦截（默认关，向后兼容；开启后拦截 rm -rf / 等明显逃逸模式）

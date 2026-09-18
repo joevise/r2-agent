@@ -72,6 +72,7 @@ enum Commands {
         host: String,
     },
     /// 自孵化沙箱会话（v0.5）：每会话一个隔离子进程（cgroup+env清洗+strict bash）
+    /// （namespace/cgroup 隔离仅 Linux；macOS 自动降级 rlimits+环境清洗）
     Sandbox {
         #[command(subcommand)]
         action: SandboxAction,
@@ -90,10 +91,10 @@ enum SandboxAction {
     Run {
         /// 会话提示词
         prompt: String,
-        /// 会话内存上限 MB（cgroup memory.max，0=不限；OOM 内核直接杀）
+        /// 会话内存上限 MB（cgroup memory.max，0=不限；OOM 内核直接杀；仅 Linux，macOS 忽略）
         #[arg(long, default_value_t = 0)]
         memory: u64,
-        /// 会话进程树上限（cgroup pids.max）
+        /// 会话进程树上限（cgroup pids.max；仅 Linux，macOS 忽略）
         #[arg(long, default_value_t = 256)]
         pids: u32,
         /// 会话结束后删除会话目录（产物不保留）

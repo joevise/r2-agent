@@ -16,7 +16,12 @@
 //! - **ps/top 复活**：沙箱内 /proc 可用，且只见沙箱自身进程（宿主进程不可见）
 //! - **内核级清理**：PID 1（sh）死亡 → 内核回收整个 PID 空间，零僵尸
 //! - **退出码传播**：中间进程 waitpid 孙进程后 _exit 同码（信号 → 128+sig）
+//!
+//! 平台说明：namespace 隔离（unshare/CLONE_NEW*/chroot）是 Linux 内核机制，
+//! 全部实现仅在 Linux 编译；macOS 下提供同名降级 stub（can_namespace()=false）。
 
+#[cfg(target_os = "linux")]
+mod linux_impl {
 use std::ffi::CString;
 use std::io::Read;
 use std::os::unix::fs::symlink;
@@ -465,3 +470,37 @@ mod tests {
         let _ = c5;
     }
 }
+}
+
+#[cfg(target_os = "linux")]
+pub use linux_impl::*;
+
+/// macOS 降级 stub：namespace 隔离仅支持 Linux。
+/// install_sandbox_pre_exec 只在 bash.rs 的 can_namespace()==true 分支里被调用，
+/// macOS 下不可达，stub 仅为让链接通过。
+#[cfg(not(target_os = "linux"))]
+mod stub_impl {
+    use std::path::{Path, PathBuf};
+
+    pub fn can_namespace() -> bool {
+        false
+    }
+
+    pub fn prepare_min_root(_work_dir: &Path) -> Result<PathBuf, String> {
+        Err("namespace 隔离仅支持 Linux".to_string())
+    }
+
+    /// # Safety
+    /// 与 Linux 版签名一致；macOS 下不可达（can_namespace()==false）
+    pub unsafe fn install_sandbox_pre_exec(
+        _cmd: &mut std::process::Command,
+        _root: PathBuf,
+        _work_dir: PathBuf,
+        _command: &str,
+    ) {
+        unreachable!("namespace 仅 Linux")
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub use stub_impl::*;
