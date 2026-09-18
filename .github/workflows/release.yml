@@ -3,6 +3,7 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -13,24 +14,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, artifact: r2-linux-x86_64 }
-          - { os: ubuntu-24.04, target: aarch64-unknown-linux-gnu,  artifact: r2-linux-aarch64 }
-          - { os: macos-13,     target: x86_64-apple-darwin,        artifact: r2-macos-x86_64 }
-          - { os: macos-14,     target: aarch64-apple-darwin,       artifact: r2-macos-aarch64 }
+          - { os: ubuntu-24.04,     target: x86_64-unknown-linux-gnu,  artifact: r2-linux-x86_64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, artifact: r2-linux-aarch64 }
+          - { os: macos-13,         target: x86_64-apple-darwin,       artifact: r2-macos-x86_64 }
+          - { os: macos-14,         target: aarch64-apple-darwin,      artifact: r2-macos-aarch64 }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: "${{ matrix.target }}"
-      # linux aarch64 交叉编译需要 gcc-aarch64-linux-gnu（gnu linker）
-      - name: Install cross toolchain (linux aarch64 only)
-        if: matrix.os == 'ubuntu-24.04' && matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }} -p r2-cli
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
       - name: Package
         run: |
           mkdir -p dist
