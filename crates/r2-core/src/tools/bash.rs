@@ -144,6 +144,11 @@ impl BashTool {
         } else {
             "bash"
         };
+        // cwd 防御：work_dir 缺失时 macOS posix_spawn 报 EINVAL（Linux 才报 ENOENT），
+        // 错误码有误导性——spawn 前确保目录存在（手工建/旧版迁移的 agent 常见缺 work/）
+        if !self.work_dir.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(&self.work_dir);
+        }
         let mut cmd = Command::new(program);
         cmd.arg("-c")
             .arg(command)
