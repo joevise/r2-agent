@@ -2,213 +2,176 @@
 
 > **Small droid, big jobs.**
 
-一个 ~5000 行 Rust 实现的极简 Agent 运行时，release 二进制仅 ~2MB，零外部服务依赖——丢到任何 Linux 上就能跑。
+一个 Rust 实现的轻量 Agent 运行时：引擎极简（零平台代码）、分身独居一亩三分地、飞书原生渠道、沙箱五层防护。release 二进制约 2MB，零外部服务依赖——Linux / macOS 丢上就能跑。
 
 > 名字致敬 R2-D2：房间里最小的机器人，没有光剑，不多话，只有工具和执行力。拯救世界几十年。
 
 ## 特性
 
-- **双 Provider**：OpenAI 兼容协议（OpenAI / 智谱 / DeepSeek 等）+ Anthropic Messages API，SSE 流式解析，429/5xx 指数退避重试
-- **三级上下文缓存**：L1 工作记忆（token 预算）→ L2 压缩摘要（阈值触发）→ L3 跨会话记忆（可选编译）
-- **4 个核心工具**：`read` / `write` / `edit` / `bash`，全部路径越界防护
-- **三级沙箱**：off / container（rlimits + 环境变量清洗）/ strict（+ seccomp 系统调用白名单）
-- **崩溃安全会话**：JSONL 追加写、逐行 flush，断电最多丢半行，恢复时自动丢弃残行
-- **118 个测试**（`--features l3-memory`），含恶意输入 fuzz 与边界防御
+- **多 Provider × 多模型档案**：OpenAI 兼容 + Anthropic Messages API，SSE 流式（字节级 UTF-8 安全），429/5xx 指数退避；`[[model.profiles]]` 跨 provider 配多套模型（如 glm + kimi），飞书/Console 一键切换
+- **飞书原生渠道**：每分身一个飞书自建应用，WebSocket 长连接免公网回调；CardKit 流式卡片；斜杠命令 `/model` `/new` `/status` `/help`；**在途消息 = steer 转向**（打断当前流注入新指令，不丢消息）；文件/图片/富文本（post）全接收；DM 会话跨重启续接
+- **多分身**：每个 agent 独居 `~/.r2/agents/<name>/`（人格 / MCP / 记忆 / 会话 / 工作目录物理隔离），群聊多分身协作 MVP
+- **三级上下文 + 三层记忆**：L1 工作记忆 → L2 压缩摘要 → MEMORY.md 策展记忆注入 system prompt + `history` 全文检索工具（零 embedding 依赖）
+- **五层沙箱**：rlimits / cgroup v2（pids + memory.max RSS 护栏）/ 环境清洗 / namespace 假根隔离（userns 双 fork + mount + pid + 断网）/ seccomp 白名单；**Linux 全功能，macOS 自动降级**（rlimit + 超时组杀 + 环境清洗）
+- **MCP 一亩三分地**：作为 MCP host 连外部 server，动态注册工具；每分身独立 `MCP.toml` + env 注入，能力扩展不进引擎核心
+- **崩溃安全会话**：JSONL 追加写、逐行 flush，断电最多丢半行
+- **R2 Console**：单文件内嵌 Web UI（黑白终端美学），流式对话 / steer / 会话分支树 / 三层 system prompt 编辑 / 模型切换 / 沙箱面板 / 文件上传 / 成本显示
+- **265 个测试**：含 SSE 畸形输入 fuzz、组杀身份验证、namespace 边界、UTF-8 截断回归
 
 ## Quick Start
 
 ```bash
-# 构建（release 二进制约 2MB）
+# 方式一：下载预编译（GitHub Releases，tag 触发自动构建）
+#   r2-linux-x86_64 / r2-linux-aarch64 / r2-macos-x86_64 / r2-macos-aarch64
+curl -LO https://github.com/joevise/r2-agent/releases/latest/download/r2-linux-x86_64.tar.gz
+
+# 方式二：源码构建（~2MB 二进制）
 cargo build --release
 
 # 配置：复制示例并填入 API Key
 mkdir -p ~/.r2 && cp docs/config.example.toml ~/.r2/config.toml
 
-# 交互模式
-r2
-
-# 单发模式（问完即退）
-r2 --once "读一下 config.toml 并解释每个字段"
-
-# 恢复会话
-r2 --session abc-123
+r2          # 交互模式
+r2 --once "读一下 config.toml 并解释每个字段"   # 单发
+r2 web      # Console（http://127.0.0.1:5290）
 ```
 
-交互模式下可用斜杠命令：`/help` `/clear`（清空上下文、开新会话）`/quit`。
+### 平台支持
+
+| 能力 | Linux | macOS | Windows |
+|---|---|---|---|
+| 核心引擎 / 工具 / 会话 / Console | ✅ | ✅ | 规划中 |
+| 飞书渠道 / MCP / 多分身 | ✅ | ✅ | 规划中 |
+| namespace 假根隔离（strict） | ✅ | 自动降级 | — |
+| seccomp 白名单 | ✅（feature） | 自动降级 | — |
+| cgroup 资源护栏 | ✅ | 自动降级 | — |
+| rlimit / 墙钟超时组杀 / 环境清洗 | ✅ | ✅ | — |
 
 ## CLI 参考
 
-| 命令 / 参数 | 说明 |
+| 命令 | 说明 |
 |---|---|
-| `r2` | 交互模式 |
-| `r2 --once <问题>` | 单发模式，回答完退出 |
-| `r2 --config <路径>` | 指定配置文件（默认 `~/.r2/config.toml`，缺省用内置默认值） |
-| `r2 --session <id>` | 恢复指定会话 |
-| `r2 --model <名称>` | 覆盖当前 provider 的模型 |
-| `r2 --work-dir <目录>` | 覆盖工作目录（工具与 bash 的根目录） |
-| `r2 --list-sessions` | 列出所有会话（等同 `r2 sessions`） |
-| `r2 sessions` | 列出所有会话（按最后活跃倒序） |
-| `r2 sessions show <id>` | 人类可读地打印会话内容（工具参数截断 120 字符） |
-| `r2 sessions export <id> [--out <文件>]` | 导出会话为 JSON |
+| `r2` | 交互模式（`/help` `/clear` `/quit`） |
+| `r2 --once <问题>` | 单发模式 |
+| `r2 --model <名称>` | 覆盖当前模型 |
+| `r2 --session <id>` / `r2 sessions [show/export <id>]` | 会话恢复 / 列表 / 查看 / 导出 |
+| `r2 web [--host 0.0.0.0] [--port 5290]` | 启动 Console Web UI |
+| `r2 sandbox run <命令>` | 在沙箱会话中执行（每会话独立 cgroup + 假根） |
 
 ## 配置说明
 
-完整 `config.toml` 字段（均可缺省，有内置默认值；示例见 [docs/config.example.toml](docs/config.example.toml)）：
+完整字段见 [docs/config.example.toml](docs/config.example.toml)，均可缺省。核心段：
 
 ```toml
 [model]
-provider = "openai_compat"        # openai_compat | anthropic
+provider = "openai_compat"          # openai_compat | anthropic
 
-[model.openai_compat]
-base_url = "https://api.openai.com/v1"  # 兼容端点（智谱/DeepSeek 等均可）
-api_key = ""                      # API 密钥
-model = "gpt-4o"                  # 模型名
+# 多模型档案：跨 provider 配多套，active 持久化，Console/飞书可切换
+[[model.profiles]]
+name = "glm"
+provider = "openai_compat"
+model = "glm-5.2"
 
-[model.anthropic]
-base_url = "https://api.anthropic.com"
-api_key = ""
-model = "claude-sonnet-4-20250514"
+[[model.profiles]]
+name = "kimi"
+model = "kimi-k3"
 
 [agent]
-max_turns = 50                    # 单轮对话最大工具循环轮数
-max_total_tokens = 500000         # 上下文硬上限（也是 L1 窗口大小）
-work_dir = "."                    # 工作目录（支持 ~ 展开）
-
-[context]
-l1_threshold = 0.7                # L2 压缩触发阈值（占 max_total_tokens 比例）
-l2_summary_model = "gpt-4o-mini"  # 摘要模型（当前版本预留，实际复用主模型）
-l3_enabled = false                # 跨会话记忆（需 --features l3-memory 编译）
+max_turns = 50
+max_total_tokens = 500000
 
 [sandbox]
-level = "container"               # off | container | strict
-bash_timeout_secs = 30            # bash 默认超时（上限 120s）
-max_processes = 0                 # NPROC + cgroup pids.max；0=不限，生产独占 uid 建议 64-256
-max_memory_mb = 512               # RLIMIT_AS
-cpu_time_secs = 60                # RLIMIT_CPU
-max_file_size_mb = 100            # RLIMIT_FSIZE
-cgroup = true                     # cgroup v2 pids 硬限（不可用时自动降级 rlimits）
-bash_restrict_workdir = false     # 高危命令启发式拦截（rm -rf /、| sh 等，软层）
+level = "container"       # off | container | strict
+cgroup = true             # cgroup v2 pids 硬限（不可用自动降级）
+cgroup_memory_mb = 0      # RSS 物理内存护栏（0=不限；不误伤 JIT 的 VA 预留）
+max_processes = 0         # RLIMIT_NPROC；0=不限（桌面共享 uid 勿设小值）
+bash_timeout_secs = 30
 
-[session]
-dir = "~/.r2/sessions"            # 会话 JSONL 存储目录（支持 ~ 展开）
+[feishu]                  # 飞书渠道（每分身一个自建应用）
+app_id = ""
+app_secret = ""
 ```
+
+## 飞书渠道
+
+每个分身绑定一个飞书自建应用（WebSocket 长连接，无需公网回调 / HTTPS / Nginx）：
+
+- **私聊**：直接和分身对话，CardKit 流式卡片实时渲染
+- **斜杠命令**：`/model`（切模型档案，会话原地重建保历史）/ `/new`（新会话）/ `/status` / `/help`
+- **steer 插话**：生成过程中发消息 = 中途转向，注入当前流；收尾窗口残留自动补投，绝不静默丢弃
+- **文件 / 图片 / post 富文本**：全部接收——文件落 `work/uploads/`，富文本自动拍平为纯文本进对话
+- **会话续接**：DM 会话 ID 落盘（`dm/<open_id>.sid`），R2 重启后继续原会话
+
+## 多分身与 MCP
+
+```
+~/.r2/agents/<name>/
+├── AGENT.toml        # 分身配置（人格参数、模型档案）
+├── MCP.toml          # 该分身专属的 MCP server 列表（含 env 注入）
+├── SOUL.md           # 人格
+├── work/             # 工作目录（MEMORY.md 记忆 / uploads/ 上传文件）
+├── dm/               # 飞书 DM 会话指针
+└── sessions/         # 会话 JSONL
+```
+
+MCP 工具以 `mcp_{server}_{tool}` 注册，单 server 失败只告警不阻塞；agent 退出自动回收子进程。**引擎核心零平台代码**——能力扩展一律外挂（MCP / skill 装在分身自己目录）。
 
 ## 架构
 
 ```
 r2-agent/
-├── src/
-│   ├── main.rs             # CLI 入口：clap 参数、REPL、会话管理命令
-│   ├── agent.rs            # 循环引擎：流式 → 解析 → 工具调用 → 再提示
-│   ├── context.rs          # L1 工作记忆 + L2 压缩摘要
-│   ├── memory.rs           # L3 跨会话记忆（feature: l3-memory，rusqlite）
-│   ├── session.rs          # JSONL 持久化 + 崩溃恢复
-│   ├── sandbox.rs          # 三级沙箱：rlimits + cgroup pids + 环境清洗 + seccomp
-│   ├── config.rs           # TOML 配置 + 校验 + ~ 展开
-│   ├── types.rs            # Message / ToolCall / StreamChunk 等核心类型
-│   ├── model/              # ModelProvider trait + 双 provider
-│   │   ├── openai_compat.rs
-│   │   └── anthropic.rs
-│   └── tools/              # read / write / edit / bash + 路径防护
-└── tests/                  # 集成测试 + E2E 套件
+├── crates/
+│   ├── r2-core/               # 引擎（零平台代码）
+│   │   └── src/
+│   │       ├── agent.rs       # 循环引擎：流式 → 解析 → 工具 → 再提示
+│   │       ├── channels.rs    # 飞书渠道：WS 长连接 / CardKit / steer / 文件接收
+│   │       ├── namespaces.rs  # strict 沙箱：userns 双 fork + mount 假根 + 断网
+│   │       ├── sandbox.rs     # rlimits / cgroup / 环境清洗 / seccomp
+│   │       ├── mcp.rs         # MCP host：stdio + 动态工具注册
+│   │       ├── groups.rs      # 群聊多分身协作
+│   │       ├── evolution.rs / rpc.rs / config.rs / agents.rs
+│   │       └── tools/         # read/write/edit/bash/task/history/mcp_admin
+│   └── r2-cli/                # CLI + Console Web（web_ui.html 单文件内嵌）
+└── .github/workflows/release.yml   # tag → 四平台产物自动构建
 ```
 
-**三级上下文**：
-
-- **L1 工作记忆**：token 预算内的活跃消息（`max_total_tokens` 硬上限，超限报错）
-- **L2 压缩摘要**：token 超过 `l1_threshold` 比例时，旧消息（对齐工具调用组切分）被压缩成摘要，保留最近 12 条
-- **L3 跨会话记忆**（可选）：256 维字符三元组哈希 embedding + 余弦检索，rusqlite 存储，跨会话召回历史结论
-
-详细设计文档见飞书（内部）。
-
-## MCP 外部工具
-
-r2 可作为 MCP host 连接外部 MCP server（stdio 传输），把 server 提供的工具动态注册进工具表，模型像用内置工具一样调用它们。配置示例：
-
-```toml
-[[mcp.servers]]
-name = "filesystem"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-```
-
-- 工具以 `mcp_{server}_{tool}` 前缀注册，不与内置工具撞名
-- 单个 server 连接失败只告警跳过，不影响启动；请求默认 30s 超时
-- Agent 退出时自动杀掉 MCP server 子进程
+**三级上下文**：L1 工作记忆（token 硬上限）→ L2 压缩摘要（阈值触发，对齐工具组切分）→ MEMORY.md 策展注入 + `history` 工具全文检索。
 
 ## 沙箱
 
-三级级别 × 四层防护，逐层叠加、逐层可降级：
-
-| 层 | 机制 | 说明 |
+| 层 | 机制 | 级别 |
 |---|---|---|
-| rlimits | NPROC / AS / CPU / FSIZE | `container` 起生效。注意 RLIMIT_NPROC 按真实 uid 全部线程计数，桌面/共享 uid 机器勿设小值 |
-| cgroup v2 pids | `pids.max` 硬限 | fork 炸弹的真正硬隔离（NPROC 堵不住的真空）。`cgroup = true` 默认开；无 root / 非 v2 / 只读时自动降级回 rlimits 并告警，不失败 |
-| 启发式拦截 | 高危命令模式匹配 | `bash_restrict_workdir = true` 开启（默认关）。拦截 `rm -rf /`、`mkfs`、`\| sh` 注入等 ~19 个高危模式。软层，防误操作/防注入常见路径；硬隔离需 namespace（v0.5 规划） |
-| seccomp | syscall 白名单（~65 个） | 仅 `strict` 级，需 `--features sandbox-strict` 编译且安装 libseccomp-dev；未编译时降级为 container 并告警 |
+| rlimits | NPROC / AS / CPU / FSIZE（默认全 0 = 不设，避免误伤 JIT/桌面） | container 起可用 |
+| cgroup v2 | `pids.max` 防 fork 炸弹 + `memory.max` RSS 护栏 | container 起可用 |
+| 环境清洗 | API Key 不进子进程 + PATH 重置 | container 起 |
+| namespace | mount 假根（chroot）/ pid ns / 断网，userns 双 fork 免 root | strict |
+| seccomp | ~65 syscall 白名单（feature `sandbox-strict`） | strict |
 
-| 级别 | 能力 |
-|---|---|
-| `off` | 不做任何隔离 |
-| `container`（默认） | rlimits + cgroup pids + 环境变量白名单清洗（API Key 不进子进程）+ PATH 重置 |
-| `strict` | container + seccomp 系统调用白名单 |
+降级链全程不 panic：strict 无 seccomp 编译 → container；cgroup 只读 → rlimits；**macOS → rlimit + 超时组杀 + 环境清洗**（namespace/cgroup/seccomp 为 Linux 内核机制，mac 自动降级并告警）。
 
-降级链：`strict`（无 seccomp 编译）→ `container`；cgroup 不可写 → 仅 rlimits；全程不 panic、命令照常执行并附 WARN。
-
-**生产建议**：`max_processes = 64-256` + `cgroup = true`（独占 uid 容器部署）；桌面交互使用保持 `max_processes = 0`（不限）。
-
-**seccomp 编译说明**（`strict` 级才需要）：默认 feature 不含 seccomp（避免系统缺 libseccomp 时构建失败）。启用：`apt install libseccomp-dev` 后 `cargo build --features sandbox-strict`。
+超时组杀带 **PID 身份验证**（pgrp + starttime 双重核对，防 PID 复用误杀）。
 
 ## 测试
 
 ```bash
-# 默认套件（106 个测试）
-cargo test
-
-# 含 L3 记忆（118 个测试）
-cargo test --features l3-memory
-
-# E2E 套件（Python，需先构建 release）
-python3 tests/e2e/l3_memory_suite.py
+cargo test --workspace        # core 213 + cli 32 等共 265 个测试
 ```
 
-覆盖：SSE 畸形输入 fuzz（不 panic）、会话恢复极端输入（5MB 大行 / 全坏行 / BOM / CRLF）、工具参数类型错误、上下文阈值越界等。
+覆盖：SSE 畸形输入 fuzz、会话恢复极端输入（5MB 大行 / 全坏行 / BOM / CRLF）、UTF-8 多字节截断回归、组杀身份验证、工具参数类型防御、沙箱降级路径。
 
-## 路线图
+## 版本纪要
 
-| 阶段 | 交付物 | 状态 |
-|---|---|---|
-| P0 | 核心循环 + OpenAI 兼容 provider | ✅ |
-| P0.5 | Anthropic provider | ✅ |
-| P1 | 4 核心工具 + ToolRegistry | ✅ |
-| P2 | 会话 JSONL + 崩溃恢复 | ✅ |
-| P3 | L2 上下文压缩 | ✅ |
-| P4 | 沙箱三级 | ✅ |
-| P5 | L3 跨会话记忆 | ✅ |
-| P6 | CLI + 配置打磨 | ✅ |
-| P7 | 测试加固（fuzz + 边界） | ✅ |
+| 版本 | 交付 |
+|---|---|
+| v0.5 | namespace 沙箱 strict 档（双 fork 假根 + 断网） |
+| v0.8 | 桌面安全加固（组杀身份验证）；多分身；群聊 MVP；KV-cache |
+| v0.9 | AppArmor userns 适配；沙箱自孵化会话 |
+| v0.10 | 飞书渠道（斜杠命令 / steer / 沙箱资源面板 / DM 跨重启续接） |
+| v0.11 | 三层记忆（MEMORY.md + history 工具）；文件/图片/post 接收；UTF-8 字节级修复 |
+| v0.12 | **macOS 原生支持**（沙箱平台分叉）+ GitHub Actions 四产物发版流水线 |
 
-**v0.2 展望**：neural embedding（替换哈希 embedding）、namespace 沙箱（真正的文件系统隔离）、MCP 工具协议接入。
+**路线**：Windows 适配（bash→PowerShell、信号模型）、vision 多模态档案、群聊打磨。
 
 ## License
 
 MIT
-
-## R2 Console（Web UI）
-
-```bash
-r2 web                    # 本机访问 http://127.0.0.1:5290
-r2 web --host 0.0.0.0     # 局域网/手机访问（注意安全）
-```
-
-黑白终端美学的 Web Playground：对话流式、工具调用展示、**运行中 steer 转向**、
-会话分支树 + fork、三层 system prompt 编辑（核心/SOUL.md/AGENTS.md）、
-MCP 工具面板、沙箱状态、文件拖拽上传、成本实时显示。单文件内嵌 UI，
-零 npm 依赖，手机自适应（抽屉式侧栏）。
-
-## 自定义 Agent 人格与项目上下文
-
-```bash
-~/.r2/SOUL.md          # 全局人格（所有项目生效）
-{work_dir}/AGENTS.md   # 项目上下文（行业标准文件名，Cursor/Codex 通用）
-```
