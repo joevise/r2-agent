@@ -1671,10 +1671,16 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
 // 私聊消息路由到它自己的持久 AgentSession（每 (agent, open_id) 一个），回复发回飞书。
 // dm_sessions 与 state.agent 主槽位完全隔离：main console 会话不受任何影响。
 
-/// DM prompt 超时（秒）。8/25 用户实测：复杂任务（思考+工具链）120s 截断太短——
-/// 提到 600s 与后台任务同档；Console 单聊本就无超时
-// 必须 > bash MAX_TIMEOUT_SECS(600) + 收尾余量：否则 DM deadline 恒先撞，工具结果被丢弃
-const DM_PROMPT_TIMEOUT_SECS: u64 = 900;
+/// DM 回合真死判据（秒，v0.12.5 活性驱动）：连续 600s 零事件才掐断，
+/// 替代 v0.12.3 的固定墙钟 deadline——忙 = 永生（模型每吐一个 chunk、
+/// 工具每回一个结果，计时器经 IdleDeadline 重置），死 = 有交代
+const DM_IDLE_KILL_SECS: u64 = 600;
+/// 真死保险丝：掐断后延迟 5 秒自动续跑（给收尾留时间）
+const DM_RESUME_DELAY_SECS: u64 = 5;
+/// 真死保险丝：最多自动续跑 2 次，再掐断则挂起等用户
+const DM_RESUME_MAX: u32 = 2;
+/// 续跑内部消息（role=user 进会话 JSONL，[系统续跑] 前缀可审计）
+const DM_RESUME_MSG: &str = "[系统续跑] 上一任务因长时间无响应被中断（工具结果已标记未知）。请基于当前上下文继续任务或向用户汇报状态。";
 /// none 档心跳间隔：静默处理超 2 分钟时告知用户还活着（compact/full 有过程流不需）
 const DM_HEARTBEAT_SECS: u64 = 120;
 /// 深度心跳间隔（v0.12.4）：连续 300s 无任何新输出即汇报，不限模式（有卡片也发）
@@ -1711,6 +1717,9 @@ struct DmSession {
     /// 在途活动探针句柄（v0.12.4 忙碌必答的信息源）：外层 Mutex 只为
     /// /new /model 重建会话时换句柄；读时双锁均短持。与 steer_tx 同生命周期
     activity: StdMutex<r2_core::agent::ActivityHandle>,
+    /// 真死保险丝计数（v0.12.5）：掐断触发续跑前 +1，回合正常完成清零；
+    /// >= DM_RESUME_MAX 不再自动续跑，挂起等用户
+    resume_count: StdMutex<u32>,
 }
 
 /// show_process 分档（带序：None < Compact < Full，便于 >= 判断）
@@ -2083,6 +2092,37 @@ impl DeepHeartbeat {
     }
 }
 
+/// 活性驱动 deadline（v0.12.5）：跟踪"最近一次事件时间戳"，有新事件就把
+/// 掐断点推移到 now+DM_IDLE_KILL_SECS——忙=永生；连续 10 分钟零事件才到点
+/// 判真死。与 DeepHeartbeat 同款的 last_seen 比较模式
+struct IdleDeadline {
+    last_seen: Option<std::time::Instant>,
+    deadline: tokio::time::Instant,
+}
+
+impl IdleDeadline {
+    fn new() -> Self {
+        Self {
+            last_seen: None,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(DM_IDLE_KILL_SECS),
+        }
+    }
+
+    /// 每轮 select 前调用：事件时间戳变了 = 有新动静 → deadline 重置续命
+    fn on_event(&mut self, evt: Option<std::time::Instant>) {
+        if evt != self.last_seen {
+            self.last_seen = evt;
+            self.deadline =
+                tokio::time::Instant::now() + Duration::from_secs(DM_IDLE_KILL_SECS);
+        }
+    }
+}
+
+/// 真死保险丝判定（v0.12.5）：续跑计数未达上限才允许自动续跑
+fn should_auto_resume(count: u32) -> bool {
+    count < DM_RESUME_MAX
+}
+
 /// 深度心跳文案：有在途命令带命令摘要（前 60 字符），无则报"思考/处理中"
 fn deep_heartbeat_msg(activity: Option<&r2_core::agent::Activity>, silent_secs: u64) -> String {
     let mins = (silent_secs / 60).max(1);
@@ -2386,8 +2426,11 @@ async fn handle_dm(
         }
     }
     // 收到确认：贴 Typing 表情（成功后回复完换 👍；失败记日志方便诊断权限缺失）
-    if let Err(e) = client.add_reaction(&dm.message_id, "Typing").await {
-        eprintln!("[feishu] Typing 表情贴失败（检查 im:message.reaction:write 权限是否开通并重新发布）：{e}");
+    // 内部续跑消息（v0.12.5）无真实 message_id，跳过表情
+    if !dm.message_id.is_empty() {
+        if let Err(e) = client.add_reaction(&dm.message_id, "Typing").await {
+            eprintln!("[feishu] Typing 表情贴失败（检查 im:message.reaction:write 权限是否开通并重新发布）：{e}");
+        }
     }
     // c. 会话获取：每 (agent, open_id) 一个持久 AgentSession
     let key = dm_key(&agent, &dm.open_id);
@@ -2433,6 +2476,7 @@ async fn handle_dm(
                         pending: StdMutex::new(VecDeque::new()),
                         steer_tx: StdMutex::new(steer),
                         activity: StdMutex::new(activity),
+                        resume_count: StdMutex::new(0),
                     })
                 })
                 .clone()
@@ -2495,7 +2539,7 @@ async fn handle_dm(
     let mut item = (prompt_text, dm.message_id.clone());
     loop {
         let (text, mid) = &item;
-        run_dm_prompt(&state, &agent, &cf, &client, &dm.open_id, mid, &mut guard, text).await;
+        run_dm_prompt(&state, &agent, &cf, &client, &dm.open_id, mid, &mut guard, &dm_sess, text).await;
         // 收尾窗口落进来的 steer（本轮 run 没来得及消费）转为排队补投——用户消息绝不静默丢
         for x in guard.take_stale_steers() {
             dm_sess
@@ -2512,6 +2556,35 @@ async fn handle_dm(
     }
 }
 
+/// 真死保险丝的续跑投递（v0.12.5）：合成内部 FeishuDm 走 handle_dm 正常管线。
+/// 盒装擦除 future 类型——handle_dm → run_dm_prompt →（续跑）→ handle_dm 的
+/// 类型级递归会让 rustc 的 Send 推断走入死循环编不过，断点必须立在这里
+fn dm_resume_fut(
+    state: Arc<WebState>,
+    agent: String,
+    cf: ChannelFeishu,
+    client: Arc<FeishuClient>,
+    open_id: String,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        handle_dm(
+            state,
+            agent,
+            cf,
+            client,
+            FeishuDm {
+                open_id,
+                message_id: String::new(), // 内部消息：无真实 message_id（跳过贴表情）
+                text: DM_RESUME_MSG.to_string(),
+                msg_type: "text".into(),
+                resource_key: String::new(),
+                file_name: String::new(),
+            },
+        )
+        .await;
+    })
+}
+
 /// 执行一条 DM prompt：事件转发到 Console（带 from_channel 标记）+ 按 show_process
 /// 分档回传过程消息，完成后最终回复发回飞书（FeishuClient 自带 4000 字分片）
 async fn run_dm_prompt(
@@ -2522,6 +2595,7 @@ async fn run_dm_prompt(
     open_id: &str,
     message_id: &str,
     session: &mut AgentSession,
+    dm_sess: &Arc<DmSession>,
     text: &str,
 ) {
     let mode = show_process_mode(&cf.show_process);
@@ -2632,8 +2706,10 @@ async fn run_dm_prompt(
             }
         }
     });
-    // ③ prompt 主体：deadline 兜底 + none 档心跳 + 深度心跳（select 循环，心跳不打断 prompt）
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(DM_PROMPT_TIMEOUT_SECS);
+    // ③ prompt 主体：活性驱动 deadline + none 档心跳 + 深度心跳（select 循环，心跳不打断 prompt）
+    // v0.12.5：固定墙钟改为活性驱动——有新事件 deadline 自动续命，忙=永生；
+    // 连续 DM_IDLE_KILL_SECS 零事件才掐（120s 心跳分支保证至少每 2 分钟重检一次探针）
+    let mut kill = IdleDeadline::new();
     // 探针句柄在 prompt 持锁前取出（Arc 克隆，之后旁路读取不碰 session 锁）
     let last_event = session.last_event_handle();
     let activity_probe = session.activity_handle();
@@ -2642,14 +2718,16 @@ async fn run_dm_prompt(
     let mut prompt_fut = Box::pin(session.prompt(text));
     let timed_out;
     let result = loop {
-        // 有新事件 → 深度心跳计数归零、重排 300s（每轮 select 前检查）
-        deep.on_event(*last_event.lock().expect("事件探针锁中毒"));
+        // 有新事件 → 深度心跳计数归零、重排 300s；deadline 推移续命（每轮 select 前检查）
+        let evt = *last_event.lock().expect("事件探针锁中毒");
+        deep.on_event(evt);
+        kill.on_event(evt);
         tokio::select! {
             r = &mut prompt_fut => {
                 timed_out = false;
                 break r;
             }
-            _ = tokio::time::sleep_until(deadline) => {
+            _ = tokio::time::sleep_until(kill.deadline) => {
                 timed_out = true;
                 break Ok(String::new());
             }
@@ -2689,6 +2767,26 @@ async fn run_dm_prompt(
             eprintln!("[feishu] DM 超时掐断：已补写 {patched} 条合成 tool_result");
         }
     }
+    // 真死保险丝（v0.12.5）：掐断 → 触发续跑前计数 +1（达上限则挂起）；
+    // 回合正常完成（非掐断）→ 计数清零
+    let will_resume = if timed_out {
+        let mut c = dm_sess.resume_count.lock().expect("续跑计数锁中毒");
+        if should_auto_resume(*c) {
+            *c += 1;
+            true
+        } else {
+            false
+        }
+    } else {
+        *dm_sess.resume_count.lock().expect("续跑计数锁中毒") = 0;
+        false
+    };
+    // 掐断通知文案：准备续跑与挂起两种口径（挂起时不谎称"自动恢复"）
+    let timeout_msg = if will_resume {
+        format!("（{DM_IDLE_KILL_SECS} 秒无响应已中断，正在尝试自动恢复…）")
+    } else {
+        format!("（{DM_IDLE_KILL_SECS} 秒无响应已中断）")
+    };
     // ④ 收尾：卡片路径 finalize（主区定格最终回复 + note 变身状态行 + 关流式）；降级路径纯文本
     let succeeded = !timed_out && result.is_ok();
     // 状态行：模型/token/缓存命中/费用（estimate_cost 与 Console 顶栏同源）
@@ -2715,8 +2813,6 @@ async fn run_dm_prompt(
     let card_opt = card_holder.lock().await.take();
     if let Some(mut c) = card_opt {
         if timed_out {
-            let timeout_msg =
-                format!("（超时 {DM_PROMPT_TIMEOUT_SECS} 秒，未能完成回复。重发任意消息即可恢复）");
             // finalize 失败不静默吞：降级 send_text（带重试一次），用户必须收到收尾通知
             if let Err(e) = c.finalize(&timeout_msg, Some(status_line.as_str())).await {
                 eprintln!("[feishu] 超时卡片收尾失败，降级文本通知：{e}");
@@ -2742,12 +2838,7 @@ async fn run_dm_prompt(
             }
         }
     } else if timed_out {
-        let _ = client
-            .send_text(
-                open_id,
-                &format!("（超时 {DM_PROMPT_TIMEOUT_SECS} 秒，未能完成回复。重发任意消息即可恢复）"),
-            )
-            .await;
+        let _ = client.send_text(open_id, &timeout_msg).await;
     } else {
         match result {
             Ok(reply) => {
@@ -2764,6 +2855,26 @@ async fn run_dm_prompt(
     if succeeded && !message_id.is_empty() {
         if let Err(e) = client.add_reaction(message_id, "THUMBSUP").await {
             eprintln!("[feishu] 👍 表情贴失败：{e}");
+        }
+    }
+    // 真死保险丝（v0.12.5）：掐断通知发出后，未达上限 → 5s 后投递内部续跑消息
+    // （走 handle_dm 正常管线：抢锁/steer/排队/卡片/deadline 全复用，与用户消息
+    //   同路径先到先得，绝不并发两个 prompt）；达上限 → 挂起等用户
+    if timed_out {
+        if will_resume {
+            let st2 = state.clone();
+            let agent2 = agent.to_string();
+            let cf2 = cf.clone();
+            let client2 = client.clone();
+            let oid = open_id.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(DM_RESUME_DELAY_SECS)).await;
+                dm_resume_fut(st2, agent2, cf2, client2, oid).await;
+            });
+        } else {
+            let _ = client
+                .send_text(open_id, "⚠️ 该任务多次无响应已挂起，回复任意内容可继续。")
+                .await;
         }
     }
 }
@@ -3833,6 +3944,58 @@ mod tests {
         h.on_event(Some(t0 + Duration::from_secs(1)));
         assert_eq!(h.count, 0);
         assert!(!h.exhausted());
+    }
+
+    #[test]
+    fn test_idle_deadline_reset_on_event() {
+        // v0.12.5：有新事件 deadline 推移续命；时间戳不变（零事件）不推移
+        let mut d = IdleDeadline::new();
+        // 初始 deadline ≈ now + DM_IDLE_KILL_SECS
+        let upper = tokio::time::Instant::now() + Duration::from_secs(DM_IDLE_KILL_SECS);
+        assert!(d.deadline <= upper);
+        assert!(
+            d.deadline > tokio::time::Instant::now() + Duration::from_secs(DM_IDLE_KILL_SECS - 5)
+        );
+        let t0 = std::time::Instant::now();
+        d.on_event(Some(t0));
+        std::thread::sleep(Duration::from_millis(20));
+        let before = d.deadline;
+        // 时间戳没变（无新事件）→ deadline 不动（无事件到点即掐）
+        d.on_event(Some(t0));
+        assert_eq!(d.deadline, before);
+        // 新事件（时间戳变了）→ deadline 推移到新的 now+600
+        d.on_event(Some(t0 + Duration::from_secs(1)));
+        assert!(d.deadline > before, "有事件必须续命");
+        let upper2 = tokio::time::Instant::now() + Duration::from_secs(DM_IDLE_KILL_SECS);
+        assert!(d.deadline <= upper2);
+        assert!(
+            d.deadline
+                > tokio::time::Instant::now() + Duration::from_secs(DM_IDLE_KILL_SECS - 5)
+        );
+    }
+
+    #[test]
+    fn test_resume_count_decision() {
+        // v0.12.5：掐断触发续跑前 +1、正常完成清零、>= DM_RESUME_MAX 挂起不再续跑
+        assert!(should_auto_resume(0));
+        assert!(should_auto_resume(1));
+        assert!(!should_auto_resume(2));
+        assert!(!should_auto_resume(3));
+        // 生命周期演练：掐断+1 → 再掐断+1 → 第三次掐断挂起 → 正常完成清零复活
+        let c = StdMutex::new(0u32);
+        {
+            let mut g = c.lock().unwrap();
+            assert!(should_auto_resume(*g), "第 1 次掐断可续跑");
+            *g += 1;
+        }
+        {
+            let mut g = c.lock().unwrap();
+            assert!(should_auto_resume(*g), "第 2 次掐断可续跑");
+            *g += 1;
+        }
+        assert!(!should_auto_resume(*c.lock().unwrap()), "第 3 次掐断挂起");
+        *c.lock().unwrap() = 0; // 回合正常完成清零
+        assert!(should_auto_resume(*c.lock().unwrap()), "清零后恢复续跑资格");
     }
 
     #[test]
