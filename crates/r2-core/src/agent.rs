@@ -26,6 +26,20 @@ const TOOL_USAGE_RULES: &str = "\
 /// 单个人格/上下文文件的最大读取量：超过即截断，防撑爆上下文
 const MAX_LAYER_BYTES: usize = 64 * 1024;
 
+/// 在途工具活动探针（v0.12.4）：忙碌状态应答/深度心跳的信息源。
+/// 工具执行前写入、结束后清空；cmd_preview 取命令参数前 80 字符。
+#[derive(Debug, Clone)]
+pub struct Activity {
+    pub tool_name: String,
+    pub cmd_preview: String,
+    pub started_at: std::time::Instant,
+}
+
+/// 活动探针共享句柄（宿主在持锁跑 prompt 期间仍可旁路读取）
+pub type ActivityHandle = std::sync::Arc<std::sync::Mutex<Option<Activity>>>;
+/// 最近事件时间戳共享句柄（深度心跳的"有无新输出"判据）
+pub type LastEventHandle = std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>;
+
 /// system prompt 分层结果（壳展示用）：core 恒有，其余层按命中情况填充
 #[derive(Debug, Clone, PartialEq)]
 pub struct PromptSections {
@@ -269,6 +283,10 @@ pub struct Agent {
     failed_tools: std::collections::HashSet<String>,
     /// 组装好的三层 system prompt 全文（壳展示用 effective_system_prompt）
     system_prompt: String,
+    /// 最近一条 AgentEvent 的产出时刻（v0.12.4 深度心跳探针；emit 时刷新）
+    last_event_at: LastEventHandle,
+    /// 在途工具活动（v0.12.4 忙碌应答/深度心跳的信息源）
+    activity: ActivityHandle,
 }
 
 impl Agent {
@@ -307,6 +325,8 @@ impl Agent {
             turn_start_skills: Vec::new(),
             failed_tools: std::collections::HashSet::new(),
             system_prompt,
+            last_event_at: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            activity: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -356,6 +376,8 @@ impl Agent {
             turn_start_skills: Vec::new(),
             failed_tools: std::collections::HashSet::new(),
             system_prompt,
+            last_event_at: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            activity: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -408,6 +430,8 @@ impl Agent {
             turn_start_skills: Vec::new(),
             failed_tools: std::collections::HashSet::new(),
             system_prompt,
+            last_event_at: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            activity: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -447,8 +471,10 @@ impl Agent {
         self.quiet = quiet;
     }
 
-    /// 广播一条事件（无订阅者时忽略错误）
+    /// 广播一条事件（无订阅者时忽略错误）。
+    /// 每产出一条事件即刷新 last_event_at——深度心跳的"有无新输出"判据（v0.12.4）
     fn emit(&self, event: AgentEvent) {
+        *self.last_event_at.lock().expect("事件探针锁中毒") = Some(std::time::Instant::now());
         if let Some(tx) = &self.emitter {
             let _ = tx.send(event);
         }
@@ -524,6 +550,41 @@ impl Agent {
     /// 组装好的三层 system prompt 全文（壳展示用）
     pub fn effective_system_prompt(&self) -> &str {
         &self.system_prompt
+    }
+
+    /// 最近一条 AgentEvent 的产出时刻（无事件 = None）
+    pub fn last_event_at(&self) -> Option<std::time::Instant> {
+        *self.last_event_at.lock().expect("事件探针锁中毒")
+    }
+
+    /// 最近事件时间戳共享句柄（宿主持锁跑 prompt 期间旁路读取用）
+    pub fn last_event_handle(&self) -> LastEventHandle {
+        self.last_event_at.clone()
+    }
+
+    /// 当前在途工具活动（克隆返回；空闲 = None）
+    pub fn current_activity(&self) -> Option<Activity> {
+        self.activity.lock().expect("activity 锁中毒").clone()
+    }
+
+    /// 活动探针共享句柄（宿主持锁跑 prompt 期间旁路读取用）
+    pub fn activity_handle(&self) -> ActivityHandle {
+        self.activity.clone()
+    }
+
+    /// 工具执行前写入在途活动（cmd_preview 取参数前 80 字符）
+    fn set_activity(&self, tool_name: &str, arguments: &str) {
+        let cmd_preview: String = arguments.chars().take(80).collect();
+        *self.activity.lock().expect("activity 锁中毒") = Some(Activity {
+            tool_name: tool_name.to_string(),
+            cmd_preview,
+            started_at: std::time::Instant::now(),
+        });
+    }
+
+    /// 工具执行结束清空在途活动
+    fn clear_activity(&self) {
+        *self.activity.lock().expect("activity 锁中毒") = None;
     }
 
     /// 掐断补写（INCIDENT-20261007-ODIN P0-1）：宿主超时掐断 prompt future 后，
@@ -955,7 +1016,9 @@ impl Agent {
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
                 });
+                self.set_activity(&call.name, &call.arguments);
                 let result = self.tools.execute(call).await;
+                self.clear_activity();
                 // 技能使用追踪：引用即记，成败入统计（晋升/衰退原料）
                 if let Some(sk) = crate::evolution::detect_skill_reference(&call.name, &call.arguments) {
                     crate::evolution::record_skill_use(&sk, !result.starts_with("ERROR"));
@@ -1440,6 +1503,54 @@ mod tests {
                 .any(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("c2")),
             "合成 tool_result 应落盘：{msgs:?}"
         );
+    }
+
+    #[test]
+    fn test_current_activity_lifecycle() {
+        // v0.12.4：在途活动探针 写入/读取/清除
+        let tmp = tempfile::tempdir().unwrap();
+        let (_gate_tx, gate_rx) = tokio::sync::watch::channel(true);
+        let agent = test_agent(&tmp, gate_rx);
+        assert!(agent.current_activity().is_none(), "初始无在途活动");
+        agent.set_activity("bash", "ls -la /tmp");
+        let act = agent.current_activity().expect("写入后应可读");
+        assert_eq!(act.tool_name, "bash");
+        assert_eq!(act.cmd_preview, "ls -la /tmp");
+        assert!(act.started_at.elapsed().as_secs() < 5);
+        // 句柄与访问器同源（宿主旁路读取路径）
+        assert!(agent.activity_handle().lock().unwrap().is_some());
+        agent.clear_activity();
+        assert!(agent.current_activity().is_none(), "清除后应为 None");
+        assert!(agent.activity_handle().lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_activity_cmd_preview_truncated_80() {
+        // cmd_preview 取命令参数前 80 字符
+        let tmp = tempfile::tempdir().unwrap();
+        let (_gate_tx, gate_rx) = tokio::sync::watch::channel(true);
+        let agent = test_agent(&tmp, gate_rx);
+        let long = "x".repeat(200);
+        agent.set_activity("bash", &long);
+        let act = agent.current_activity().unwrap();
+        assert_eq!(act.cmd_preview.chars().count(), 80);
+        // 短参数不截断
+        agent.set_activity("read", "a.md");
+        assert_eq!(agent.current_activity().unwrap().cmd_preview, "a.md");
+    }
+
+    #[tokio::test]
+    async fn test_last_event_at_refreshed_by_run() {
+        // v0.12.4：run 产出事件后 last_event_at 应被刷新
+        let tmp = tempfile::tempdir().unwrap();
+        let (_gate_tx, gate_rx) = tokio::sync::watch::channel(true);
+        let mut agent = test_agent(&tmp, gate_rx);
+        assert!(agent.last_event_at().is_none(), "未跑时无事件");
+        agent.run("任务").await.expect("run 应成功");
+        let t = agent.last_event_at().expect("run 后应有事件时间戳");
+        assert!(t.elapsed().as_secs() < 5);
+        // 句柄与访问器同源
+        assert_eq!(agent.last_event_handle().lock().unwrap().is_some(), true);
     }
 
     #[test]

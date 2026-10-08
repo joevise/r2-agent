@@ -1677,6 +1677,12 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
 const DM_PROMPT_TIMEOUT_SECS: u64 = 900;
 /// none 档心跳间隔：静默处理超 2 分钟时告知用户还活着（compact/full 有过程流不需）
 const DM_HEARTBEAT_SECS: u64 = 120;
+/// 深度心跳间隔（v0.12.4）：连续 300s 无任何新输出即汇报，不限模式（有卡片也发）
+const DM_DEEP_HEARTBEAT_SECS: u64 = 300;
+/// 深度心跳单段静默期上限（有新输出计数归零）
+const DM_DEEP_HEARTBEAT_MAX: u32 = 3;
+/// 忙碌旁路 AI 应答的总超时（超时/失败 → 降级模板直答）
+const DM_BUSY_REPLY_TIMEOUT_SECS: u64 = 8;
 /// 单个 DM 会话排队上限（满了回"忙"）
 const DM_QUEUE_MAX: usize = 8;
 /// full 档思考流累计多少字发一段
@@ -1702,6 +1708,9 @@ struct DmSession {
     /// steer 发送端（与 session 内部通道同源克隆）：在途消息插话不打断排队机制，
     /// 也不用锁 session（运行中锁被 prompt 持有）。/new /model 重建会话后刷新
     steer_tx: StdMutex<tokio::sync::mpsc::Sender<String>>,
+    /// 在途活动探针句柄（v0.12.4 忙碌必答的信息源）：外层 Mutex 只为
+    /// /new /model 重建会话时换句柄；读时双锁均短持。与 steer_tx 同生命周期
+    activity: StdMutex<r2_core::agent::ActivityHandle>,
 }
 
 /// show_process 分档（带序：None < Compact < Full，便于 >= 判断）
@@ -1926,11 +1935,13 @@ async fn dm_slash_command(
                 Ok(s) => {
                     let sid = s.session_id().map(|x| x[..8.min(x.len())].to_string()).unwrap_or_default();
                     let steer = s.steer_handle();
+                    let activity = s.activity_handle();
                     if let Some(full) = s.session_id() {
                         write_dm_sid(agent, open_id, full);
                     }
                     *guard = s;
                     *d.steer_tx.lock().expect("steer 锁中毒") = steer;
+                    *d.activity.lock().expect("activity 锁中毒") = activity;
                     Some(format!("🆕 新话题已开启（{sid}…）——历史已归档，我们从头开始"))
                 }
                 Err(e) => Some(format!("（新建会话失败：{e}）")),
@@ -1989,8 +2000,10 @@ async fn dm_slash_command(
             match rebuilt {
                 Ok(s) => {
                     let steer = s.steer_handle();
+                    let activity = s.activity_handle();
                     *guard = s;
                     *d.steer_tx.lock().expect("steer 锁中毒") = steer;
+                    *d.activity.lock().expect("activity 锁中毒") = activity;
                     Some(format!("{msg}\n会话已按新模型重建（历史保留）"))
                 }
                 Err(e) => Some(format!("{msg}\n（会话重建失败：{e}；新消息将新建会话）")),
@@ -2018,6 +2031,167 @@ fn fmt_tok(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// 耗时人性化：`已 N 分钟`，不足 1 分钟显示"不到 1 分钟"
+fn elapsed_zh(started: std::time::Instant) -> String {
+    let m = started.elapsed().as_secs() / 60;
+    if m == 0 {
+        "不到 1 分钟".to_string()
+    } else {
+        format!("{m} 分钟")
+    }
+}
+
+/// 深度心跳（v0.12.4）：跟踪"最近一次新输出"与已发次数。
+/// 有新事件 → 计数归零并重排 300s；单段静默期最多发 DM_DEEP_HEARTBEAT_MAX 次。
+struct DeepHeartbeat {
+    count: u32,
+    last_seen: Option<std::time::Instant>,
+    next_at: tokio::time::Instant,
+}
+
+impl DeepHeartbeat {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            last_seen: None,
+            next_at: tokio::time::Instant::now() + Duration::from_secs(DM_DEEP_HEARTBEAT_SECS),
+        }
+    }
+
+    /// 每轮 select 前调用：事件时间戳变了 = 有新输出 → 计数归零、重排计时
+    fn on_event(&mut self, evt: Option<std::time::Instant>) {
+        if evt != self.last_seen {
+            self.last_seen = evt;
+            self.count = 0;
+            self.next_at =
+                tokio::time::Instant::now() + Duration::from_secs(DM_DEEP_HEARTBEAT_SECS);
+        }
+    }
+
+    /// 单段静默期配额是否已用完
+    fn exhausted(&self) -> bool {
+        self.count >= DM_DEEP_HEARTBEAT_MAX
+    }
+
+    /// 发出一次后：计数 +1 并重排 300s
+    fn fired(&mut self) {
+        self.count += 1;
+        self.next_at =
+            tokio::time::Instant::now() + Duration::from_secs(DM_DEEP_HEARTBEAT_SECS);
+    }
+}
+
+/// 深度心跳文案：有在途命令带命令摘要（前 60 字符），无则报"思考/处理中"
+fn deep_heartbeat_msg(activity: Option<&r2_core::agent::Activity>, silent_secs: u64) -> String {
+    let mins = (silent_secs / 60).max(1);
+    match activity {
+        Some(act) => {
+            let full = format!("{} {}", act.tool_name, act.cmd_preview);
+            let mut summary: String = full.chars().take(60).collect();
+            if full.chars().count() > 60 {
+                summary.push('…');
+            }
+            format!("⏳ 还在干活：正在执行 {summary}（已 {mins} 分钟），请稍等")
+        }
+        None => format!("⏳ 仍在思考/处理中（已 {mins} 分钟无输出），请稍等"),
+    }
+}
+
+/// 忙碌状态文本（旁路 AI 应答 system 提示词与降级模板共用）
+fn busy_status_text(activity: Option<&r2_core::agent::Activity>, queued: usize) -> String {
+    match activity {
+        Some(act) => format!(
+            "正在执行 {} {}（已 {}），队列中还有 {queued} 条消息",
+            act.tool_name,
+            act.cmd_preview,
+            elapsed_zh(act.started_at)
+        ),
+        None => format!("正在思考/处理中，队列中还有 {queued} 条消息"),
+    }
+}
+
+/// 忙碌降级模板（AI 失败/超时时直答）
+fn dm_busy_template(activity: Option<&r2_core::agent::Activity>, queued: usize) -> String {
+    match activity {
+        Some(act) => format!(
+            "📊 正在执行 {}（已 {}），前面还有 {queued} 条排队消息。我不会丢你的消息，处理完当前任务就回你。",
+            act.tool_name,
+            elapsed_zh(act.started_at)
+        ),
+        None => format!(
+            "📊 正在处理任务中，前面还有 {queued} 条排队消息。我不会丢你的消息，处理完当前任务就回你。"
+        ),
+    }
+}
+
+/// 忙碌旁路 AI 应答（v0.12.4）：独立单轮请求——不碰主会话上下文、
+/// 不写 JSONL、用完即弃。失败/超时才由调用方降级模板
+async fn dm_busy_ai_reply(
+    state: &Arc<WebState>,
+    agent: &str,
+    user_text: &str,
+    activity: Option<&r2_core::agent::Activity>,
+    queued: usize,
+) -> Result<String, String> {
+    let cfg = dm_config(state, agent);
+    let provider = r2_core::model::create_provider(&cfg).map_err(|e| e.to_string())?;
+    let status = busy_status_text(activity, queued);
+    let system = format!(
+        "你是 {agent}，正在执行长任务无暇分身。用户发来了消息。基于下面的状态数据，\
+         用你的口吻用一两句中文自然回复用户（安抚 + 简报进度），不要编造状态之外的信息，\
+         结尾自然带一句“忙完就回你”意思的话。回复控制在 200 字以内。\n状态：{status}"
+    );
+    let msgs = vec![
+        r2_core::types::Message {
+            role: r2_core::types::Role::System,
+            content: system,
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        r2_core::types::Message {
+            role: r2_core::types::Role::User,
+            content: format!("用户消息：{user_text}"),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+    ];
+    let mut stream = provider
+        .chat_stream(&msgs, &[])
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut chunks = Vec::new();
+    while let Some(item) = stream.next().await {
+        chunks.push(item.map_err(|e| e.to_string())?);
+    }
+    let (text, _) = provider.parse_response(&chunks).map_err(|e| e.to_string())?;
+    if text.trim().is_empty() {
+        return Err("旁路应答模型返回空内容".into());
+    }
+    Ok(text.trim().to_string())
+}
+
+/// 忙碌必答入口：8s 内拿到 AI 应答发 AI 版（截 200 字），否则降级模板直答
+async fn dm_busy_reply(
+    state: &Arc<WebState>,
+    agent: &str,
+    client: &Arc<FeishuClient>,
+    open_id: &str,
+    user_text: &str,
+    activity: Option<r2_core::agent::Activity>,
+    queued: usize,
+) {
+    let ai = tokio::time::timeout(
+        Duration::from_secs(DM_BUSY_REPLY_TIMEOUT_SECS),
+        dm_busy_ai_reply(state, agent, user_text, activity.as_ref(), queued),
+    )
+    .await;
+    let reply = match ai {
+        Ok(Ok(text)) => text.chars().take(200).collect::<String>(),
+        _ => dm_busy_template(activity.as_ref(), queued),
+    };
+    let _ = client.send_text(open_id, &reply).await;
 }
 
 /// 通道状态 → 前端字符串（failed 附带原因）
@@ -2253,10 +2427,12 @@ async fn handle_dm(
             map.entry(key)
                 .or_insert_with(|| {
                     let steer = session.steer_handle();
+                    let activity = session.activity_handle();
                     Arc::new(DmSession {
                         session: Mutex::new(session),
                         pending: StdMutex::new(VecDeque::new()),
                         steer_tx: StdMutex::new(steer),
+                        activity: StdMutex::new(activity),
                     })
                 })
                 .clone()
@@ -2267,6 +2443,26 @@ async fn handle_dm(
     let mut guard = match dm_sess.session.try_lock() {
         Ok(g) => g,
         Err(_) => {
+            // 忙碌状态必答（v0.12.4）：旁路应答先行（spawn 不阻塞入队路径，
+            // 不写会话 JSONL、不进主上下文），原消息照常走 steer/排队
+            {
+                let activity = dm_sess
+                    .activity
+                    .lock()
+                    .expect("activity 锁中毒")
+                    .lock()
+                    .expect("activity 锁中毒")
+                    .clone();
+                let queued = dm_sess.pending.lock().expect("排队锁中毒").len();
+                let st2 = state.clone();
+                let agent2 = agent.clone();
+                let client2 = client.clone();
+                let oid = dm.open_id.clone();
+                let utext = dm.text.clone();
+                tokio::spawn(async move {
+                    dm_busy_reply(&st2, &agent2, &client2, &oid, &utext, activity, queued).await;
+                });
+            }
             if dm_sess
                 .steer_tx
                 .lock()
@@ -2436,11 +2632,18 @@ async fn run_dm_prompt(
             }
         }
     });
-    // ③ prompt 主体：deadline 兜底 + none 档心跳（select 循环，心跳不打断 prompt）
+    // ③ prompt 主体：deadline 兜底 + none 档心跳 + 深度心跳（select 循环，心跳不打断 prompt）
     let deadline = tokio::time::Instant::now() + Duration::from_secs(DM_PROMPT_TIMEOUT_SECS);
+    // 探针句柄在 prompt 持锁前取出（Arc 克隆，之后旁路读取不碰 session 锁）
+    let last_event = session.last_event_handle();
+    let activity_probe = session.activity_handle();
+    let prompt_started = std::time::Instant::now();
+    let mut deep = DeepHeartbeat::new();
     let mut prompt_fut = Box::pin(session.prompt(text));
     let timed_out;
     let result = loop {
+        // 有新事件 → 深度心跳计数归零、重排 300s（每轮 select 前检查）
+        deep.on_event(*last_event.lock().expect("事件探针锁中毒"));
         tokio::select! {
             r = &mut prompt_fut => {
                 timed_out = false;
@@ -2449,6 +2652,20 @@ async fn run_dm_prompt(
             _ = tokio::time::sleep_until(deadline) => {
                 timed_out = true;
                 break Ok(String::new());
+            }
+            // 深度心跳（v0.12.4）：300s 无任何新输出 → 带命令信息汇报，
+            // 单段静默期最多 3 次；不限模式（卡片显示内容、文本是提醒，可共存）
+            _ = tokio::time::sleep_until(deep.next_at), if !deep.exhausted() => {
+                let silent_secs = deep
+                    .last_seen
+                    .unwrap_or(prompt_started)
+                    .elapsed()
+                    .as_secs();
+                let act = activity_probe.lock().expect("activity 锁中毒").clone();
+                let _ = client
+                    .send_text(open_id, &deep_heartbeat_msg(act.as_ref(), silent_secs))
+                    .await;
+                deep.fired();
             }
             _ = tokio::time::sleep(Duration::from_secs(DM_HEARTBEAT_SECS)) => {
                 // none 档且无卡片时防"假死"；有卡片时主区/note 自带活性
@@ -3596,6 +3813,86 @@ mod tests {
         old2.allow_from = vec!["ou_x".into()];
         assert!(feishu_allowed(&old2, "ou_x"));
         assert!(!feishu_allowed(&old2, "ou_y"));
+    }
+
+    #[test]
+    fn test_deep_heartbeat_count_and_reset() {
+        // v0.12.4：单段静默期最多 3 次；有新输出计数归零；时间戳不变不归零
+        let mut h = DeepHeartbeat::new();
+        let t0 = std::time::Instant::now();
+        h.on_event(Some(t0));
+        assert_eq!(h.count, 0);
+        h.fired();
+        h.fired();
+        h.fired();
+        assert!(h.exhausted(), "3 次后配额用完");
+        // 时间戳没变（仍无新输出）→ 不归零
+        h.on_event(Some(t0));
+        assert!(h.exhausted());
+        // 新事件（时间戳变了）→ 计数归零
+        h.on_event(Some(t0 + Duration::from_secs(1)));
+        assert_eq!(h.count, 0);
+        assert!(!h.exhausted());
+    }
+
+    #[test]
+    fn test_deep_heartbeat_msg() {
+        let act = r2_core::agent::Activity {
+            tool_name: "bash".into(),
+            cmd_preview: "cargo test --workspace".into(),
+            started_at: std::time::Instant::now(),
+        };
+        let m = deep_heartbeat_msg(Some(&act), 300);
+        assert!(m.contains("还在干活"), "{m}");
+        assert!(m.contains("bash cargo test --workspace"), "{m}");
+        assert!(m.contains("已 5 分钟"), "{m}");
+        // 无在途命令
+        let m2 = deep_heartbeat_msg(None, 600);
+        assert!(m2.contains("仍在思考/处理中"), "{m2}");
+        assert!(m2.contains("已 10 分钟无输出"), "{m2}");
+        // 命令摘要超 60 字符截断
+        let long = r2_core::agent::Activity {
+            tool_name: "bash".into(),
+            cmd_preview: "x".repeat(100),
+            started_at: std::time::Instant::now(),
+        };
+        let m3 = deep_heartbeat_msg(Some(&long), 300);
+        let summary_start = m3.find("bash ").unwrap();
+        let summary_end = m3.find("（已").unwrap();
+        let summary = &m3[summary_start..summary_end];
+        assert!(summary.chars().count() <= 62, "摘要截断到 60 字符+省略号：{summary}");
+    }
+
+    #[test]
+    fn test_dm_busy_template() {
+        let act = r2_core::agent::Activity {
+            tool_name: "bash".into(),
+            cmd_preview: "ls".into(),
+            started_at: std::time::Instant::now(),
+        };
+        let m = dm_busy_template(Some(&act), 2);
+        assert!(m.contains("正在执行 bash"), "{m}");
+        assert!(m.contains("2 条排队消息"), "{m}");
+        assert!(m.contains("不会丢你的消息"), "{m}");
+        assert!(m.contains("忙完") || m.contains("处理完当前任务就回你"), "{m}");
+        // 无在途命令时也能答
+        let m2 = dm_busy_template(None, 0);
+        assert!(m2.contains("处理任务"), "{m2}");
+        assert!(m2.contains("0 条排队消息"), "{m2}");
+    }
+
+    #[test]
+    fn test_busy_status_text() {
+        let act = r2_core::agent::Activity {
+            tool_name: "read".into(),
+            cmd_preview: "src/main.rs".into(),
+            started_at: std::time::Instant::now(),
+        };
+        let s = busy_status_text(Some(&act), 1);
+        assert!(s.contains("read src/main.rs"), "{s}");
+        assert!(s.contains("队列中还有 1 条"), "{s}");
+        let s2 = busy_status_text(None, 3);
+        assert!(s2.contains("思考/处理中"), "{s2}");
     }
 
     #[test]

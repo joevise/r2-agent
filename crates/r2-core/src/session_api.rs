@@ -122,9 +122,54 @@ impl AgentSession {
         self.agent.history_len()
     }
 
+    /// 最近一条 AgentEvent 的产出时刻（v0.12.4 深度心跳探针）
+    pub fn last_event_at(&self) -> Option<std::time::Instant> {
+        self.agent.last_event_at()
+    }
+
+    /// 最近事件时间戳共享句柄（宿主持锁跑 prompt 期间旁路读取用）
+    pub fn last_event_handle(&self) -> crate::agent::LastEventHandle {
+        self.agent.last_event_handle()
+    }
+
+    /// 当前在途工具活动（克隆返回；空闲 = None）
+    pub fn current_activity(&self) -> Option<crate::agent::Activity> {
+        self.agent.current_activity()
+    }
+
+    /// 活动探针共享句柄（宿主持锁跑 prompt 期间旁路读取用）
+    pub fn activity_handle(&self) -> crate::agent::ActivityHandle {
+        self.agent.activity_handle()
+    }
+
     /// 测试用：把外部构造好的 Agent（注入了 MockProvider）包成会话
     #[cfg(test)]
     pub(crate) fn wrap_test(agent: Agent) -> Self {
         Self::wrap(agent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_probe_delegation() {
+        // v0.12.4：探针访问器与共享句柄同源（宿主旁路读取路径）
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default_config();
+        config.session.dir = tmp.path().to_string_lossy().to_string();
+        config.agent.work_dir = tmp.path().to_string_lossy().to_string();
+        let s = AgentSession::new(config).expect("建会话应成功");
+        assert!(s.current_activity().is_none());
+        assert!(s.last_event_at().is_none());
+        *s.activity_handle().lock().unwrap() = Some(crate::agent::Activity {
+            tool_name: "bash".into(),
+            cmd_preview: "ls".into(),
+            started_at: std::time::Instant::now(),
+        });
+        assert_eq!(s.current_activity().unwrap().tool_name, "bash");
+        *s.last_event_handle().lock().unwrap() = Some(std::time::Instant::now());
+        assert!(s.last_event_at().is_some());
     }
 }
