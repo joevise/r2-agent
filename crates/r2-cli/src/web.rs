@@ -1673,7 +1673,8 @@ async fn handle_client_msg(text: &str, state: &Arc<WebState>, sink: &WsSink) {
 
 /// DM prompt 超时（秒）。8/25 用户实测：复杂任务（思考+工具链）120s 截断太短——
 /// 提到 600s 与后台任务同档；Console 单聊本就无超时
-const DM_PROMPT_TIMEOUT_SECS: u64 = 600;
+// 必须 > bash MAX_TIMEOUT_SECS(600) + 收尾余量：否则 DM deadline 恒先撞，工具结果被丢弃
+const DM_PROMPT_TIMEOUT_SECS: u64 = 900;
 /// none 档心跳间隔：静默处理超 2 分钟时告知用户还活着（compact/full 有过程流不需）
 const DM_HEARTBEAT_SECS: u64 = 120;
 /// 单个 DM 会话排队上限（满了回"忙"）
@@ -2462,6 +2463,14 @@ async fn run_dm_prompt(
         let _ = tokio::time::timeout(Duration::from_secs(2), consumer).await;
     } else {
         consumer.abort();
+        // 掐断补写（INCIDENT-20261007-ODIN P0-1）：prompt_fut 被 drop 后在途
+        // 工具结果蒸发，上下文挂着无结果的 tool_calls → 下轮请求协议残废。
+        // 先 drop 归还 session 可变借用，再补写合成 tool_result 保协议完整
+        drop(prompt_fut);
+        let patched = session.interrupt_pending_tools();
+        if patched > 0 {
+            eprintln!("[feishu] DM 超时掐断：已补写 {patched} 条合成 tool_result");
+        }
     }
     // ④ 收尾：卡片路径 finalize（主区定格最终回复 + note 变身状态行 + 关流式）；降级路径纯文本
     let succeeded = !timed_out && result.is_ok();
@@ -2489,12 +2498,16 @@ async fn run_dm_prompt(
     let card_opt = card_holder.lock().await.take();
     if let Some(mut c) = card_opt {
         if timed_out {
-            let _ = c
-                .finalize(
-                    &format!("（超时 {DM_PROMPT_TIMEOUT_SECS} 秒，未能完成回复）"),
-                    Some(status_line.as_str()),
-                )
-                .await;
+            let timeout_msg =
+                format!("（超时 {DM_PROMPT_TIMEOUT_SECS} 秒，未能完成回复。重发任意消息即可恢复）");
+            // finalize 失败不静默吞：降级 send_text（带重试一次），用户必须收到收尾通知
+            if let Err(e) = c.finalize(&timeout_msg, Some(status_line.as_str())).await {
+                eprintln!("[feishu] 超时卡片收尾失败，降级文本通知：{e}");
+                if let Err(e2) = client.send_text(open_id, &timeout_msg).await {
+                    eprintln!("[feishu] 超时通知降级发送失败，重试一次：{e2}");
+                    let _ = client.send_text(open_id, &timeout_msg).await;
+                }
+            }
         } else {
             match &result {
                 Ok(reply) => {
@@ -2515,7 +2528,7 @@ async fn run_dm_prompt(
         let _ = client
             .send_text(
                 open_id,
-                &format!("（超时 {DM_PROMPT_TIMEOUT_SECS} 秒，未能完成回复）"),
+                &format!("（超时 {DM_PROMPT_TIMEOUT_SECS} 秒，未能完成回复。重发任意消息即可恢复）"),
             )
             .await;
     } else {
@@ -3437,7 +3450,47 @@ fn spawn_scheduler(state: Arc<WebState>) {
     });
 }
 
+/// web 进程日志落盘（INCIDENT-20261007-ODIN P1-5）：stdout/stderr 重定向到
+/// ~/.r2/logs/web.log（append，超 5MB 轮转成 web.log.1，只留一代）。
+/// 失败（如权限）降级：保持现状并 eprintln 提示，不阻塞启动。
+fn redirect_stdio_to_log() {
+    const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+    let Some(home) = std::env::var_os("HOME") else {
+        eprintln!("[web] HOME 未设置，日志落盘跳过");
+        return;
+    };
+    let dir = Path::new(&home).join(".r2/logs");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[web] 日志目录创建失败（{}），保持现状：{e}", dir.display());
+        return;
+    }
+    let log = dir.join("web.log");
+    if let Ok(meta) = std::fs::metadata(&log) {
+        if meta.len() > MAX_LOG_BYTES {
+            let _ = std::fs::rename(&log, dir.join("web.log.1"));
+        }
+    }
+    let file = match std::fs::OpenOptions::new().create(true).append(true).open(&log) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[web] 日志文件打开失败（{}），保持现状：{e}", log.display());
+            return;
+        }
+    };
+    use std::os::unix::io::IntoRawFd;
+    let fd = file.into_raw_fd();
+    // SAFETY：fd 来自刚打开的有效文件；dup2 原子地把 stdout(1)/stderr(2)
+    // 重指向该文件，失败时原 fd 不受影响；返回值已检查，泄漏的 fd 立即关闭
+    unsafe {
+        if libc::dup2(fd, 1) == -1 || libc::dup2(fd, 2) == -1 {
+            eprintln!("[web] stdout/stderr 重定向失败，保持现状");
+            libc::close(fd);
+        }
+    }
+}
+
 pub async fn run(config: Config, port: u16, host: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    redirect_stdio_to_log();
     let session_dir = config::expand_tilde(&config.session.dir);
     let work_dir = config::expand_tilde(&config.agent.work_dir);
     // 没有会话目录也能起服务（首次 new_session 时 Agent 会自动建）

@@ -17,6 +17,8 @@ serde_json.workspace = true
 axum.workspace = true
 futures-util.workspace = true
 toml.workspace = true
+# web 日志落盘 dup2（workspace 已有，非新依赖）
+libc.workspace = true
 # rustls：main 里显式 install_default()（双保险，防 feature 被依赖树变化稀释）
 rustls.workspace = true
 

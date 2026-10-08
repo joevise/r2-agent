@@ -526,6 +526,46 @@ impl Agent {
         &self.system_prompt
     }
 
+    /// 掐断补写（INCIDENT-20261007-ODIN P0-1）：宿主超时掐断 prompt future 后，
+    /// 上下文末尾可能挂着"有 tool_calls 无 tool_result"的 assistant 消息
+    /// （在途工具结果随 future 一起蒸发）——下轮请求协议残废，上下文全废。
+    /// 扫描历史里所有缺结果的 tool_call，逐条补写合成 tool 消息
+    /// （进 L1 上下文 + 走现有 JSONL append 落盘），返回补写条数。
+    pub fn interrupt_pending_tools(&mut self) -> usize {
+        const SYNTHETIC: &str =
+            "（会话超时中断：该命令结果未知。请勿假设成功或失败；如需结果请重新执行或查询）";
+        let history = self.context.history();
+        // 已有结果的 call_id 集合
+        let answered: std::collections::HashSet<&str> = history
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        // 缺结果的 call_id（保持出现顺序，去重）
+        let mut missing: Vec<String> = Vec::new();
+        for m in history {
+            if m.role != Role::Assistant {
+                continue;
+            }
+            if let Some(calls) = &m.tool_calls {
+                for c in calls {
+                    if !answered.contains(c.id.as_str()) && !missing.contains(&c.id) {
+                        missing.push(c.id.clone());
+                    }
+                }
+            }
+        }
+        let mut patched = 0;
+        for call_id in missing {
+            // 上下文写不进去（如 token 预算满）就不落盘——两边保持一致，不制造新的残缺
+            if self.context.add_tool_result(&call_id, SYNTHETIC).is_ok() {
+                self.log_session(&SessionEntry::tool_result(&call_id, SYNTHETIC));
+                patched += 1;
+            }
+        }
+        patched
+    }
+
     /// 追加会话记录；失败只告警不中断主流程
     fn log_session(&mut self, entry: &SessionEntry) {
         if let Some(session) = &mut self.session {
@@ -1329,6 +1369,77 @@ mod tests {
         agent2.run("继续").await.expect("run 应成功");
         assert_eq!(agent2.usage().llm_calls, 2);
         assert!(agent2.usage().input_tokens > disk.input_tokens);
+    }
+
+    #[test]
+    fn test_interrupt_pending_tools() {
+        // INCIDENT-20261007-ODIN P0-1：掐断后挂空的 tool_calls 补写合成 tool_result
+        let tmp = tempfile::tempdir().unwrap();
+        let (_gate_tx, gate_rx) = tokio::sync::watch::channel(true);
+        let mut agent = test_agent(&tmp, gate_rx);
+        let sid = agent.session_id().unwrap().to_string();
+        // 构造假死现场：assistant 挂两个 tool_calls，只有 c1 有结果（c2 在途蒸发）
+        agent
+            .context
+            .add_message(Role::User, "跑两个命令")
+            .expect("加消息应成功");
+        agent
+            .context
+            .add_assistant_with_tools(
+                "好的",
+                vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+            )
+            .expect("加 assistant 应成功");
+        agent.context.add_tool_result("c1", "ok").expect("加结果应成功");
+
+        let n = agent.interrupt_pending_tools();
+        assert_eq!(n, 1, "只补写缺结果的 c2");
+
+        // 合成消息存在、call_id 对应
+        let history = agent.context.history();
+        let synth: Vec<_> = history
+            .iter()
+            .filter(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("c2"))
+            .collect();
+        assert_eq!(synth.len(), 1, "合成消息应恰好一条：{history:?}");
+        assert!(synth[0].content.contains("会话超时中断"));
+
+        // 协议完整：每个 tool_call 都有对应 result
+        let answered: std::collections::HashSet<&str> = history
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        for m in history {
+            if let Some(calls) = &m.tool_calls {
+                for c in calls {
+                    assert!(answered.contains(c.id.as_str()), "{} 缺 tool_result", c.id);
+                }
+            }
+        }
+
+        // 幂等：再调一次无补写
+        assert_eq!(agent.interrupt_pending_tools(), 0);
+
+        // 合成结果已走 JSONL 落盘（recover 可见）
+        let dir = tmp.path().to_string_lossy().to_string();
+        let (_s, msgs) = Session::recover(&dir, &sid).expect("recover 应成功");
+        assert!(
+            msgs.iter()
+                .any(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("c2")),
+            "合成 tool_result 应落盘：{msgs:?}"
+        );
     }
 
     #[test]

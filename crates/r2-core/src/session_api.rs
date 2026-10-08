@@ -106,6 +106,12 @@ impl AgentSession {
         self.agent.take_stale_steers()
     }
 
+    /// 掐断补写：宿主超时 drop 掉 prompt future 后调用，为挂空的 tool_calls
+    /// 补写合成 tool_result（协议完整性兜底），返回补写条数
+    pub fn interrupt_pending_tools(&mut self) -> usize {
+        self.agent.interrupt_pending_tools()
+    }
+
     /// 清空当前上下文（等价于 CLI 的 /clear）：新建会话文件 + 重置 L1
     pub fn reset_context(&mut self) {
         self.agent.reset_context();

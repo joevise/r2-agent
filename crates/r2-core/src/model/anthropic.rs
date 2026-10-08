@@ -10,6 +10,8 @@ use std::time::Duration;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// 最大重试次数（不含首次请求）
 const MAX_RETRIES: u32 = 2;
+/// 模型流 idle 超时：120 秒无任何新字节判流死（INCIDENT-20261007-ODIN P1-4）
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Anthropic API 版本头
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// max_tokens（Anthropic 强制要求）
@@ -384,17 +386,22 @@ impl ModelProvider for AnthropicProvider {
                     if finished {
                         return None;
                     }
-                    match bs.next().await {
-                        Some(Ok(bytes)) => {
+                    // idle 超时包裹：120s 无新字节判流死，走现有错误路径（上层重试/报错）
+                    match tokio::time::timeout(STREAM_IDLE_TIMEOUT, bs.next()).await {
+                        Ok(Some(Ok(bytes))) => {
                             pending.extend(parser.feed(&bytes));
                         }
-                        Some(Err(e)) => {
+                        Ok(Some(Err(e))) => {
                             finished = true;
                             pending.push_back(Err(e.into()));
                         }
-                        None => {
+                        Ok(None) => {
                             finished = true;
                             pending.extend(parser.finish());
+                        }
+                        Err(_) => {
+                            finished = true;
+                            pending.push_back(Err("模型流 idle 超时（120s 无数据）".into()));
                         }
                     }
                 }
