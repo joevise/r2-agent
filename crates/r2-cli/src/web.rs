@@ -18,7 +18,7 @@ use r2_core::agents::{self, ChannelFeishu, MAIN};
 use r2_core::channels::{ChannelStatus, FeishuClient, FeishuConfig, FeishuDm};
 use r2_core::config::{self, Config};
 use r2_core::groups::{self, GroupEvent};
-use r2_core::session::{self, SessionSummary};
+use r2_core::session::{self, Session, SessionSummary};
 use r2_core::tools::ToolRegistry;
 use r2_core::{rpc, AgentEvent, AgentSession};
 use serde_json::{json, Value};
@@ -1717,6 +1717,8 @@ struct FeishuRuntime {
     app_id: String,
     app_secret: String,
     status: ChannelStatus,
+    /// v0.15.0：启动恢复扫描只跑一次（通道重连会反复 Connected，不能重复续跑）
+    startup_recovered: bool,
 }
 
 /// 一个 (agent, open_id) 的持久 DM 会话
@@ -1827,6 +1829,49 @@ fn read_dm_pending_from(path: &std::path::Path) -> VecDeque<(String, String)> {
 
 fn persist_dm_pending(agent: &str, open_id: &str, pending: &VecDeque<(String, String)>) {
     write_dm_pending_to(&dm_pending_path(agent, open_id), pending);
+}
+
+/// DM 启动续跑 marker（v0.15.0 跨重启崩溃循环保护）：{profile_dir}/dm/{oid}.resume，
+/// JSON {count, ts}，原子写（临时文件 + rename，对齐 write_dm_pending_to 模式）。
+/// 触发启动续跑前 count+1 落盘；续跑回合正常完成 / 用户真实消息进线 → 删除。
+/// 崩溃 → marker 留着，下次启动计数递增，>= DM_RESUME_MAX 挂起等用户
+fn dm_resume_marker_path(agent: &str, open_id: &str) -> std::path::PathBuf {
+    agents::profile_dir(agent).join("dm").join(format!("{open_id}.resume"))
+}
+
+/// 读 marker 计数：文件缺失/损坏一律按 0 处理（宁可多续跑一次，不可拒绝恢复）
+fn read_dm_resume_marker(agent: &str, open_id: &str) -> u32 {
+    let Ok(body) = std::fs::read(dm_resume_marker_path(agent, open_id)) else {
+        return 0;
+    };
+    serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("count")?.as_u64())
+        .map(|n| n.min(u32::MAX as u64) as u32)
+        .unwrap_or(0)
+}
+
+fn write_dm_resume_marker(agent: &str, open_id: &str, count: u32) {
+    let path = dm_resume_marker_path(agent, open_id);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let Ok(body) = serde_json::to_vec(&json!({"count": count, "ts": ts})) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// 清 marker（存在则删，幂等）：用户在场接手 / 续跑回合正常完成 → 计数归零
+fn clear_dm_resume_marker(agent: &str, open_id: &str) {
+    let _ = std::fs::remove_file(dm_resume_marker_path(agent, open_id));
 }
 
 /// DM 会话用的配置快照：全局运行时配置 + mcp 源文件刷新 + persona 叠加。
@@ -2377,6 +2422,10 @@ fn start_feishu_channels(state: &Arc<WebState>) {
         let client_msg = client.clone();
         let st_status = state.clone();
         let agent_status = name.clone();
+        let st_recover = state.clone();
+        let agent_recover = name.clone();
+        let cf_recover = cf.clone();
+        let client_recover = client.clone();
         client.start(
             Box::new(move |dm: FeishuDm| {
                 tokio::spawn(handle_dm(
@@ -2390,10 +2439,15 @@ fn start_feishu_channels(state: &Arc<WebState>) {
             Box::new(move |status: ChannelStatus| {
                 // 注：初始状态即 Connecting，start() 内 set_status(Connecting) 相等不回调，
                 // 这里的锁不会与 start_feishu_channels 持有的表锁形成重入
+                let mut first_connected = false;
                 {
                     let mut t = st_status.channels.lock().expect("通道锁中毒");
                     if let Some(rt) = t.get_mut(&agent_status) {
                         rt.status = status.clone();
+                        if status == ChannelStatus::Connected && !rt.startup_recovered {
+                            rt.startup_recovered = true;
+                            first_connected = true;
+                        }
                     }
                 }
                 let _ = st_status.event_tx.send(json!({
@@ -2401,6 +2455,11 @@ fn start_feishu_channels(state: &Arc<WebState>) {
                     "agent": agent_status,
                     "status": channel_status_str(&status),
                 }));
+                // v0.15.0：通道首次就绪 → 启动恢复扫描（跨进程重启续跑）。
+                // 只触发一次：重连的 Connected 不重复扫
+                if first_connected {
+                    startup_recover_dm(&st_recover, &agent_recover, &cf_recover, &client_recover);
+                }
             }),
         );
         table.insert(
@@ -2410,9 +2469,59 @@ fn start_feishu_channels(state: &Arc<WebState>) {
                 app_id: cf.app_id,
                 app_secret: cf.app_secret,
                 status: ChannelStatus::Connecting,
+                startup_recovered: false,
             },
         );
     }
+}
+
+/// 获取或懒建 (agent, open_id) 的 DmSession（v0.15.0 提取：handle_dm 与
+/// 启动恢复扫描共用，行为不变）。锁外创建（AgentSession::new 可能做 MCP 冷启动
+/// 秒级，不能卡 dm_sessions 表锁）；并发下同 key 只留一个（后到者复用先入者）
+async fn get_dm_session(
+    state: &Arc<WebState>,
+    agent: &str,
+    open_id: &str,
+) -> Result<Arc<DmSession>, String> {
+    let key = dm_key(agent, open_id);
+    let existing = state
+        .dm_sessions
+        .lock()
+        .expect("dm 锁中毒")
+        .get(&key)
+        .cloned();
+    if let Some(d) = existing {
+        return Ok(d);
+    }
+    // 飞书会话 = 该 agent 的一个普通会话：config 快照 + apply_persona
+    // （session.dir 指向 ~/.r2/agents/<agent>/sessions，历史可审计、Console 可见）
+    // 会话指针：重启后 resume 同一会话（飞书连续记忆跨重启）；
+    // 无指针（首次）或会话文件丢失/损坏 → 新开并落新指针
+    let session = match read_dm_sid(agent, open_id) {
+        Some(sid) => AgentSession::resume(dm_config(state, agent), &sid)
+            .or_else(|_| AgentSession::new(dm_config(state, agent))),
+        None => AgentSession::new(dm_config(state, agent)),
+    };
+    let session = session.map_err(|e| format!("（创建会话失败：{e}）"))?;
+    if let Some(sid) = session.session_id() {
+        write_dm_sid(agent, open_id, sid);
+    }
+    let mut map = state.dm_sessions.lock().expect("dm 锁中毒");
+    Ok(map
+        .entry(key)
+        .or_insert_with(|| {
+            let steer = session.steer_handle();
+            let activity = session.activity_handle();
+            Arc::new(DmSession {
+                session: Mutex::new(session),
+                // v0.12.6 B：重启后恢复重启前排队未处理的用户消息
+                pending: StdMutex::new(read_dm_pending_from(&dm_pending_path(agent, open_id))),
+                steer_tx: StdMutex::new(steer),
+                activity: StdMutex::new(activity),
+                resume_count: StdMutex::new(0),
+            })
+        })
+        .clone())
 }
 
 /// 处理一条飞书 DM：白名单 → 文本校验 → 会话获取 → 排队/prompt → 回复
@@ -2481,55 +2590,17 @@ async fn handle_dm(
             eprintln!("[feishu] Typing 表情贴失败（检查 im:message.reaction:write 权限是否开通并重新发布）：{e}");
         }
     }
+    // v0.15.0：用户真实消息进线 = 用户在场接手，清启动续跑 marker（计数归零）；
+    // 内部续跑合成消息（空 message_id + DM_RESUME_MSG）不清，保崩溃循环计数
+    if !(dm.message_id.is_empty() && dm.text == DM_RESUME_MSG) {
+        clear_dm_resume_marker(&agent, &dm.open_id);
+    }
     // c. 会话获取：每 (agent, open_id) 一个持久 AgentSession
-    let key = dm_key(&agent, &dm.open_id);
-    let existing = state
-        .dm_sessions
-        .lock()
-        .expect("dm 锁中毒")
-        .get(&key)
-        .cloned();
-    let dm_sess = match existing {
-        Some(d) => d,
-        None => {
-            // 锁外创建：AgentSession::new 可能做 MCP 冷启动（秒级），不能卡 dm_sessions 锁。
-            // 飞书会话 = 该 agent 的一个普通会话：config 快照 + apply_persona
-            // （session.dir 指向 ~/.r2/agents/<agent>/sessions，历史可审计、Console 可见）
-            // 会话指针：重启后 resume 同一会话（飞书连续记忆跨重启）；
-            // 无指针（首次）或会话文件丢失/损坏 → 新开并落新指针
-            let session = match read_dm_sid(&agent, &dm.open_id) {
-                Some(sid) => AgentSession::resume(dm_config(&state, &agent), &sid)
-                    .or_else(|_| AgentSession::new(dm_config(&state, &agent))),
-                None => AgentSession::new(dm_config(&state, &agent)),
-            };
-            let session = match session {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = client
-                        .send_text(&dm.open_id, &format!("（创建会话失败：{e}）"))
-                        .await;
-                    return;
-                }
-            };
-            if let Some(sid) = session.session_id() {
-                write_dm_sid(&agent, &dm.open_id, sid);
-            }
-            let mut map = state.dm_sessions.lock().expect("dm 锁中毒");
-            // 并发下同 key 只留一个（后到者丢弃自己建的，复用先入者）
-            map.entry(key)
-                .or_insert_with(|| {
-                    let steer = session.steer_handle();
-                    let activity = session.activity_handle();
-                    Arc::new(DmSession {
-                        session: Mutex::new(session),
-                        // v0.12.6 B：重启后恢复重启前排队未处理的用户消息
-                        pending: StdMutex::new(read_dm_pending_from(&dm_pending_path(&agent, &dm.open_id))),
-                        steer_tx: StdMutex::new(steer),
-                        activity: StdMutex::new(activity),
-                        resume_count: StdMutex::new(0),
-                    })
-                })
-                .clone()
+    let dm_sess = match get_dm_session(&state, &agent, &dm.open_id).await {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = client.send_text(&dm.open_id, &e).await;
+            return;
         }
     };
     // g. prompt 在途 → steer 插话（对齐 Console 语义：在途消息=转向指令，
@@ -2642,6 +2713,97 @@ fn dm_resume_fut(
         )
         .await;
     })
+}
+
+/// 启动续跑判定（v0.15.0 纯函数）：需要续跑 = 排队未消费（触发 FIFO 消费）
+/// 或会话尾部角色非 assistant（残缺回合：tool = 中断；user = 未开始/回复蒸发）。
+/// 无会话指针/会话文件缺失（last_role None）且排队为空 = 干净，跳过
+fn dm_needs_startup_resume(
+    session_dir: &str,
+    sid: Option<&str>,
+    pending: &VecDeque<(String, String)>,
+) -> bool {
+    if !pending.is_empty() {
+        return true;
+    }
+    let Some(sid) = sid else {
+        return false;
+    };
+    matches!(
+        Session::last_role_of(session_dir, sid).as_deref(),
+        Some(role) if role != "assistant"
+    )
+}
+
+/// 启动恢复扫描（v0.15.0 跨进程重启续跑）：通道首次 Connected 后对单个 active 档案调用。
+/// 扫 {profile_dir}/dm/ 下全部有会话痕迹（{oid}.sid）或排队未消费（{oid}.pending 非空）
+/// 的 oid，判定需要续跑 → marker 计数检查 → 提示用户 + spawn dm_resume_fut
+/// （不阻塞启动；多 DM 并行无碍——各自独立 session）。续跑回合正常完成
+/// （dm_resume_fut 返回即算）→ 清 marker；崩溃 → marker 留着计数递增。
+/// 全程容错：单 DM 失败 eprintln 跳过，绝不阻塞其他 DM 与启动
+fn startup_recover_dm(
+    state: &Arc<WebState>,
+    agent: &str,
+    cf: &ChannelFeishu,
+    client: &Arc<FeishuClient>,
+) {
+    let dm_dir = agents::profile_dir(agent).join("dm");
+    let Ok(entries) = std::fs::read_dir(&dm_dir) else {
+        return; // 无 dm 目录 = 该档案从未有过 DM，无事可干
+    };
+    let session_dir = agents::profile_dir(agent)
+        .join("sessions")
+        .to_string_lossy()
+        .to_string();
+    // 收集候选 oid：有过会话的 ∪ 排队非空的
+    let mut oids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if let Some(oid) = name.strip_suffix(".sid") {
+            oids.insert(oid.to_string());
+        } else if let Some(oid) = name.strip_suffix(".pending") {
+            if !read_dm_pending_from(&e.path()).is_empty() {
+                oids.insert(oid.to_string());
+            }
+        }
+    }
+    for oid in oids {
+        let pending = read_dm_pending_from(&dm_pending_path(agent, &oid));
+        let sid = read_dm_sid(agent, &oid);
+        if !dm_needs_startup_resume(&session_dir, sid.as_deref(), &pending) {
+            continue; // 干净收尾
+        }
+        // 崩溃循环保护：marker 超限 → 挂起通知，不再自动续跑
+        let count = read_dm_resume_marker(agent, &oid);
+        if count >= DM_RESUME_MAX {
+            let c = client.clone();
+            tokio::spawn(async move {
+                let _ = c
+                    .send_text(&oid, "（自动恢复已达上限，等待你的指示）")
+                    .await;
+            });
+            continue;
+        }
+        write_dm_resume_marker(agent, &oid, count + 1);
+        let st2 = state.clone();
+        let agent2 = agent.to_string();
+        let cf2 = cf.clone();
+        let client2 = client.clone();
+        let oid2 = oid.clone();
+        tokio::spawn(async move {
+            // 先懒建会话（resume 指针）；失败记日志跳过，不打扰用户
+            if let Err(e) = get_dm_session(&st2, &agent2, &oid2).await {
+                eprintln!("[feishu] 启动续跑建会话失败（{agent2}/{oid2}）：{e}");
+                return;
+            }
+            let _ = client2
+                .send_text(&oid2, "（检测到上次会话未完成，正在自动恢复…）")
+                .await;
+            dm_resume_fut(st2, agent2.clone(), cf2, client2, oid2.clone()).await;
+            // 续跑管线正常返回 = 回合完成 → 清 marker（崩溃则留着，下次启动计数递增）
+            clear_dm_resume_marker(&agent2, &oid2);
+        });
+    }
 }
 
 /// 执行一条 DM prompt：事件转发到 Console（带 from_channel 标记）+ 按 show_process
@@ -4055,6 +4217,92 @@ mod tests {
         assert!(!should_auto_resume(*c.lock().unwrap()), "第 3 次掐断挂起");
         *c.lock().unwrap() = 0; // 回合正常完成清零
         assert!(should_auto_resume(*c.lock().unwrap()), "清零后恢复续跑资格");
+    }
+
+    /// v0.15.0 启动续跑 marker：往返/缺失降级 0/损坏降级 0/超限判定/清除幂等
+    #[test]
+    fn test_dm_resume_marker() {
+        let _g = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let old_home = std::env::var("HOME").unwrap_or_default();
+        std::env::set_var("HOME", tmp.path());
+
+        // 缺失 → 0
+        assert_eq!(read_dm_resume_marker("cfo", "ou_1"), 0);
+        // 往返
+        write_dm_resume_marker("cfo", "ou_1", 1);
+        assert_eq!(read_dm_resume_marker("cfo", "ou_1"), 1);
+        write_dm_resume_marker("cfo", "ou_1", 2);
+        let count = read_dm_resume_marker("cfo", "ou_1");
+        assert_eq!(count, 2);
+        // 超限判定（startup_recover_dm 的挂起门：count >= DM_RESUME_MAX 不续跑）
+        assert!(count >= DM_RESUME_MAX, "count=2 必须触发挂起路径");
+        // 损坏 → 降级 0（宁可多续跑一次，不拒绝恢复）
+        let p = dm_resume_marker_path("cfo", "ou_1");
+        std::fs::write(&p, "garbage{{{").unwrap();
+        assert_eq!(read_dm_resume_marker("cfo", "ou_1"), 0);
+        // 清除幂等
+        clear_dm_resume_marker("cfo", "ou_1");
+        assert!(!p.exists());
+        clear_dm_resume_marker("cfo", "ou_1"); // 再删不炸
+        assert_eq!(read_dm_resume_marker("cfo", "ou_1"), 0);
+
+        std::env::set_var("HOME", old_home);
+    }
+
+    /// v0.15.0 启动续跑判定四态：残缺回合（tool 尾）/排队未消费 → 需要；
+    /// 干净会话（assistant 尾、空 pending）/无会话 → 不需要
+    #[test]
+    fn test_dm_needs_startup_resume() {
+        use r2_core::session::SessionEntry;
+        use r2_core::types::Role;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().to_string();
+        let empty: VecDeque<(String, String)> = VecDeque::new();
+        let queued: VecDeque<(String, String)> =
+            VecDeque::from([("排队消息".to_string(), "m1".to_string())]);
+
+        // 无会话指针 + 空 pending → 不需要
+        assert!(!dm_needs_startup_resume(&dir, None, &empty));
+        // 无会话指针但排队非空 → 需要（触发 FIFO 消费）
+        assert!(dm_needs_startup_resume(&dir, None, &queued));
+
+        // 残缺回合：user 问 + assistant 工具调用 + tool_result 尾（中断现场）
+        let mut s = Session::create(&dir).unwrap();
+        let sid = s.id().to_string();
+        s.append(&SessionEntry::message(Role::User, "问")).unwrap();
+        s.append(&SessionEntry::assistant(
+            "",
+            vec![r2_core::types::ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }],
+        ))
+        .unwrap();
+        s.append(&SessionEntry::tool_result("c1", "ok")).unwrap();
+        drop(s);
+        assert!(dm_needs_startup_resume(&dir, Some(&sid), &empty), "tool 尾 = 残缺");
+        assert!(dm_needs_startup_resume(&dir, Some(&sid), &queued), "残缺+排队 = 需要");
+
+        // user 尾（回复蒸发）→ 需要
+        let mut s2 = Session::create(&dir).unwrap();
+        let sid2 = s2.id().to_string();
+        s2.append(&SessionEntry::message(Role::User, "问")).unwrap();
+        drop(s2);
+        assert!(dm_needs_startup_resume(&dir, Some(&sid2), &empty), "user 尾 = 残缺");
+
+        // 干净会话：assistant 尾 + 空 pending → 不需要
+        let mut s3 = Session::create(&dir).unwrap();
+        let sid3 = s3.id().to_string();
+        s3.append(&SessionEntry::message(Role::User, "问")).unwrap();
+        s3.append(&SessionEntry::message(Role::Assistant, "答")).unwrap();
+        drop(s3);
+        assert!(!dm_needs_startup_resume(&dir, Some(&sid3), &empty), "assistant 尾 = 干净");
+        // 干净会话但排队非空 → 需要
+        assert!(dm_needs_startup_resume(&dir, Some(&sid3), &queued));
+        // 会话文件丢失（指针在、文件没了）+ 空 pending → 不需要
+        assert!(!dm_needs_startup_resume(&dir, Some("nonexistent"), &empty));
     }
 
     #[test]

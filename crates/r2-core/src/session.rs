@@ -135,6 +135,8 @@ fn role_to_str(role: &Role) -> &'static str {
 pub struct Session {
     id: String,
     file: BufWriter<File>,
+    /// JSONL 文件路径（last_role 纯读自检用）
+    path: PathBuf,
 }
 
 impl Session {
@@ -148,6 +150,7 @@ impl Session {
         Ok(Self {
             id,
             file: BufWriter::new(file),
+            path,
         })
     }
 
@@ -169,6 +172,7 @@ impl Session {
             Self {
                 id: session_id.to_string(),
                 file: BufWriter::new(file),
+                path,
             },
             messages,
         ))
@@ -329,6 +333,40 @@ impl Session {
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// 尾部消息角色（v0.15.0）：None = 空会话。
+    /// 启动续跑判定用：尾部非 assistant = 回合未完成（tool = 中断；user = 未开始/回复蒸发）。
+    /// 从文件尾部倒扫第一条带角色的完整记录（Message → role；ToolResult → "tool"；
+    /// Usage/Checkpoint/Branch 无角色跳过）；损坏行按 recover 同款容错语义跳过。
+    pub fn last_role(&self) -> Option<String> {
+        Self::last_role_in(&self.path)
+    }
+
+    /// last_role 的纯读静态版：不需要打开会话句柄（启动扫描判定用）。
+    /// 文件不存在/读失败 → None（按空会话处理，不阻塞启动）。
+    pub fn last_role_of(session_dir: &str, session_id: &str) -> Option<String> {
+        Self::last_role_in(&session_path(session_dir, session_id))
+    }
+
+    fn last_role_in(path: &Path) -> Option<String> {
+        let content = fs::read_to_string(path).ok()?;
+        let content = content.trim_start_matches('\u{feff}');
+        for raw in content.lines().rev() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<SessionEntry>(line) {
+                Ok(SessionEntry::Message { role, .. }) => return Some(role),
+                Ok(SessionEntry::ToolResult { .. }) => return Some("tool".to_string()),
+                // 无角色的记录（用量快照/检查点/分支标记）不构成回合边界，继续倒扫
+                Ok(_) => continue,
+                // 坏行（崩溃残行/手动编辑）跳过，与 recover 容错语义一致
+                Err(_) => continue,
+            }
+        }
+        None
     }
 
     /// 读取会话文件里最后一条用量记录（只读，不开写句柄）。
@@ -599,6 +637,69 @@ mod tests {
         // 无记录的会话 → 默认值
         let usage = Session::recover_usage(&dir, "nonexistent");
         assert_eq!(usage.llm_calls, 0);
+    }
+
+    /// last_role（v0.15.0）：空会话 None；assistant 尾 / tool 尾 / user 尾；
+    /// 尾部 usage/checkpoint 无角色跳过；损坏尾行容错跳过
+    #[test]
+    fn test_last_role() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().to_string();
+
+        // 空会话 → None
+        let mut s = Session::create(&dir).unwrap();
+        let id = s.id().to_string();
+        assert_eq!(s.last_role(), None);
+
+        // user 尾（回复蒸发/未开始）
+        s.append(&SessionEntry::message(Role::User, "问")).unwrap();
+        assert_eq!(s.last_role().as_deref(), Some("user"));
+
+        // assistant 尾（干净收尾）+ 尾部 usage/checkpoint 不影响判定
+        s.append(&SessionEntry::message(Role::Assistant, "答")).unwrap();
+        s.append(&SessionEntry::usage(&crate::types::UsageStats::default()))
+            .unwrap();
+        s.append(&SessionEntry::checkpoint(1)).unwrap();
+        assert_eq!(s.last_role().as_deref(), Some("assistant"));
+        drop(s);
+
+        // 静态版与实例版一致
+        assert_eq!(Session::last_role_of(&dir, &id).as_deref(), Some("assistant"));
+        // 不存在的会话 → None
+        assert_eq!(Session::last_role_of(&dir, "nonexistent"), None);
+
+        // tool 尾（工具中断）
+        let mut s2 = Session::create(&dir).unwrap();
+        let id2 = s2.id().to_string();
+        s2.append(&SessionEntry::message(Role::User, "问")).unwrap();
+        s2.append(&SessionEntry::assistant(
+            "",
+            vec![ToolCall {
+                id: "c1".to_string(),
+                name: "bash".to_string(),
+                arguments: "{}".to_string(),
+            }],
+        ))
+        .unwrap();
+        s2.append(&SessionEntry::tool_result("c1", "ok")).unwrap();
+        assert_eq!(Session::last_role_of(&dir, &id2).as_deref(), Some("tool"));
+        drop(s2);
+
+        // 损坏尾行 → 跳过取前一条完整记录
+        let mut s3 = Session::create(&dir).unwrap();
+        let id3 = s3.id().to_string();
+        s3.append(&SessionEntry::message(Role::User, "问")).unwrap();
+        drop(s3);
+        let p3 = tmp.path().join(format!("{id3}.jsonl"));
+        let mut body = std::fs::read_to_string(&p3).unwrap();
+        body.push_str("{\"type\":\"message\",\"role\":\"assi"); // 崩溃残行
+        std::fs::write(&p3, body).unwrap();
+        assert_eq!(Session::last_role_of(&dir, &id3).as_deref(), Some("user"));
+
+        // 全坏 → None
+        let p4 = tmp.path().join("allbad.jsonl");
+        std::fs::write(&p4, "garbage\n{broken\n").unwrap();
+        assert_eq!(Session::last_role_of(&dir, "allbad"), None);
     }
 
     /// BOM 开头的文件：剥掉 BOM 后正常解析
