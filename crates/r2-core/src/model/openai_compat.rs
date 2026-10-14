@@ -23,6 +23,8 @@ pub struct OpenAiCompatProvider {
     model: String,
     /// HTTP 客户端
     client: reqwest::Client,
+    /// 会话提示头（X-R2-Session；None = 不带）
+    session_hint: Option<String>,
 }
 
 impl OpenAiCompatProvider {
@@ -37,6 +39,15 @@ impl OpenAiCompatProvider {
             api_key: api_key.to_string(),
             model: model.to_string(),
             client,
+            session_hint: None,
+        }
+    }
+
+    /// 有 session hint 时给请求挂 X-R2-Session 头（网关日志按会话聚合用）
+    fn with_session_header(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.session_hint {
+            Some(hint) => req.header("X-R2-Session", hint),
+            None => req,
         }
     }
 }
@@ -230,6 +241,10 @@ impl ModelProvider for OpenAiCompatProvider {
         "openai_compat"
     }
 
+    fn set_session_hint(&mut self, id: &str) {
+        self.session_hint = Some(id.to_string());
+    }
+
     async fn chat_stream(
         &self,
         messages: &[Message],
@@ -241,13 +256,12 @@ impl ModelProvider for OpenAiCompatProvider {
         // 建连阶段重试：429/5xx 指数退避（1s/2s/4s），流开始后不重试
         let mut attempt: u32 = 0;
         let response = loop {
-            let result = self
+            let req = self
                 .client
                 .post(&url)
                 .bearer_auth(&self.api_key)
-                .json(&body)
-                .send()
-                .await;
+                .json(&body);
+            let result = self.with_session_header(req).send().await;
             match result {
                 Ok(resp) => {
                     let status = resp.status();
@@ -361,6 +375,25 @@ impl ModelProvider for OpenAiCompatProvider {
 
 #[cfg(test)]
 mod tests {
+    /// v0.14.0：session hint → X-R2-Session 请求头（有值才带，无值不带）
+    #[test]
+    fn test_session_hint_header() {
+        let mut p = OpenAiCompatProvider::new("https://example.com", "k", "m");
+        // 无 hint：不带头
+        let req = p
+            .with_session_header(p.client.post("http://localhost/"))
+            .build()
+            .unwrap();
+        assert!(req.headers().get("X-R2-Session").is_none());
+        // 有 hint：带头
+        p.set_session_hint("s-abc123");
+        let req = p
+            .with_session_header(p.client.post("http://localhost/"))
+            .build()
+            .unwrap();
+        assert_eq!(req.headers()["X-R2-Session"], "s-abc123");
+    }
+
     /// 回归测试（用户实测"两个问号"）：TCP chunk 边界把汉字切开时，
     /// 字节级缓冲必须无损还原——绝不允许 U+FFFD 进回复
     #[test]

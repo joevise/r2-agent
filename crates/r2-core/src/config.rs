@@ -114,10 +114,15 @@ pub struct AgentConfig {
     /// 分身档案目录（v0.9：Some = agent 分身，SOUL/私有技能从该目录读；None = 主 agent）
     #[serde(default)]
     pub persona_dir: Option<String>,
-    /// 自进化钩子开关（v0.13.0）：false 时 Agent 不注册 EvolutionHook
-    /// （回合反思 / 技能草稿 / 技能追踪全关——测试与嵌入式宿主的确定性保障）
+    /// 自进化钩子开关（v0.13.0 遗留兼容项）：false 时过滤掉 evolution extension
+    /// （prompt 段与 EvolutionHook 同步消失）。语义优先级低于 extensions 清单——
+    /// 新配置请直接用 extensions 裁剪；此字段仅为兼容 v0.13 配置保留。
     #[serde(default = "default_evolution_enabled")]
     pub evolution_enabled: bool,
+    /// Extension 能力清单（v0.14.0）：编译期注册表条目名列表，按序 resolve。
+    /// 默认全装 = v0.13 行为等价；分身可在 AGENT.toml 里裁剪。
+    #[serde(default = "default_extensions")]
+    pub extensions: Vec<String>,
 }
 
 /// 上下文管理配置
@@ -248,6 +253,13 @@ fn default_evolution_enabled() -> bool {
     // 默认开启：与 v0.12.x 内嵌行为等价；测试/嵌入宿主显式关闭
     true
 }
+/// 默认 Extension 清单（全装 = v0.13 行为等价）
+pub fn default_extensions() -> Vec<String> {
+    ["evolution", "tasks", "summon", "mcp-admin"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
 fn default_max_total_tokens() -> usize {
     // 0 = 自动：post_process / Agent 构造时按 models 注册表推导窗口预算
     0
@@ -351,6 +363,7 @@ impl Default for AgentConfig {
             system_prompt: String::new(),
             persona_dir: None,
             evolution_enabled: default_evolution_enabled(),
+            extensions: default_extensions(),
         }
     }
 }
@@ -776,6 +789,24 @@ bash_restrict_workdir = true
         let config = Config::load_from_str(toml_str).unwrap();
         assert!(!config.sandbox.cgroup);
         assert!(config.sandbox.bash_restrict_workdir);
+    }
+
+    #[test]
+    fn test_extensions_default_and_parse() {
+        // 旧配置（无 extensions 字段）向后兼容：默认全装
+        let config = Config::load_from_str(FULL_TOML).unwrap();
+        assert_eq!(config.agent.extensions, default_extensions());
+        assert_eq!(
+            config.agent.extensions,
+            vec!["evolution", "tasks", "summon", "mcp-admin"]
+        );
+        // 显式裁剪清单
+        let toml_str = r#"
+[agent]
+extensions = ["tasks"]
+"#;
+        let config = Config::load_from_str(toml_str).unwrap();
+        assert_eq!(config.agent.extensions, vec!["tasks"]);
     }
 
     #[test]

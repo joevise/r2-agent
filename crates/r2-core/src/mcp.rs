@@ -427,7 +427,7 @@ mod tests {
             level: "off".to_string(),
             ..Default::default()
         };
-        let mut reg = ToolRegistry::new_default(tmp.path().to_str().unwrap(), &sandbox, None, "/tmp/r2-test-sessions").unwrap();
+        let mut reg = ToolRegistry::new_core(tmp.path().to_str().unwrap(), &sandbox, "/tmp/r2-test-sessions").unwrap();
         let cfg = McpConfig {
             servers: vec![mock_cfg("")],
         };

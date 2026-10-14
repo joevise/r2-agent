@@ -45,6 +45,7 @@ pub mod mcp;
 pub mod memory;
 pub mod model;
 pub mod evolution;
+pub mod extensions;
 pub mod hooks;
 pub mod groups;
 pub mod models;

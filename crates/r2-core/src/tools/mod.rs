@@ -1,12 +1,14 @@
-//! 工具系统：Tool trait + ToolRegistry + 4 个核心工具（read/write/edit/bash）
+//! 工具系统：Tool trait + ToolRegistry + 核心 5 工具（read/write/edit/history/bash）。
+//! 其余工具（task/summon/mcp 管理）已迁为 Extension（crate::extensions），
+//! 由 Agent 构造时按清单注入；MCP 外部工具仍经 push_tool 后挂。
 
 mod bash;
 mod edit;
 mod history;
-mod mcp_admin;
+pub(crate) mod mcp_admin;
 mod read;
-mod summon;
-mod task_tool;
+pub(crate) mod summon;
+pub(crate) mod task_tool;
 mod write;
 
 use crate::types::{ToolCall, ToolSchema};
@@ -32,13 +34,14 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// 创建默认注册表：read/write/edit/bash 四个核心工具
+    /// 创建核心注册表：read/write/edit/history/bash 五个核心工具（恒注册，
+    /// 不拆——history 被 [记忆规则] prompt 引用，拆了会 prompt/工具不一致）。
+    /// 其余工具由 Extension 经 extend 注入。
     ///
     /// bash 工具按 sandbox_cfg 构造沙箱；level 非法返回错误（正常路径下 config 加载已校验）
-    pub fn new_default(
+    pub fn new_core(
         work_dir: &str,
         sandbox_cfg: &crate::config::SandboxConfig,
-        config_path: Option<&str>,
         session_dir: &str,
     ) -> Result<Self, String> {
         let sandbox = crate::sandbox::Sandbox::from_config(sandbox_cfg)?;
@@ -54,11 +57,13 @@ impl ToolRegistry {
                     sandbox,
                     sandbox_cfg.bash_restrict_workdir,
                 )),
-                Box::new(mcp_admin::McpAdminTool::new(config_path)),
-                Box::new(task_tool::TaskTool::new()),
-                Box::new(summon::SummonTool::new()),
             ],
         })
+    }
+
+    /// 注入一批 Extension 工具（Agent 构造时按清单 resolve 后调用）
+    pub fn extend(&mut self, tools: Vec<Box<dyn Tool>>) {
+        self.tools.extend(tools);
     }
 
     /// 注册一个外部工具（MCP 适配器用）
@@ -160,7 +165,18 @@ mod tests {
             level: "off".to_string(),
             ..Default::default()
         };
-        ToolRegistry::new_default(dir.to_str().unwrap(), &cfg, None, "/tmp/r2-test-sessions").unwrap()
+        // 核心 5 工具 + 默认 Extension 清单注入（= v0.13 默认注册表等价）
+        let mut reg =
+            ToolRegistry::new_core(dir.to_str().unwrap(), &cfg, "/tmp/r2-test-sessions").unwrap();
+        let ctx = crate::extensions::ExtCtx {
+            work_dir: dir.to_str().unwrap(),
+            session_dir: "/tmp/r2-test-sessions",
+            config_path: None,
+        };
+        for ext in crate::extensions::resolve(&crate::config::default_extensions()) {
+            reg.extend(ext.tools(&ctx));
+        }
+        reg
     }
 
     #[tokio::test]
@@ -190,11 +206,25 @@ mod tests {
     }
 
     #[test]
+    fn test_new_core_has_five_tools() {
+        // v0.14.0：new_core 恒注册核心 5 工具，Extension 工具经 extend 注入
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::SandboxConfig {
+            level: "off".to_string(),
+            ..Default::default()
+        };
+        let reg = ToolRegistry::new_core(tmp.path().to_str().unwrap(), &cfg, "/tmp/r2-test-sessions")
+            .unwrap();
+        let names: Vec<String> = reg.schemas().iter().map(|s| s.name.clone()).collect();
+        assert_eq!(names, vec!["read", "write", "edit", "history", "bash"]);
+    }
+
+    #[test]
     fn test_schemas_contains_core_tools() {
         let tmp = tempfile::tempdir().unwrap();
         let reg = make_registry(tmp.path());
         let schemas = reg.schemas();
-        // v0.11.0 加 history 工具：8 个（read/write/edit/history/bash/mcp_admin/task/summon）
+        // 默认清单下 8 个（核心 5 + tasks/summon/mcp-admin 各 1）
         assert_eq!(schemas.len(), 8);
         let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"read"));

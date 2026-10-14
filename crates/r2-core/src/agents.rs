@@ -97,6 +97,10 @@ pub struct AgentProfile {
     /// 飞书 DM 通道（老档案无此段 → 默认全关；读入后再写回时原样保留）
     #[serde(default)]
     pub channel_feishu: ChannelFeishu,
+    /// Extension 裁剪清单（v0.14.0）：None = 继承主配置 extensions；
+    /// Some = 该分身的能力清单（如 Some(["tasks"]) 只留 task 工具）
+    #[serde(default)]
+    pub extensions: Option<Vec<String>>,
 }
 
 fn default_state() -> String {
@@ -204,6 +208,7 @@ pub fn draft_profile(
             .map(|d| d.as_secs())
             .unwrap_or(0),
         channel_feishu: ChannelFeishu::default(),
+        extensions: None,
     };
     save_profile(&profile)?;
     std::fs::write(profile_dir(name).join("SOUL.md"), soul).map_err(|e| e.to_string())?;
@@ -320,6 +325,23 @@ mod tests {
         assert!(remove_profile("bob", false).is_err());
         remove_profile("bob", true).unwrap();
         assert!(!profile_dir("bob").exists());
+    }
+
+    #[test]
+    fn test_extensions_field_roundtrip() {
+        // v0.14.0：老档案无 extensions 字段 → None（继承主配置）；
+        // 显式裁剪清单 → Some 原样读写
+        let (_h, _g) = isolate_home();
+        let p = draft_profile("cfo", "CFO", "", "", "soul").unwrap();
+        assert_eq!(p.extensions, None);
+        let loaded = load_profile("cfo").unwrap();
+        assert_eq!(loaded.extensions, None);
+
+        let mut p = loaded;
+        p.extensions = Some(vec!["tasks".to_string()]);
+        save_profile(&p).unwrap();
+        let loaded = load_profile("cfo").unwrap();
+        assert_eq!(loaded.extensions, Some(vec!["tasks".to_string()]));
     }
 
     #[test]

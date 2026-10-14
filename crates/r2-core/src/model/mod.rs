@@ -28,6 +28,11 @@ pub trait ModelProvider: Send + Sync {
     /// 从流式 chunks 合成完整响应：(文本, 工具调用列表)
     fn parse_response(&self, chunks: &[StreamChunk]) -> ModelResult<(String, Vec<ToolCall>)>;
 
+    /// 会话提示（v0.14.0）：有值的 provider 在 HTTP 请求头带 X-R2-Session，
+    /// 排查假死类事故时可按会话聚合网关/provider 日志。
+    /// 默认空实现——mock/NullProvider 等零改动。
+    fn set_session_hint(&mut self, _id: &str) {}
+
     /// Token 计数（v0.1 用近似：字符数/2）
     fn count_tokens(&self, text: &str) -> usize {
         text.len() / 2

@@ -27,6 +27,8 @@ pub struct AnthropicProvider {
     model: String,
     /// HTTP 客户端
     client: reqwest::Client,
+    /// 会话提示头（X-R2-Session；None = 不带）
+    session_hint: Option<String>,
 }
 
 impl AnthropicProvider {
@@ -41,6 +43,15 @@ impl AnthropicProvider {
             api_key: api_key.to_string(),
             model: model.to_string(),
             client,
+            session_hint: None,
+        }
+    }
+
+    /// 有 session hint 时给请求挂 X-R2-Session 头（网关日志按会话聚合用）
+    fn with_session_header(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.session_hint {
+            Some(hint) => req.header("X-R2-Session", hint),
+            None => req,
         }
     }
 }
@@ -319,6 +330,10 @@ impl ModelProvider for AnthropicProvider {
         "anthropic"
     }
 
+    fn set_session_hint(&mut self, id: &str) {
+        self.session_hint = Some(id.to_string());
+    }
+
     async fn chat_stream(
         &self,
         messages: &[Message],
@@ -330,15 +345,14 @@ impl ModelProvider for AnthropicProvider {
         // 建连阶段重试：429/5xx 指数退避（1s/2s/4s），流开始后不重试
         let mut attempt: u32 = 0;
         let response = loop {
-            let result = self
+            let req = self
                 .client
                 .post(&url)
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .header("Content-Type", "application/json")
-                .json(&body)
-                .send()
-                .await;
+                .json(&body);
+            let result = self.with_session_header(req).send().await;
             match result {
                 Ok(resp) => {
                     let status = resp.status();
@@ -453,6 +467,23 @@ impl ModelProvider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.14.0：session hint → X-R2-Session 请求头（有值才带，无值不带）
+    #[test]
+    fn test_session_hint_header() {
+        let mut p = AnthropicProvider::new("https://example.com", "k", "m");
+        let req = p
+            .with_session_header(p.client.post("http://localhost/"))
+            .build()
+            .unwrap();
+        assert!(req.headers().get("X-R2-Session").is_none());
+        p.set_session_hint("s-xyz");
+        let req = p
+            .with_session_header(p.client.post("http://localhost/"))
+            .build()
+            .unwrap();
+        assert_eq!(req.headers()["X-R2-Session"], "s-xyz");
+    }
 
     /// 完整的 SSE 流文本（text + tool_use 开始 + input_json_delta 分片 + message_stop）
     const SSE_TEXT: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"role\":\"assistant\"}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"我需要执行命令\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01\",\"name\":\"bash\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cmd\\\":\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"ls\\\"}\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";

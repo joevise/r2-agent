@@ -51,6 +51,8 @@ pub struct PromptSections {
     pub skills: Option<String>,
     /// 长期记忆 MEMORY.md（work_dir 跨会话持久层，v0.11.0）
     pub memory: Option<String>,
+    /// Extension 注入的 prompt 段（title, content），按清单 resolve 序（v0.14.0）
+    pub extensions: Vec<(String, String)>,
 }
 
 /// 用给定 home 展开路径开头的 ~（测试可注入假 home，隔离真实 ~/.r2）
@@ -180,6 +182,7 @@ fn build_system_prompt_with_home(config: &Config, home: &str) -> (String, Prompt
         custom: None,
         skills: None,
         memory: None,
+        extensions: Vec::new(),
     };
 
     // 技能层：动态扫描 ~/.r2/skills（装了自动可见，删了自动消失，零维护）。
@@ -192,19 +195,18 @@ fn build_system_prompt_with_home(config: &Config, home: &str) -> (String, Prompt
         full.push_str(s);
         sections.skills = Some(s.clone());
     }
-    // 成长系统自我认知层（v0.7.2）：没有这段，agent 不知道自己的进化机制存在
-    // （实测病灶：用户口述目标，它只能塞进工作目录笔记；学完的东西不沉淀）。
-    // 宪法保护 = 语义约束（不得自行更改目标），而非文件权限——代笔权给 agent。
-    full.push_str("\n\n[成长系统]\n");
-    full.push_str(
-        "你有自我成长机制，用户口头表达时请主动使用：\n\
-         · 目标代笔：用户说出目标/身份/期望（如「我希望你成为…」）时，把原话忠实写入 ~/.r2/GOAL.md\n\
-           （用 bash 写入），写入前先向用户复述确认。未经用户明确表达，绝不创建或修改目标。\n\
-         · 学习沉淀：完成有意义的学习（方法论/框架/流程/领域知识）后，主动蒸馏成技能文件\n\
-           写入 ~/.r2/skills/<名字>/SKILL.md（frontmatter 含 name 和 description），\n\
-           下次会话自动生效——学习不沉淀等于白学。\n\
-         · 你的目标与技能会出现在成长档案里，持续积累成为你的一部分。",
-    );
+    // Extension prompt 段（v0.14.0）：原进化认知硬编码段迁为 evolution
+    // extension 的 prompt_sections。与 skills 层同原则：能力感知始终可见，
+    // custom 覆盖不跳过；注入顺序 = 清单 resolve 序（字节级稳定，防 KV-cache 抖动）
+    for ext in crate::extensions::resolve_for(&config.agent) {
+        for section in ext.prompt_sections() {
+            full.push_str(&format!("\n\n[{}]\n", ext.title()));
+            full.push_str(&section);
+            sections
+                .extensions
+                .push((ext.title().to_string(), section));
+        }
+    }
 
     // 长期记忆层（v0.11.0）：work_dir/MEMORY.md 跨会话持久，agent 自维护。
     // 文件为空/不存在也注入规则——否则 agent 永远不知道该建立记忆
@@ -292,14 +294,39 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// 组装钩子注册表：evolution_enabled=false 时不注册 EvolutionHook
-    /// （反思/草稿/技能追踪全关——测试与嵌入宿主的确定性保障）
+    /// 组装钩子注册表（v0.14.0）：按清单 resolve extensions 收集 hooks。
+    /// evolution_enabled=false（v0.13 兼容开关）时 resolve_for 已过滤掉
+    /// evolution extension——反思/草稿/技能追踪全关（测试与嵌入宿主的确定性保障）
     fn build_hooks(config: &Config) -> crate::hooks::HookRegistry {
         let mut hooks = crate::hooks::HookRegistry::new();
-        if config.agent.evolution_enabled {
-            hooks.register(std::sync::Arc::new(crate::evolution::EvolutionHook::new()));
+        for ext in crate::extensions::resolve_for(&config.agent) {
+            for h in ext.hooks() {
+                hooks.register(h);
+            }
         }
         hooks
+    }
+
+    /// 组装工具注册表（v0.14.0）：核心 5 工具恒注册 + 按清单 resolve 的
+    /// Extension 工具注入 + MCP 外部工具连接（push_tool 逻辑不动）
+    fn build_tools(config: &Config) -> ModelResult<ToolRegistry> {
+        let mut tools = ToolRegistry::new_core(
+            &config.agent.work_dir,
+            &config.sandbox,
+            &config.session.dir,
+        )
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        let binding = config.mcp_write_path();
+        let ext_ctx = crate::extensions::ExtCtx {
+            work_dir: &config.agent.work_dir,
+            session_dir: &config.session.dir,
+            config_path: binding.as_deref(),
+        };
+        for ext in crate::extensions::resolve_for(&config.agent) {
+            tools.extend(ext.tools(&ext_ctx));
+        }
+        tools.connect_mcp(&config.mcp);
+        Ok(tools)
     }
 
     pub fn new(config: Config) -> ModelResult<Self> {
@@ -308,14 +335,16 @@ impl Agent {
         // 直接构造的 Config（未走 load_from_file）也在这里兜底做窗口自动预算
         let mut config = config;
         config.resolve_auto_budget();
-        let provider = create_provider(&config)?;
+        let mut provider = create_provider(&config)?;
         let max_tokens = config.agent.max_total_tokens;
         let (system_prompt, _sections) = build_system_prompt(&config);
         let context = ContextManager::new(&system_prompt, max_tokens, config.context.l1_threshold);
-        let mut tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox, config.mcp_write_path().as_deref(), &config.session.dir)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-        tools.connect_mcp(&config.mcp);
+        let tools = Self::build_tools(&config)?;
         let session = Session::create(&crate::config::expand_tilde(&config.session.dir)).ok();
+        // 会话 ID 透传给 provider（X-R2-Session 头）：排查假死可按会话聚合网关日志
+        if let Some(s) = &session {
+            provider.set_session_hint(s.id());
+        }
         #[cfg(feature = "l3-memory")]
         let (memory, embedding) = Self::init_memory(&config);
         let hooks = Self::build_hooks(&config);
@@ -350,11 +379,12 @@ impl Agent {
         Self::warn_l3_not_compiled(&config);
         let mut config = config;
         config.resolve_auto_budget();
-        let provider = create_provider(&config)?;
+        let mut provider = create_provider(&config)?;
         let max_tokens = config.agent.max_total_tokens;
         let session_dir = crate::config::expand_tilde(&config.session.dir);
         let (session, messages) = Session::recover(&session_dir, session_id)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        provider.set_session_hint(session.id());
         // 累计用量一并恢复（取 JSONL 里最后一条 usage 快照）
         let usage = Session::recover_usage(&session_dir, session_id);
         let count = messages.len();
@@ -365,9 +395,7 @@ impl Agent {
             max_tokens,
             config.context.l1_threshold,
         );
-        let mut tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox, config.mcp_write_path().as_deref(), &config.session.dir)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-        tools.connect_mcp(&config.mcp);
+        let tools = Self::build_tools(&config)?;
         println!("已恢复会话 {session_id}（{count} 条历史消息）");
         #[cfg(feature = "l3-memory")]
         let (memory, embedding) = Self::init_memory(&config);
@@ -413,11 +441,12 @@ impl Agent {
         Self::warn_l3_not_compiled(&config);
         let mut config = config;
         config.resolve_auto_budget();
-        let provider = create_provider(&config)?;
+        let mut provider = create_provider(&config)?;
         let max_tokens = config.agent.max_total_tokens;
         let session_dir = crate::config::expand_tilde(&config.session.dir);
         let (session, messages) = Session::branch(&session_dir, parent_session_id, upto)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        provider.set_session_hint(session.id());
         let count = messages.len();
         let new_id = session.id().to_string();
         let (system_prompt, _sections) = build_system_prompt(&config);
@@ -427,9 +456,7 @@ impl Agent {
             max_tokens,
             config.context.l1_threshold,
         );
-        let mut tools = ToolRegistry::new_default(&config.agent.work_dir, &config.sandbox, config.mcp_write_path().as_deref(), &config.session.dir)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-        tools.connect_mcp(&config.mcp);
+        let tools = Self::build_tools(&config)?;
         println!("已从会话 {parent_session_id} 分叉（继承 {count} 条消息，新会话 {new_id}）");
         #[cfg(feature = "l3-memory")]
         let (memory, embedding) = Self::init_memory(&config);
@@ -491,10 +518,15 @@ impl Agent {
         }
     }
 
-    /// 测试注入 Mock Provider（不走 create_provider 工厂）
+    /// 测试注入 Mock Provider（不走 create_provider 工厂）；
+    /// 会话 ID 可得时同步 session hint（与构造路径行为一致）
     #[cfg(test)]
     pub(crate) fn set_provider(&mut self, p: Box<dyn ModelProvider>) {
         self.provider = p;
+        let sid = self.session_id().map(|s| s.to_string());
+        if let Some(sid) = sid {
+            self.provider.set_session_hint(&sid);
+        }
     }
 
     /// 静音开关：true 时不向 stdout 打印（事件照常广播）
@@ -1716,10 +1748,36 @@ mod tests {
         assert!(!full.contains("[SOUL.md"));
         assert!(!full.contains("[AGENTS.md"));
         assert!(!full.contains("[自定义配置]"));
-        // v0.7.2 起内核恒附[成长系统]段（fixture 无技能目录）：core 是前缀而非全部
+        // 默认清单下 evolution extension 恒附 prompt 段（fixture 无技能目录）：
+        // core 是前缀而非全部
         assert!(full.starts_with(sections.core.as_str()), "内核段必须是前缀");
-        assert!(full.contains("[成长系统]"));
+        assert_eq!(sections.extensions.len(), 1, "默认应注入 evolution 段");
+        let (title, content) = &sections.extensions[0];
+        assert!(full.contains(&format!("\n\n[{title}]\n{content}")));
         assert!(sections.soul.is_none() && sections.agents.is_none() && sections.custom.is_none());
+    }
+
+    /// v0.14.0 字节级等价 golden：默认配置（全装 extensions、无技能/SOUL/AGENTS/记忆文件）
+    /// 下 build_system_prompt 输出必须与 v0.13 内嵌实现逐字节一致。
+    /// golden 文件从 v0.13.0 实跑抓取（1655 字节，无尾部换行；勿用编辑器重存防加换行）。
+    const DEFAULT_PROMPT_GOLDEN: &str = include_str!("../tests/golden/default_system_prompt.txt");
+
+    #[test]
+    fn test_prompt_default_golden_bytes() {
+        let (home, _work, config) = prompt_fixture();
+        let (full, _) = build_system_prompt_with_home(&config, &home.path().to_string_lossy());
+        assert_eq!(full, DEFAULT_PROMPT_GOLDEN, "默认 prompt 字节级漂移");
+    }
+
+    #[test]
+    fn test_prompt_evolution_disabled_drops_extension_section() {
+        // evolution_enabled=false（v0.13 兼容开关）：evolution 被过滤，
+        // 无 prompt 段注入（v0.13 关开关行为保持）
+        let (home, _work, mut config) = prompt_fixture();
+        config.agent.evolution_enabled = false;
+        let (_full, sections) =
+            build_system_prompt_with_home(&config, &home.path().to_string_lossy());
+        assert!(sections.extensions.is_empty());
     }
 
     #[test]
@@ -1781,7 +1839,7 @@ mod tests {
         let agents = sections.agents.expect("应有 AGENTS 段");
         assert!(agents.len() <= MAX_LAYER_BYTES + 64, "截断后超长：{}", agents.len());
         assert!(agents.ends_with("已截断）"));
-        // 成长系统段（~400B）+ 记忆规则块（~500B）恒定附加于 core 之后：
+        // extension prompt 段（~400B）+ 记忆规则块（~500B）恒定附加于 core 之后：
         // 边界放宽到 +2048 覆盖恒定段（v0.11.0 记忆层）
         assert!(full.len() < sections.core.len() + MAX_LAYER_BYTES + 2048);
     }

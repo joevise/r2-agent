@@ -104,6 +104,10 @@ fn apply_persona(name: &str, cfg: &mut Config) {
                 _ => cfg.model.openai_compat.model = p.model.clone(),
             }
         }
+        // Extension 裁剪（v0.14.0）：Some = 分身能力清单覆盖主配置；None = 继承
+        if let Some(exts) = &p.extensions {
+            cfg.agent.extensions = exts.clone();
+        }
     }
     // 分身自己的 MCP.toml 叠加（一亩三分地读侧：agent 用 mcp 工具装的 server
     // 写在自己目录，这里 upsert 进会话配置；同名覆盖全局，幂等可重复调用）
@@ -361,17 +365,27 @@ fn state_json(state: &WebState) -> Value {
             "skills": sections.skills,
             "custom": sections.custom,
             "memory": sections.memory,
+            "extensions": sections.extensions,
         },
         "running": running,
     })
 }
 
-/// 启动时构造工具清单快照（与 Agent 同源的注册表，含 MCP 连接）
+/// 启动时构造工具清单快照（与 Agent 同源的注册表：核心 5 工具 + extensions 注入 + MCP 连接）
 fn build_tool_list(config: &Config) -> Vec<Value> {
     let work_dir = config::expand_tilde(&config.agent.work_dir);
-    let Ok(mut registry) = ToolRegistry::new_default(&work_dir, &config.sandbox, config.mcp_write_path().as_deref(), &config.session.dir) else {
+    let Ok(mut registry) = ToolRegistry::new_core(&work_dir, &config.sandbox, &config.session.dir) else {
         return Vec::new();
     };
+    let binding = config.mcp_write_path();
+    let ext_ctx = r2_core::extensions::ExtCtx {
+        work_dir: &work_dir,
+        session_dir: &config.session.dir,
+        config_path: binding.as_deref(),
+    };
+    for ext in r2_core::extensions::resolve_for(&config.agent) {
+        registry.extend(ext.tools(&ext_ctx));
+    }
     registry.connect_mcp(&config.mcp);
     registry
         .schemas()
@@ -4351,6 +4365,33 @@ mod tests {
         apply_persona(MAIN, &mut cfg);
         assert!(cfg.agent.persona_dir.is_none());
         assert_eq!(cfg.model.openai_compat.model, "keep-me");
+
+        std::env::set_var("HOME", old_home);
+    }
+
+    #[test]
+    fn test_persona_extensions_overlay() {
+        // v0.14.0：AGENT.toml extensions=Some(清单) 时裁剪，None 时继承主配置
+        let _g = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let old_home = std::env::var("HOME").unwrap_or_default();
+        std::env::set_var("HOME", tmp.path());
+
+        // None（默认档案）：继承主配置清单
+        agents::draft_profile("inherit", "Inherit", "", "", "").unwrap();
+        let mut cfg = Config::default_config();
+        cfg.agent.extensions = vec!["evolution".into(), "tasks".into()];
+        apply_persona("inherit", &mut cfg);
+        assert_eq!(cfg.agent.extensions, vec!["evolution", "tasks"]);
+
+        // Some(["tasks"])：裁剪后只剩 tasks
+        agents::draft_profile("trimmed", "Trimmed", "", "", "").unwrap();
+        let mut p = agents::load_profile("trimmed").unwrap();
+        p.extensions = Some(vec!["tasks".to_string()]);
+        agents::save_profile(&p).unwrap();
+        let mut cfg = Config::default_config();
+        apply_persona("trimmed", &mut cfg);
+        assert_eq!(cfg.agent.extensions, vec!["tasks"]);
 
         std::env::set_var("HOME", old_home);
     }
