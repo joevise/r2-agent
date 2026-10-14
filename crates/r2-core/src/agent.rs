@@ -287,9 +287,21 @@ pub struct Agent {
     last_event_at: LastEventHandle,
     /// 在途工具活动（v0.12.4 忙碌应答/深度心跳的信息源）
     activity: ActivityHandle,
+    /// 行为钩子注册表（v0.13.0：核心循环只调点位；evolution 为第一个 hook 实现）
+    hooks: crate::hooks::HookRegistry,
 }
 
 impl Agent {
+    /// 组装钩子注册表：evolution_enabled=false 时不注册 EvolutionHook
+    /// （反思/草稿/技能追踪全关——测试与嵌入宿主的确定性保障）
+    fn build_hooks(config: &Config) -> crate::hooks::HookRegistry {
+        let mut hooks = crate::hooks::HookRegistry::new();
+        if config.agent.evolution_enabled {
+            hooks.register(std::sync::Arc::new(crate::evolution::EvolutionHook::new()));
+        }
+        hooks
+    }
+
     pub fn new(config: Config) -> ModelResult<Self> {
         #[cfg(not(feature = "l3-memory"))]
         Self::warn_l3_not_compiled(&config);
@@ -306,6 +318,7 @@ impl Agent {
         let session = Session::create(&crate::config::expand_tilde(&config.session.dir)).ok();
         #[cfg(feature = "l3-memory")]
         let (memory, embedding) = Self::init_memory(&config);
+        let hooks = Self::build_hooks(&config);
         Ok(Self {
             provider,
             context,
@@ -327,6 +340,7 @@ impl Agent {
             system_prompt,
             last_event_at: std::sync::Arc::new(std::sync::Mutex::new(None)),
             activity: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            hooks,
         })
     }
 
@@ -357,6 +371,7 @@ impl Agent {
         println!("已恢复会话 {session_id}（{count} 条历史消息）");
         #[cfg(feature = "l3-memory")]
         let (memory, embedding) = Self::init_memory(&config);
+        let hooks = Self::build_hooks(&config);
         let mut agent = Self {
             provider,
             context,
@@ -378,6 +393,7 @@ impl Agent {
             system_prompt,
             last_event_at: std::sync::Arc::new(std::sync::Mutex::new(None)),
             activity: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            hooks,
         };
         // v0.12.6 持久化第一批 A：重启恢复时补写历史里缺结果的 tool_call
         // （崩溃时结果随进程蒸发，不补则下轮请求协议残废）。幂等。
@@ -417,6 +433,7 @@ impl Agent {
         println!("已从会话 {parent_session_id} 分叉（继承 {count} 条消息，新会话 {new_id}）");
         #[cfg(feature = "l3-memory")]
         let (memory, embedding) = Self::init_memory(&config);
+        let hooks = Self::build_hooks(&config);
         let mut agent = Self {
             provider,
             context,
@@ -439,6 +456,7 @@ impl Agent {
             system_prompt,
             last_event_at: std::sync::Arc::new(std::sync::Mutex::new(None)),
             activity: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            hooks,
         };
         // 分支可能复制了父会话的残缺尾部（有 tool_call 无 tool_result）——同 resume 补写
         let patched = agent.interrupt_pending_tools_on_restart();
@@ -668,131 +686,6 @@ impl Agent {
     /// v0.1 复用主模型做摘要（config.context.l2_summary_model 暂忽略，
     /// 独立的小模型做摘要是后续优化点）。
     /// 已有摘要时，让模型把旧摘要和新消息合并成一份新摘要。
-
-    /// 反思钩子（v0.7 自进化核心环）：本轮有硬信号时，让模型把信号翻译成
-    /// 一条可操作教训，落进化事件流。失败静默（进化是副业，不打扰主业）。
-    /// 铁律：模型只翻译硬信号，不评判（prompt 见 evolution::reflection_messages）。
-    async fn reflect_and_record(&mut self, task_summary: &str) {
-        if self.turn_signals.is_empty() {
-            return;
-        }
-        let msgs = crate::evolution::reflection_messages(&self.turn_signals, task_summary);
-        let stream = match self.provider.chat_stream(&msgs, &[]).await {
-            Ok(s) => s,
-            Err(_) => return, // 反思失败不影响主流程
-        };
-        let mut chunks = Vec::new();
-        let mut st = stream;
-        use futures_util::StreamExt;
-        while let Some(item) = st.next().await {
-            match item {
-                Ok(c) => chunks.push(c),
-                Err(_) => return,
-            }
-        }
-        let Ok((text, _)) = self.provider.parse_response(&chunks) else {
-            return;
-        };
-        if let Some((lesson, evidence)) = crate::evolution::parse_reflection(&text) {
-            let ev = crate::evolution::EvolutionEvent {
-                ts: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-                kind: "lesson".into(),
-                content: lesson.clone(),
-                evidence,
-                session_id: self.session_id().unwrap_or("unknown").to_string(),
-            };
-            if crate::evolution::append_event(&ev).is_ok() {
-                self.emit(AgentEvent::Evolved(format!("🌱 学到教训：{lesson}")));
-            }
-        }
-    }
-
-
-    /// 成长变化记账：本轮内目标被设定/修改、技能被沉淀 → 事件流 + git 快照 + 广播。
-    /// 与反思钩子互补：反思管"教训"，这里管"自我档案的变化"。
-    async fn record_growth_changes(&mut self) {
-        let now = crate::evolution::now_ts_pub();
-        // 目标 diff
-        let goal_after = crate::evolution::read_goal();
-        let goal_changed = match (&self.turn_start_goal, &goal_after) {
-            (None, Some(g)) => Some(format!("目标已设定：{}", truncate_str(g, 80))),
-            (Some(a), Some(b)) if a != b => Some(format!("目标已更新：{}", truncate_str(b, 80))),
-            _ => None,
-        };
-        if let Some(content) = goal_changed {
-            let _ = crate::evolution::append_event(&crate::evolution::EvolutionEvent {
-                ts: now,
-                kind: "goal_set".into(),
-                content,
-                evidence: "用户口述 · agent 代笔".into(),
-                session_id: self.session_id().unwrap_or("unknown").to_string(),
-            });
-            let _ = crate::evolution::snapshot_self("goal updated");
-            self.emit(AgentEvent::Evolved("🎯 目标已记录".into()));
-        }
-        // 技能 diff（新增 = 沉淀；删除不记账——归档机制已有自己的事件）
-        let after = crate::evolution::list_skill_names();
-        let added: Vec<&String> = after.iter().filter(|n| !self.turn_start_skills.contains(n)).collect();
-        if let Some(first) = added.first() {
-            // 只对非 auto- 前缀记账（auto 起草有自己的 skill_draft 事件，避免双记）
-            if !first.starts_with("auto-") {
-                let names: Vec<String> = added.iter().map(|s| s.to_string()).collect();
-                let _ = crate::evolution::append_event(&crate::evolution::EvolutionEvent {
-                    ts: now,
-                    kind: "skill_created".into(),
-                    content: format!("学习沉淀为技能：{}", names.join("、")),
-                    evidence: "agent 主动蒸馏（成长系统注入指引）".into(),
-                    session_id: self.session_id().unwrap_or("unknown").to_string(),
-                });
-                let _ = crate::evolution::snapshot_self(&format!("skill沉淀 {names:?}"));
-                self.emit(AgentEvent::Evolved(format!("⭐ 学习沉淀：{}", names.join("、"))));
-            }
-        }
-    }
-
-    /// 同族教训 ≥3 条 → LLM 合成 SKILL.md 草稿（trial 状态）→ 事件 + git 快照。
-    /// 每轮最多起草 1 个（防突发成批）；名字冲突 = 已在成长中，跳过。
-    async fn maybe_draft_skill(&mut self) {
-        let clusters = crate::evolution::detect_lesson_clusters(3);
-        let Some(lessons) = clusters.first() else { return };
-        let msgs = crate::evolution::draft_messages(lessons);
-        let Ok(mut stream) = self.provider.chat_stream(&msgs, &[]).await else {
-            return;
-        };
-        let mut chunks = Vec::new();
-        use futures_util::StreamExt;
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(c) => chunks.push(c),
-                Err(_) => return,
-            }
-        }
-        let Ok((text, _)) = self.provider.parse_response(&chunks) else {
-            return;
-        };
-        let Some(name) = crate::evolution::parse_draft_name(&text) else {
-            return;
-        };
-        if crate::evolution::write_draft_skill(&name, &text).is_ok() {
-            let n = lessons.len();
-            let _ = crate::evolution::append_event(&crate::evolution::EvolutionEvent {
-                ts: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-                kind: "skill_draft".into(),
-                content: format!("同族教训 ×{n} 自动合成技能「{name}」（试用中）"),
-                evidence: lessons.first().cloned().unwrap_or_default(),
-                session_id: self.session_id().unwrap_or("unknown").to_string(),
-            });
-            let _ = crate::evolution::snapshot_self(&format!("draft skill {name}"));
-            self.emit(AgentEvent::Evolved(format!("✏️ 教训攒够 {n} 条，自动起草技能 {name}（试用）")));
-        }
-    }
-
     async fn summarize(&mut self, old_msgs: &[crate::types::Message]) -> ModelResult<String> {
         // 把待压缩消息转成可读对话文本
         let mut dialogue = String::new();
@@ -1127,11 +1020,45 @@ impl Agent {
                     arguments: call.arguments.clone(),
                 });
                 self.set_activity(&call.name, &call.arguments);
-                let result = self.tools.execute(call).await;
-                self.clear_activity();
-                // 技能使用追踪：引用即记，成败入统计（晋升/衰退原料）
-                if let Some(sk) = crate::evolution::detect_skill_reference(&call.name, &call.arguments) {
-                    crate::evolution::record_skill_use(&sk, !result.starts_with("ERROR"));
+                // 钩子点位（工具前）：返回 Some(文案) = 拦截，文案直接作为工具结果
+                let intercepted = {
+                    let ctx = crate::hooks::HookCtx {
+                        provider: &mut *self.provider,
+                        signals: &self.turn_signals,
+                        task_summary: "",
+                        work_dir: &self.config.agent.work_dir,
+                        session_id: "",
+                        emitter: self.emitter.as_ref(),
+                        goal_baseline: None,
+                        skills_baseline: &[],
+                    };
+                    self.hooks.fire_tool_start(call, &ctx).await
+                };
+                let result = match intercepted {
+                    Some(text) => {
+                        self.clear_activity();
+                        text
+                    }
+                    None => {
+                        let r = self.tools.execute(call).await;
+                        self.clear_activity();
+                        r
+                    }
+                };
+                let tool_ok = !result.starts_with("ERROR");
+                // 钩子点位（工具后）：技能使用追踪等（evolution hook 在此记账）
+                {
+                    let ctx = crate::hooks::HookCtx {
+                        provider: &mut *self.provider,
+                        signals: &self.turn_signals,
+                        task_summary: "",
+                        work_dir: &self.config.agent.work_dir,
+                        session_id: "",
+                        emitter: self.emitter.as_ref(),
+                        goal_baseline: None,
+                        skills_baseline: &[],
+                    };
+                    self.hooks.fire_tool_end(call, tool_ok, &ctx).await;
                 }
                 // 硬信号采集：ERROR 前缀 = 工具失败；曾失败的工具成功 = 重试爬出
                 if result.starts_with("ERROR") {
@@ -1211,25 +1138,29 @@ impl Agent {
         if !self.quiet {
             println!("[usage] {}", self.usage_line());
         }
-        // 反思钩子：Done 之后跑（用户已见到回复），教训落进化流
+        // 收尾钩子点位：Done 之后跑（用户已见到回复）。EvolutionHook 在此做
+        // 反思（教训落进化流）→ 聚类起草（无条件检查，幂等保护 = 同名技能已存在时
+        // write_draft_skill 拒绝）→ 成长变化记账（目标/技能 diff → 事件 + git 快照）。
         let task_summary: String = user_input.chars().take(200).collect();
+        let session_id = self.session_id().unwrap_or("unknown").to_string();
         // 收尾钩子 30s 上限：副业（进化）不得无限占用会话锁——
         // 8/23 大Joe 实测：回复已显示，但钩子的 LLM 调用还在锁内跑，
         // 此时发消息吃 "prompt in flight" 闭门羹
+        let mut ctx = crate::hooks::HookCtx {
+            provider: &mut *self.provider,
+            signals: &self.turn_signals,
+            task_summary: &task_summary,
+            work_dir: &self.config.agent.work_dir,
+            session_id: &session_id,
+            emitter: self.emitter.as_ref(),
+            goal_baseline: self.turn_start_goal.as_deref(),
+            skills_baseline: &self.turn_start_skills,
+        };
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            self.reflect_and_record(&task_summary),
+            self.hooks.fire_turn_end(&mut ctx),
         )
         .await;
-        // 聚类检查（无条件）：种子教训可能来自历史会话，不能只靠"新教训落流"触发；
-        // 幂等保护 = 同名技能已存在时 write_draft_skill 拒绝（E2E 实测发现的 gap）
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            self.maybe_draft_skill(),
-        )
-        .await;
-        // 成长变化记账：目标被设定/修改、技能被沉淀 → 事件流 + git 快照
-        self.record_growth_changes().await;
         Ok(final_text)
     }
 
@@ -1332,10 +1263,6 @@ fn is_context_too_long_error(e: &str) -> bool {
         "input length and max_tokens exceed context limit",
     ];
     PATTERNS.iter().any(|p| s.contains(p))
-}
-
-fn truncate_str(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
 }
 
 /// 空响应守卫：正文与工具调用双空 = 流被掐断的显式错误（不静默成功）。
@@ -1453,6 +1380,8 @@ mod tests {
         config.session.dir = tmp.path().to_string_lossy().to_string();
         // work_dir 也指向临时目录：避免拾取仓库根 AGENTS.md 污染 system prompt 相关断言
         config.agent.work_dir = tmp.path().to_string_lossy().to_string();
+        // v0.13.0：测试关进化钩子——收尾不再有意外模型调用，调用计数断言恢复精确
+        config.agent.evolution_enabled = false;
         let mut agent = Agent::new(config).unwrap();
         agent.set_provider(Box::new(MockProvider {
             gate,
@@ -1548,6 +1477,7 @@ mod tests {
         // 恢复会话：usage 一并恢复，再跑一轮在累计值上继续
         let mut config = Config::default_config();
         config.session.dir = dir;
+        config.agent.evolution_enabled = false; // 收尾钩子不调模型，计数精确
         let mut agent2 = Agent::resume(config, &session_id).expect("resume 应成功");
         assert_eq!(agent2.usage().llm_calls, 1);
         let (_g2, gate_rx2) = tokio::sync::watch::channel(true);
@@ -1977,6 +1907,8 @@ mod tests {
         let mut config = Config::default_config();
         config.session.dir = tmp.path().to_string_lossy().to_string();
         config.agent.work_dir = tmp.path().to_string_lossy().to_string();
+        // v0.13.0：测试关进化钩子——收尾不再有意外模型调用，调用计数断言恢复精确
+        config.agent.evolution_enabled = false;
         let mut agent = Agent::new(config).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         agent.set_provider(Box::new(ScriptedProvider {
@@ -2015,9 +1947,8 @@ mod tests {
 
         let reply = agent.run("继续").await.expect("强压重试后 run 应成功");
         assert_eq!(reply, "最终回复");
-        // ≥3 次模型调用：首错 + 摘要 + 重试（收尾的进化钩子在装有教训聚类的
-        // 环境上可能追加调用，不断言精确上限）
-        assert!(calls.load(Ordering::SeqCst) >= 3);
+        // 恰好 3 次模型调用：首错 + 摘要 + 重试（测试关进化钩子，收尾零追加调用）
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
         // 触发了压缩：摘要就位、上下文 token 下降
         assert_eq!(agent.context.l2_summary(), Some("历史摘要"));
         assert!(agent.context.token_count() < tokens_before);
@@ -2087,12 +2018,138 @@ mod tests {
 
         let reply = agent.run("继续").await.expect("降级截断后重试应成功");
         assert_eq!(reply, "最终回复");
-        // 首错 + 失败的摘要 + 重试 = 3（收尾钩子可能追加，见上）
-        assert!(calls.load(Ordering::SeqCst) >= 3);
+        // 首错 + 失败的摘要 + 重试 = 恰好 3（测试关进化钩子，收尾零追加调用）
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(
             agent.context.l2_summary(),
             Some("（上下文超限，旧消息已截断）"),
             "摘要失败应写截断占位"
+        );
+    }
+
+    // ── v0.13.0：hooks 体系 ──
+
+    #[test]
+    fn test_evolution_hook_registered_by_default_and_disabled_by_config() {
+        // 默认注册 EvolutionHook（与 v0.12.x 内嵌行为等价）
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default_config();
+        config.session.dir = tmp.path().to_string_lossy().to_string();
+        let agent = Agent::new(config).unwrap();
+        assert_eq!(agent.hooks.len(), 1, "默认应注册 EvolutionHook");
+
+        // evolution_enabled=false：不注册，注册表为空
+        let mut config2 = Config::default_config();
+        config2.session.dir = tmp.path().to_string_lossy().to_string();
+        config2.agent.evolution_enabled = false;
+        let agent2 = Agent::new(config2).unwrap();
+        assert_eq!(agent2.hooks.len(), 0);
+        assert!(agent2.hooks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_evolution_disabled_turn_end_makes_zero_model_calls() {
+        // 关进化：一次普通 run 全程恰好 1 次模型调用（收尾钩子不存在）
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut agent, calls) = scripted_agent(&tmp, vec![Ok("回复".into())]);
+        let reply = agent.run("任务").await.expect("run 应成功");
+        assert_eq!(reply, "回复");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "evolution_enabled=false 时收尾不得追加模型调用"
+        );
+    }
+
+    /// 首轮返回一个 bash 工具调用、次轮返回纯文本的 Provider（拦截测试用）
+    struct ToolCallingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ToolCallingProvider {
+        fn id(&self) -> &str {
+            "tool-calling"
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+        ) -> ModelResult<ChunkStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let text = if n == 0 { "调用工具" } else { "完成" };
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::Delta(text.to_string())),
+                Ok(StreamChunk::Done),
+            ])))
+        }
+
+        fn parse_response(&self, chunks: &[StreamChunk]) -> ModelResult<(String, Vec<ToolCall>)> {
+            let text: String = chunks
+                .iter()
+                .filter_map(|c| match c {
+                    StreamChunk::Delta(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if text.contains("调用工具") {
+                Ok((
+                    text,
+                    vec![ToolCall {
+                        id: "t1".into(),
+                        name: "bash".into(),
+                        arguments: "{\"command\":\"touch INTERCEPTED_MARKER\"}".into(),
+                    }],
+                ))
+            } else {
+                Ok((text, vec![]))
+            }
+        }
+    }
+
+    /// 防护型 hook：拦截一切 bash 调用
+    struct InterceptHook;
+
+    #[async_trait::async_trait]
+    impl crate::hooks::Hook for InterceptHook {
+        fn name(&self) -> &str {
+            "intercept"
+        }
+        async fn on_tool_start(
+            &self,
+            call: &ToolCall,
+            _ctx: &crate::hooks::HookCtx<'_>,
+        ) -> Option<String> {
+            (call.name == "bash").then(|| "【防护】bash 调用已被拦截".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_start_hook_intercepts_execution() {
+        // on_tool_start 返回 Some(文案)：工具不执行，文案直接作为工具结果
+        let tmp = tempfile::tempdir().unwrap();
+        let (_gate_tx, gate_rx) = tokio::sync::watch::channel(true);
+        let mut agent = test_agent(&tmp, gate_rx);
+        let calls = Arc::new(AtomicUsize::new(0));
+        agent.set_provider(Box::new(ToolCallingProvider { calls: calls.clone() }));
+        agent.hooks.register(Arc::new(InterceptHook));
+
+        let reply = agent.run("跑个命令").await.expect("run 应成功");
+        assert_eq!(reply, "完成");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "工具循环两轮 = 2 次模型调用");
+        // 工具未执行：marker 文件不存在
+        assert!(
+            !tmp.path().join("INTERCEPTED_MARKER").exists(),
+            "被拦截的工具不得执行"
+        );
+        // 拦截文案作为工具结果入上下文（协议完整：tool_call 有对应 tool_result）
+        let history = agent.context.history();
+        assert!(
+            history.iter().any(|m| m.role == Role::Tool
+                && m.tool_call_id.as_deref() == Some("t1")
+                && m.content.contains("已被拦截")),
+            "拦截文案应作为工具结果：{history:?}"
         );
     }
 }

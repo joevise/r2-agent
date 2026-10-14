@@ -651,6 +651,178 @@ pub fn list_skill_names() -> Vec<String> {
     out
 }
 
+// ═══════════════════ v0.13.0：EvolutionHook（自进化降级为第一个 Hook 实现）═══════════════════
+
+fn truncate_str(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// 广播一条成长事件（无订阅者/无 emitter 时静默）
+fn emit_evolved(ctx: &crate::hooks::HookCtx<'_>, text: String) {
+    if let Some(tx) = ctx.emitter {
+        let _ = tx.send(crate::events::AgentEvent::Evolved(text));
+    }
+}
+
+/// 自进化 Hook：工具追踪（on_tool_end）+ 回合收尾（反思 → 技能草稿 → 成长记账）。
+/// 方法体原样搬自 agent.rs 的 reflect_and_record / maybe_draft_skill /
+/// record_growth_changes / 工具执行处的技能追踪段，行为等价。
+/// 铁律不变：模型只翻译硬信号，不评判；进化是副业，失败静默。
+pub struct EvolutionHook;
+
+impl EvolutionHook {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// 反思钩子（v0.7 自进化核心环）：本轮有硬信号时，让模型把信号翻译成
+    /// 一条可操作教训，落进化事件流。失败静默（进化是副业，不打扰主业）。
+    async fn reflect(&self, ctx: &mut crate::hooks::HookCtx<'_>) {
+        if ctx.signals.is_empty() {
+            return;
+        }
+        let msgs = reflection_messages(ctx.signals, ctx.task_summary);
+        let stream = match ctx.provider.chat_stream(&msgs, &[]).await {
+            Ok(s) => s,
+            Err(_) => return, // 反思失败不影响主流程
+        };
+        let mut chunks = Vec::new();
+        let mut st = stream;
+        use futures_util::StreamExt;
+        while let Some(item) = st.next().await {
+            match item {
+                Ok(c) => chunks.push(c),
+                Err(_) => return,
+            }
+        }
+        let Ok((text, _)) = ctx.provider.parse_response(&chunks) else {
+            return;
+        };
+        if let Some((lesson, evidence)) = parse_reflection(&text) {
+            let ev = EvolutionEvent {
+                ts: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                kind: "lesson".into(),
+                content: lesson.clone(),
+                evidence,
+                session_id: ctx.session_id.to_string(),
+            };
+            if append_event(&ev).is_ok() {
+                emit_evolved(ctx, format!("🌱 学到教训：{lesson}"));
+            }
+        }
+    }
+
+    /// 同族教训 ≥3 条 → LLM 合成 SKILL.md 草稿（trial 状态）→ 事件 + git 快照。
+    /// 每轮最多起草 1 个（防突发成批）；名字冲突 = 已在成长中，跳过。
+    async fn draft(&self, ctx: &mut crate::hooks::HookCtx<'_>) {
+        let clusters = detect_lesson_clusters(3);
+        let Some(lessons) = clusters.first() else { return };
+        let msgs = draft_messages(lessons);
+        let Ok(mut stream) = ctx.provider.chat_stream(&msgs, &[]).await else {
+            return;
+        };
+        let mut chunks = Vec::new();
+        use futures_util::StreamExt;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(c) => chunks.push(c),
+                Err(_) => return,
+            }
+        }
+        let Ok((text, _)) = ctx.provider.parse_response(&chunks) else {
+            return;
+        };
+        let Some(name) = parse_draft_name(&text) else {
+            return;
+        };
+        if write_draft_skill(&name, &text).is_ok() {
+            let n = lessons.len();
+            let _ = append_event(&EvolutionEvent {
+                ts: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                kind: "skill_draft".into(),
+                content: format!("同族教训 ×{n} 自动合成技能「{name}」（试用中）"),
+                evidence: lessons.first().cloned().unwrap_or_default(),
+                session_id: ctx.session_id.to_string(),
+            });
+            let _ = snapshot_self(&format!("draft skill {name}"));
+            emit_evolved(ctx, format!("✏️ 教训攒够 {n} 条，自动起草技能 {name}（试用）"));
+        }
+    }
+
+    /// 成长变化记账：本轮内目标被设定/修改、技能被沉淀 → 事件流 + git 快照 + 广播。
+    /// 与反思钩子互补：反思管"教训"，这里管"自我档案的变化"。
+    async fn record_growth(&self, ctx: &mut crate::hooks::HookCtx<'_>) {
+        let now = now_ts_pub();
+        // 目标 diff
+        let goal_after = read_goal();
+        let goal_changed = match (ctx.goal_baseline, &goal_after) {
+            (None, Some(g)) => Some(format!("目标已设定：{}", truncate_str(g, 80))),
+            (Some(a), Some(b)) if a != b => Some(format!("目标已更新：{}", truncate_str(b, 80))),
+            _ => None,
+        };
+        if let Some(content) = goal_changed {
+            let _ = append_event(&EvolutionEvent {
+                ts: now,
+                kind: "goal_set".into(),
+                content,
+                evidence: "用户口述 · agent 代笔".into(),
+                session_id: ctx.session_id.to_string(),
+            });
+            let _ = snapshot_self("goal updated");
+            emit_evolved(ctx, "🎯 目标已记录".into());
+        }
+        // 技能 diff（新增 = 沉淀；删除不记账——归档机制已有自己的事件）
+        let after = list_skill_names();
+        let added: Vec<&String> = after
+            .iter()
+            .filter(|n| !ctx.skills_baseline.contains(n))
+            .collect();
+        if let Some(first) = added.first() {
+            // 只对非 auto- 前缀记账（auto 起草有自己的 skill_draft 事件，避免双记）
+            if !first.starts_with("auto-") {
+                let names: Vec<String> = added.iter().map(|s| s.to_string()).collect();
+                let _ = append_event(&EvolutionEvent {
+                    ts: now,
+                    kind: "skill_created".into(),
+                    content: format!("学习沉淀为技能：{}", names.join("、")),
+                    evidence: "agent 主动蒸馏（成长系统注入指引）".into(),
+                    session_id: ctx.session_id.to_string(),
+                });
+                let _ = snapshot_self(&format!("skill沉淀 {names:?}"));
+                emit_evolved(ctx, format!("⭐ 学习沉淀：{}", names.join("、")));
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::hooks::Hook for EvolutionHook {
+    fn name(&self) -> &str {
+        "evolution"
+    }
+
+    /// 技能使用追踪：引用即记，成败入统计（晋升/衰退原料）
+    async fn on_tool_end(&self, call: &crate::types::ToolCall, ok: bool, _ctx: &crate::hooks::HookCtx<'_>) {
+        if let Some(sk) = detect_skill_reference(&call.name, &call.arguments) {
+            record_skill_use(&sk, ok);
+        }
+    }
+
+    /// 回合收尾：反思（有硬信号才调模型）→ 聚类起草（无条件检查，
+    /// 幂等保护 = 同名技能已存在时 write_draft_skill 拒绝）→ 成长变化记账
+    async fn on_turn_end(&self, ctx: &mut crate::hooks::HookCtx<'_>) {
+        self.reflect(ctx).await;
+        self.draft(ctx).await;
+        self.record_growth(ctx).await;
+    }
+}
+
 #[cfg(test)]
 mod v2_tests {
     use super::*;
@@ -692,5 +864,129 @@ mod v2_tests {
         let msgs = draft_messages(&["教训A".into(), "教训B".into()]);
         assert_eq!(msgs.len(), 2);
         assert!(msgs[0].content.contains("禁止发明"));
+    }
+
+    // ── v0.13.0：EvolutionHook 回归 ──
+
+    use crate::hooks::{Hook, HookCtx};
+    use crate::model::{ChunkStream, ModelProvider, ModelResult};
+    use crate::types::{Message, StreamChunk, ToolCall, ToolSchema};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// 计数 Provider：断言 hook 是否意外调模型
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CountingProvider {
+        fn id(&self) -> &str {
+            "counting"
+        }
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+        ) -> ModelResult<ChunkStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::Delta("NO_LESSON".into())),
+                Ok(StreamChunk::Done),
+            ])))
+        }
+        fn parse_response(&self, chunks: &[StreamChunk]) -> ModelResult<(String, Vec<ToolCall>)> {
+            let text: String = chunks
+                .iter()
+                .filter_map(|c| match c {
+                    StreamChunk::Delta(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            Ok((text, vec![]))
+        }
+    }
+
+    fn tool_call(name: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: "t1".into(),
+            name: name.into(),
+            arguments: args.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hook_tool_end_tracks_skill_reference() {
+        // 改 HOME 的测试必须持全仓共享锁（防并行踩踏）
+        let _guard = crate::testutil::HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        // write_usage 不建目录（真实环境 ~/.r2 恒存在），测试需补建
+        std::fs::create_dir_all(tmp.path().join(".r2")).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut provider = CountingProvider { calls: calls.clone() };
+        let signals = TurnSignals::default();
+        let hook = EvolutionHook::new();
+        let ctx = HookCtx {
+            provider: &mut provider,
+            signals: &signals,
+            task_summary: "",
+            work_dir: "",
+            session_id: "s-test",
+            emitter: None,
+            goal_baseline: None,
+            skills_baseline: &[],
+        };
+        // 引用技能 → 落 usage 统计；非技能调用 → 不记
+        hook.on_tool_end(
+            &tool_call("bash", "cat ~/.r2/skills/brainstorming/SKILL.md"),
+            true,
+            &ctx,
+        )
+        .await;
+        hook.on_tool_end(&tool_call("bash", "ls -la"), true, &ctx).await;
+        hook.on_tool_end(
+            &tool_call("bash", "cat ~/.r2/skills/brainstorming/SKILL.md"),
+            false,
+            &ctx,
+        )
+        .await;
+        let usage = read_usage();
+        let stat = usage.get("brainstorming").expect("技能引用应落统计");
+        assert_eq!(stat.count, 2);
+        assert_eq!(stat.success, 1);
+        assert_eq!(stat.fail, 1);
+        assert!(!usage.contains_key("ls"), "非技能调用不应入统计");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "工具追踪不调模型");
+    }
+
+    #[tokio::test]
+    async fn test_hook_turn_end_empty_signals_zero_model_calls() {
+        // 收尾无硬信号、无目标/技能变化：全程零模型调用（失败静默，副业不扰主业）
+        let _guard = crate::testutil::HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut provider = CountingProvider { calls: calls.clone() };
+        let signals = TurnSignals::default();
+        let hook = EvolutionHook::new();
+        let mut ctx = HookCtx {
+            provider: &mut provider,
+            signals: &signals,
+            task_summary: "任务摘要",
+            work_dir: "",
+            session_id: "s-test",
+            emitter: None,
+            goal_baseline: None,
+            skills_baseline: &[],
+        };
+        hook.on_turn_end(&mut ctx).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "空信号 + 无档案变化时收尾不得调模型"
+        );
     }
 }

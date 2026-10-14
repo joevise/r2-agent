@@ -114,6 +114,10 @@ pub struct AgentConfig {
     /// 分身档案目录（v0.9：Some = agent 分身，SOUL/私有技能从该目录读；None = 主 agent）
     #[serde(default)]
     pub persona_dir: Option<String>,
+    /// 自进化钩子开关（v0.13.0）：false 时 Agent 不注册 EvolutionHook
+    /// （回合反思 / 技能草稿 / 技能追踪全关——测试与嵌入式宿主的确定性保障）
+    #[serde(default = "default_evolution_enabled")]
+    pub evolution_enabled: bool,
 }
 
 /// 上下文管理配置
@@ -240,6 +244,10 @@ fn default_anthropic_model() -> String {
 fn default_max_turns() -> usize {
     50
 }
+fn default_evolution_enabled() -> bool {
+    // 默认开启：与 v0.12.x 内嵌行为等价；测试/嵌入宿主显式关闭
+    true
+}
 fn default_max_total_tokens() -> usize {
     // 0 = 自动：post_process / Agent 构造时按 models 注册表推导窗口预算
     0
@@ -342,6 +350,7 @@ impl Default for AgentConfig {
             work_dir: default_work_dir(),
             system_prompt: String::new(),
             persona_dir: None,
+            evolution_enabled: default_evolution_enabled(),
         }
     }
 }
