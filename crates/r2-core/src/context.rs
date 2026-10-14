@@ -158,10 +158,26 @@ impl ContextManager {
     /// 把切分点向后推到这组 tool 结果之后——整组一起进压缩，
     /// 避免保留区出现没有对应 tool_calls 的孤儿 tool 消息（OpenAI 会直接报错）。
     fn compressible_end(&self) -> Option<usize> {
-        let len = self.messages.len();
         // 保留条数自适应阶梯：优先 12 条；消息太少切不动时逐级减少
         // （小窗口场景：消息少而大），至少保留 2 条（最近一轮 user+assistant）
-        for &keep in &[KEEP_RECENT, 8, 4, 2] {
+        self.compressible_end_with(&[KEEP_RECENT, 8, 4, 2])
+    }
+
+    /// 强制压缩切分点（v0.12.7）：保留窗口更小（最近 4/2 条），
+    /// 供 provider 报 context-too-long 时的强压路径使用
+    fn force_compressible_end(&self) -> Option<usize> {
+        self.compressible_end_with(&[4, 2])
+    }
+
+    /// 按给定保留阶梯计算可压缩消息的结束下标（[0, end) 进入压缩，[end, len) 保留）
+    ///
+    /// 切分点对齐规则：不能把 assistant(tool_calls) 和它的 tool 结果切开。
+    /// 若切分点落在 tool 结果消息上（即该 tool 组的 assistant 在切分点之前），
+    /// 把切分点向后推到这组 tool 结果之后——整组一起进压缩，
+    /// 避免保留区出现没有对应 tool_calls 的孤儿 tool 消息（OpenAI 会直接报错）。
+    fn compressible_end_with(&self, keeps: &[usize]) -> Option<usize> {
+        let len = self.messages.len();
+        for &keep in keeps {
             let mut end = len.saturating_sub(keep);
             // 切分点后推跳过 tool 结果（对齐 tool 组，避免孤儿 tool 消息）
             while end < len && self.messages[end].role == Role::Tool {
@@ -178,10 +194,21 @@ impl ContextManager {
     /// 取出待压缩的旧消息（从 messages 里移除并返回）；take 之后应调 set_summary
     pub fn take_compressible(&mut self) -> Option<Vec<Message>> {
         let end = self.compressible_end()?;
+        Some(self.take_until(end))
+    }
+
+    /// 强制取出待压缩旧消息（v0.12.7）：绕过 should_compress 的阈值判断，
+    /// 保留窗口更小（最近 4/2 条）。供 provider 报 context-too-long 时调用。
+    pub fn force_compressible(&mut self) -> Option<Vec<Message>> {
+        let end = self.force_compressible_end()?;
+        Some(self.take_until(end))
+    }
+
+    fn take_until(&mut self, end: usize) -> Vec<Message> {
         let taken: Vec<Message> = self.messages.drain(..end).collect();
         let taken_tokens: usize = taken.iter().map(message_tokens).sum();
         self.token_count = self.token_count.saturating_sub(taken_tokens);
-        Some(taken)
+        taken
     }
 
     /// 注入压缩摘要（二次压缩时直接替换旧摘要，不叠加——
@@ -486,6 +513,52 @@ mod tests {
         let mut ctx2 = ContextManager::new("sys", 10_000, -0.5);
         fill(&mut ctx2, 1);
         assert!(!ctx2.should_compress());
+    }
+
+    /// v0.12.7：force_compressible 绕过阈值（远低于阈值也切），保留窗口更小（4 条）
+    #[test]
+    fn test_force_compressible_bypasses_threshold_and_keeps_fewer() {
+        let mut ctx = ContextManager::new("sys", 10_000, THRESHOLD);
+        fill(&mut ctx, 20);
+        assert!(!ctx.should_compress(), "远低于阈值，常规路径不触发");
+        let before = ctx.token_count();
+        let taken = ctx.force_compressible().expect("force 应有可压缩旧消息");
+        assert_eq!(taken.len(), 20 - 4, "force 只保留最近 4 条");
+        assert_eq!(ctx.history_len(), 4);
+        assert!(ctx.token_count() < before);
+        assert_eq!(ctx.history()[0].content, format!("消息 {}", 20 - 4));
+    }
+
+    /// force 的切分点同样对齐 tool 组边界（不产生孤儿 tool 消息）
+    #[test]
+    fn test_force_compressible_aligns_tool_boundary() {
+        let mut ctx = ContextManager::new("sys", 10_000, THRESHOLD);
+        for i in 0..14 {
+            let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
+            ctx.add_message(role, &format!("消息 {i}")).unwrap();
+        }
+        let tc = ToolCall {
+            id: "call_f".to_string(),
+            name: "bash".to_string(),
+            arguments: "{}".to_string(),
+        };
+        ctx.add_assistant_with_tools("执行", vec![tc]).unwrap(); // index 14
+        ctx.add_tool_result("call_f", "ok").unwrap(); // index 15 = keep4 的切分点
+        fill(&mut ctx, 3); // index 16..19，共 19 条
+        let taken = ctx.force_compressible().unwrap();
+        // 切分点 15 落在 tool 结果上 → 后推到 16：tool 组整组进压缩
+        assert_eq!(taken.len(), 16);
+        assert_eq!(taken[15].role, Role::Tool);
+        assert_ne!(ctx.history()[0].role, Role::Tool);
+    }
+
+    /// 无可压缩旧消息（只剩 2 条）时 force 返回 None
+    #[test]
+    fn test_force_compressible_none_when_nothing_to_take() {
+        let mut ctx = ContextManager::new("sys", 10_000, THRESHOLD);
+        fill(&mut ctx, 2);
+        assert!(ctx.force_compressible().is_none());
+        assert_eq!(ctx.history_len(), 2);
     }
 
     /// max_total_tokens = 0：任何非空消息都报“上下文超限”（符合逻辑）

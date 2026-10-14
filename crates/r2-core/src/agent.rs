@@ -5,7 +5,7 @@ use crate::context::ContextManager;
 use crate::events::AgentEvent;
 #[cfg(feature = "l3-memory")]
 use crate::memory::{EmbeddingProvider, MemoryStore};
-use crate::model::{create_provider, ModelProvider, ModelResult};
+use crate::model::{create_provider, ChunkStream, ModelProvider, ModelResult};
 use crate::session::{Session, SessionEntry};
 use crate::tools::ToolRegistry;
 use crate::types::{Role, StreamChunk, ToolCall, UsageStats};
@@ -871,6 +871,89 @@ impl Agent {
         }
     }
 
+    /// 强制压缩一次（v0.12.7 context-too-long 自救）：绕过阈值 take 出旧消息，
+    /// 复用 L2 摘要路径（SUMMARY_PREFIX 落盘 + set_summary）。
+    /// 摘要失败降级：旧消息直接丢弃，摘要位写截断说明。
+    /// 返回是否确有旧消息被压缩（false = 无可压缩内容，调用方走原报错路径）。
+    async fn force_compress_for_retry(&mut self) -> bool {
+        let Some(old_msgs) = self.context.force_compressible() else {
+            return false;
+        };
+        match self.summarize(&old_msgs).await {
+            Ok(summary) => {
+                self.notice(format!(
+                    "\n[context] 模型报上下文超限，已强制压缩 {} 条历史消息并重试",
+                    old_msgs.len()
+                ));
+                // 摘要落盘：append-only，恢复时由 from_messages 重建
+                self.log_session(&SessionEntry::message(
+                    Role::System,
+                    &format!("{}\n{}", crate::context::SUMMARY_PREFIX, summary),
+                ));
+                self.context.set_summary(summary);
+            }
+            Err(e) => {
+                tracing::warn!("强压摘要失败（降级为截断）：{e}");
+                let placeholder = "（上下文超限，旧消息已截断）".to_string();
+                self.notice(format!(
+                    "\n[context] 模型报上下文超限，摘要生成失败，已截断 {} 条旧消息并重试",
+                    old_msgs.len()
+                ));
+                self.log_session(&SessionEntry::message(
+                    Role::System,
+                    &format!("{}\n{}", crate::context::SUMMARY_PREFIX, placeholder),
+                ));
+                self.context.set_summary(placeholder);
+            }
+        }
+        true
+    }
+
+    /// 模型流式调用（v0.12.7）：context-too-long 错误时强制压缩后单次重试。
+    /// - 非 context 类错误：原样返回，不触发压缩
+    /// - 无可压缩内容 / 重试仍超限：附「无法再压缩」提示后按原路径报错
+    /// - 重试遇到其他错误：原样返回
+    async fn chat_stream_with_ctx_retry(&mut self, messages: &[crate::types::Message]) -> ModelResult<ChunkStream> {
+        match self
+            .provider
+            .chat_stream(messages, &self.tools.schemas())
+            .await
+        {
+            Ok(s) => Ok(s),
+            Err(e) => {
+                let err_text = e.to_string();
+                if !is_context_too_long_error(&err_text) {
+                    return Err(e);
+                }
+                if !self.force_compress_for_retry().await {
+                    return Err(format!(
+                        "{err_text}（上下文已无法再压缩，请 /new 开新会话）"
+                    )
+                    .into());
+                }
+                // 重试用压缩后的上下文重建消息序列（原 messages 还是超限的那份）
+                let retry_messages = self.context.build();
+                match self
+                    .provider
+                    .chat_stream(&retry_messages, &self.tools.schemas())
+                    .await
+                {
+                    Ok(s) => Ok(s),
+                    Err(e2) => {
+                        if is_context_too_long_error(&e2.to_string()) {
+                            Err(format!(
+                                "{e2}（上下文已无法再压缩，请 /new 开新会话）"
+                            )
+                            .into())
+                        } else {
+                            Err(e2)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// 处理一次用户输入，流式打印 assistant 输出，返回完整回复文本
     pub async fn run(&mut self, user_input: &str) -> ModelResult<String> {
         self.emit(AgentEvent::AgentStart);
@@ -921,9 +1004,9 @@ impl Agent {
             let turn_base_input = self.usage.input_tokens;
             let turn_base_output = self.usage.output_tokens;
             let mut server_usage_seen = false;
+            // context-too-long 时此处内部会强压 + 单次重试（v0.12.7）
             let mut stream = self
-                .provider
-                .chat_stream(&messages, &self.tools.schemas())
+                .chat_stream_with_ctx_retry(&messages)
                 .await
                 .map_err(|e| format!("模型请求失败（第 {} 轮）：{}", turn + 1, e))?;
 
@@ -1233,6 +1316,23 @@ impl Agent {
     }
 }
 
+
+/// provider 错误是否为 context 超限（v0.12.7）：两 provider 文案 + Kimi/智谱变体，
+/// 不区分大小写、子串匹配。命中时 run 循环走强压重试路径。
+fn is_context_too_long_error(e: &str) -> bool {
+    let s = e.to_lowercase();
+    const PATTERNS: &[&str] = &[
+        // OpenAI 系
+        "context_length_exceeded",
+        "maximum context length",
+        // Anthropic 系
+        "prompt is too long",
+        "context window",
+        // Kimi/智谱常见变体
+        "input length and max_tokens exceed context limit",
+    ];
+    PATTERNS.iter().any(|p| s.contains(p))
+}
 
 fn truncate_str(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
@@ -1801,5 +1901,198 @@ mod tests {
         let new_id = agent.session_id().expect("reset 后应有新会话");
         assert!(old_id.as_deref() != Some(new_id));
         assert!(tmp.path().join(format!("{new_id}.jsonl")).exists());
+    }
+
+    #[test]
+    fn test_is_context_too_long_error_patterns() {
+        // OpenAI 系
+        assert!(is_context_too_long_error(
+            "This model's maximum context length is 8192 tokens"
+        ));
+        assert!(is_context_too_long_error("error code: context_length_exceeded"));
+        // Anthropic 系（大小写不敏感）
+        assert!(is_context_too_long_error(
+            "Prompt is too long: 234567 tokens > 200000 maximum"
+        ));
+        assert!(is_context_too_long_error("input exceeds the Context Window"));
+        // Kimi/智谱变体
+        assert!(is_context_too_long_error(
+            "Input length and max_tokens exceed context limit: 130000 > 128000"
+        ));
+        // 普通错误不命中
+        assert!(!is_context_too_long_error("connection reset by peer"));
+        assert!(!is_context_too_long_error("rate limit exceeded"));
+        assert!(!is_context_too_long_error("invalid api key"));
+    }
+
+    /// 脚本化 MockProvider（v0.12.7 ctx-retry 测试用）：按调用次序消费脚本，
+    /// Ok(文本) → 吐 Delta+Done 流；Err(文案) → chat_stream 直接报错。
+    /// 脚本耗尽后复用最后一条。
+    struct ScriptedProvider {
+        calls: Arc<AtomicUsize>,
+        script: Vec<Result<String, String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ScriptedProvider {
+        fn id(&self) -> &str {
+            "scripted"
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+        ) -> ModelResult<ChunkStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            match &self.script[n.min(self.script.len() - 1)] {
+                Err(e) => Err(e.clone().into()),
+                Ok(text) => {
+                    let text = text.clone();
+                    let stream = futures_util::stream::iter(vec![
+                        Ok(StreamChunk::Delta(text)),
+                        Ok(StreamChunk::Done),
+                    ]);
+                    Ok(Box::pin(stream))
+                }
+            }
+        }
+
+        fn parse_response(&self, chunks: &[StreamChunk]) -> ModelResult<(String, Vec<ToolCall>)> {
+            let text: String = chunks
+                .iter()
+                .filter_map(|c| match c {
+                    StreamChunk::Delta(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            Ok((text, vec![]))
+        }
+    }
+
+    fn scripted_agent(
+        tmp: &tempfile::TempDir,
+        script: Vec<Result<String, String>>,
+    ) -> (Agent, Arc<AtomicUsize>) {
+        let mut config = Config::default_config();
+        config.session.dir = tmp.path().to_string_lossy().to_string();
+        config.agent.work_dir = tmp.path().to_string_lossy().to_string();
+        let mut agent = Agent::new(config).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        agent.set_provider(Box::new(ScriptedProvider {
+            calls: calls.clone(),
+            script,
+        }));
+        agent.set_quiet(true);
+        (agent, calls)
+    }
+
+    fn fill_history(agent: &mut Agent, n: usize) {
+        for i in 0..n {
+            let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
+            agent
+                .context
+                .add_message(role, &format!("历史消息 {i}"))
+                .expect("加历史消息应成功");
+        }
+    }
+
+    /// 场景 1：首次调用报 context-too-long → 触发强压（摘要落盘/token 下降）→ 重试成功
+    #[tokio::test]
+    async fn test_ctx_too_long_force_compress_then_retry_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut agent, calls) = scripted_agent(
+            &tmp,
+            vec![
+                Err("This model's maximum context length is 8192 tokens".into()),
+                Ok("历史摘要".into()), // 强压的摘要调用
+                Ok("最终回复".into()), // 重试
+            ],
+        );
+        fill_history(&mut agent, 20);
+        let tokens_before = agent.context.token_count();
+        let sid = agent.session_id().unwrap().to_string();
+
+        let reply = agent.run("继续").await.expect("强压重试后 run 应成功");
+        assert_eq!(reply, "最终回复");
+        // ≥3 次模型调用：首错 + 摘要 + 重试（收尾的进化钩子在装有教训聚类的
+        // 环境上可能追加调用，不断言精确上限）
+        assert!(calls.load(Ordering::SeqCst) >= 3);
+        // 触发了压缩：摘要就位、上下文 token 下降
+        assert_eq!(agent.context.l2_summary(), Some("历史摘要"));
+        assert!(agent.context.token_count() < tokens_before);
+        // 摘要消息已走 SUMMARY_PREFIX 落盘
+        let dir = tmp.path().to_string_lossy().to_string();
+        let (_s, msgs) = Session::recover(&dir, &sid).expect("recover 应成功");
+        assert!(
+            msgs.iter().any(|m| m.role == Role::System
+                && m.content.starts_with(crate::context::SUMMARY_PREFIX)),
+            "摘要应落盘：{msgs:?}"
+        );
+    }
+
+    /// 场景 2：重试仍报 context-too-long → 原路径报错，错误信息含「无法再压缩」提示
+    #[tokio::test]
+    async fn test_ctx_too_long_retry_still_fails_reports_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut agent, calls) = scripted_agent(
+            &tmp,
+            vec![
+                Err("prompt is too long: 234567 tokens > 200000 maximum".into()),
+                Ok("历史摘要".into()),
+                Err("prompt is too long: 200001 tokens > 200000 maximum".into()),
+            ],
+        );
+        fill_history(&mut agent, 20);
+
+        let err = agent.run("继续").await.expect_err("重试仍超限应报错");
+        let msg = err.to_string();
+        assert!(msg.contains("无法再压缩"), "错误应含降级提示：{msg}");
+        assert!(msg.contains("/new"), "错误应提示开新会话：{msg}");
+        // 首错 + 摘要 + 重试 = 3 次，且只重试一次
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // 压缩确实发生过
+        assert!(agent.context.l2_summary().is_some());
+    }
+
+    /// 场景 3（回归）：普通错误不触发压缩、不重试
+    #[tokio::test]
+    async fn test_non_ctx_error_no_compress_no_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut agent, calls) =
+            scripted_agent(&tmp, vec![Err("connection reset by peer".into())]);
+        fill_history(&mut agent, 20);
+
+        let err = agent.run("继续").await.expect_err("普通错误应报错");
+        assert!(err.to_string().contains("connection reset"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "普通错误不重试");
+        assert!(agent.context.l2_summary().is_none(), "普通错误不压缩");
+        // 20 条历史 + run 加入的 1 条 user 消息，均未被动过
+        assert_eq!(agent.context.history_len(), 21);
+    }
+
+    /// 摘要生成失败的降级路径：旧消息截断，摘要位写占位说明，重试照常进行
+    #[tokio::test]
+    async fn test_ctx_too_long_summary_fails_fallback_truncation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut agent, calls) = scripted_agent(
+            &tmp,
+            vec![
+                Err("context_length_exceeded".into()),
+                Err("summary model exploded".into()), // 摘要调用失败
+                Ok("最终回复".into()),                // 重试
+            ],
+        );
+        fill_history(&mut agent, 20);
+
+        let reply = agent.run("继续").await.expect("降级截断后重试应成功");
+        assert_eq!(reply, "最终回复");
+        // 首错 + 失败的摘要 + 重试 = 3（收尾钩子可能追加，见上）
+        assert!(calls.load(Ordering::SeqCst) >= 3);
+        assert_eq!(
+            agent.context.l2_summary(),
+            Some("（上下文超限，旧消息已截断）"),
+            "摘要失败应写截断占位"
+        );
     }
 }
