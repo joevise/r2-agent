@@ -1780,6 +1780,41 @@ fn write_dm_sid(agent: &str, open_id: &str, sid: &str) {
     let _ = std::fs::write(p, sid);
 }
 
+/// DM 排队消息持久化（v0.12.6 持久化第一批 B）：pending 纯内存，重启会丢光
+/// 排队中的用户消息（违背"绝不静默丢消息"）。每次变更（入队/出队）同步写
+/// ~/.r2/agents/<name>/dm/<oid>.pending（JSON，原子写：临时文件 + rename，
+/// 与 write_dm_sid 同目录模式）；DmSession 创建时若文件存在则加载恢复进内存
+/// （文件保留作事实来源，后续变更会重写）。steer 通道不持久化
+/// （进程死 = 在途 run 死，steer 丢失合理）。
+fn dm_pending_path(agent: &str, open_id: &str) -> std::path::PathBuf {
+    agents::profile_dir(agent).join("dm").join(format!("{open_id}.pending"))
+}
+
+fn write_dm_pending_to(path: &std::path::Path, pending: &VecDeque<(String, String)>) {
+    let Ok(body) = serde_json::to_vec(pending) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+fn read_dm_pending_from(path: &std::path::Path) -> VecDeque<(String, String)> {
+    let Ok(body) = std::fs::read(path) else {
+        return VecDeque::new();
+    };
+    // 文件损坏等降级为空队列启动，不阻塞
+    serde_json::from_slice(&body).unwrap_or_default()
+}
+
+fn persist_dm_pending(agent: &str, open_id: &str, pending: &VecDeque<(String, String)>) {
+    write_dm_pending_to(&dm_pending_path(agent, open_id), pending);
+}
+
 /// DM 会话用的配置快照：全局运行时配置 + mcp 源文件刷新 + persona 叠加。
 /// handle_dm 创建分支与 /model 原地重建共用（保证两条路拿到同款 config）
 fn dm_config(state: &WebState, agent: &str) -> Config {
@@ -2473,7 +2508,8 @@ async fn handle_dm(
                     let activity = session.activity_handle();
                     Arc::new(DmSession {
                         session: Mutex::new(session),
-                        pending: StdMutex::new(VecDeque::new()),
+                        // v0.12.6 B：重启后恢复重启前排队未处理的用户消息
+                        pending: StdMutex::new(read_dm_pending_from(&dm_pending_path(&agent, &dm.open_id))),
                         steer_tx: StdMutex::new(steer),
                         activity: StdMutex::new(activity),
                         resume_count: StdMutex::new(0),
@@ -2526,6 +2562,7 @@ async fn handle_dm(
                     true
                 } else {
                     q.push_back((prompt_text.clone(), dm.message_id.clone()));
+                    persist_dm_pending(&agent, &dm.open_id, &q); // v0.12.6 B：入队落盘
                     false
                 }
             };
@@ -2541,14 +2578,22 @@ async fn handle_dm(
         let (text, mid) = &item;
         run_dm_prompt(&state, &agent, &cf, &client, &dm.open_id, mid, &mut guard, &dm_sess, text).await;
         // 收尾窗口落进来的 steer（本轮 run 没来得及消费）转为排队补投——用户消息绝不静默丢
-        for x in guard.take_stale_steers() {
-            dm_sess
-                .pending
-                .lock()
-                .expect("排队锁中毒")
-                .push_back((x, String::new()));
+        let stale = guard.take_stale_steers();
+        if !stale.is_empty() {
+            let mut q = dm_sess.pending.lock().expect("排队锁中毒");
+            for x in stale {
+                q.push_back((x, String::new()));
+            }
+            persist_dm_pending(&agent, &dm.open_id, &q); // v0.12.6 B：补投落盘
         }
-        let next = dm_sess.pending.lock().expect("排队锁中毒").pop_front();
+        let next = {
+            let mut q = dm_sess.pending.lock().expect("排队锁中毒");
+            let n = q.pop_front();
+            if n.is_some() {
+                persist_dm_pending(&agent, &dm.open_id, &q); // v0.12.6 B：出队落盘
+            }
+            n
+        };
         match next {
             Some(x) => item = x,
             None => break,
@@ -4148,6 +4193,46 @@ mod tests {
         assert!(parse_client_msg(r#"{"t":"fly"}"#).is_err());
         assert!(parse_client_msg(r#"{"foo":1}"#).is_err());
         assert!(parse_client_msg("").is_err());
+    }
+
+    #[test]
+    fn dm_pending_persist_roundtrip() {
+        // v0.12.6 持久化第一批 B：pending 保存→加载内容一致；入队/出队后
+        // 文件与内存一致；文件损坏降级为空队列不阻塞
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("dm").join("ou_x.pending");
+
+        // 文件不存在 → 空队列
+        assert!(read_dm_pending_from(&path).is_empty());
+
+        // 保存 → 加载往返一致
+        let mut q: VecDeque<(String, String)> = VecDeque::new();
+        q.push_back(("第一条".into(), "om_1".into()));
+        q.push_back(("第二条".into(), String::new()));
+        write_dm_pending_to(&path, &q);
+        assert!(path.exists(), "落盘文件应存在");
+        assert_eq!(read_dm_pending_from(&path), q, "往返应一致");
+
+        // 出队后重写：文件内容与内存一致
+        let mut mem = read_dm_pending_from(&path);
+        let popped = mem.pop_front();
+        assert_eq!(popped, Some(("第一条".into(), "om_1".into())));
+        write_dm_pending_to(&path, &mem);
+        let disk = read_dm_pending_from(&path);
+        assert_eq!(disk, mem, "出队后文件应与内存一致");
+        assert_eq!(disk.len(), 1);
+
+        // 入队同理
+        mem.push_back(("第三条".into(), "om_3".into()));
+        write_dm_pending_to(&path, &mem);
+        assert_eq!(read_dm_pending_from(&path), mem, "入队后文件应与内存一致");
+
+        // 原子写不残留临时文件
+        assert!(!path.with_extension("tmp").exists(), "临时文件应已 rename");
+
+        // 文件损坏 → 空队列降级
+        std::fs::write(&path, b"not json {{{").unwrap();
+        assert!(read_dm_pending_from(&path).is_empty(), "损坏文件应降级为空");
     }
 
     #[test]

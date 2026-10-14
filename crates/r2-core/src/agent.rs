@@ -357,7 +357,7 @@ impl Agent {
         println!("已恢复会话 {session_id}（{count} 条历史消息）");
         #[cfg(feature = "l3-memory")]
         let (memory, embedding) = Self::init_memory(&config);
-        Ok(Self {
+        let mut agent = Self {
             provider,
             context,
             tools,
@@ -378,7 +378,14 @@ impl Agent {
             system_prompt,
             last_event_at: std::sync::Arc::new(std::sync::Mutex::new(None)),
             activity: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        })
+        };
+        // v0.12.6 持久化第一批 A：重启恢复时补写历史里缺结果的 tool_call
+        // （崩溃时结果随进程蒸发，不补则下轮请求协议残废）。幂等。
+        let patched = agent.interrupt_pending_tools_on_restart();
+        if patched > 0 {
+            println!("（重启恢复：补写 {patched} 条在途工具结果）");
+        }
+        Ok(agent)
     }
 
     /// 从某会话分叉并继续（上下文 = 父会话 upto 点 + 后续新对话）
@@ -410,7 +417,7 @@ impl Agent {
         println!("已从会话 {parent_session_id} 分叉（继承 {count} 条消息，新会话 {new_id}）");
         #[cfg(feature = "l3-memory")]
         let (memory, embedding) = Self::init_memory(&config);
-        Ok(Self {
+        let mut agent = Self {
             provider,
             context,
             tools,
@@ -432,7 +439,13 @@ impl Agent {
             system_prompt,
             last_event_at: std::sync::Arc::new(std::sync::Mutex::new(None)),
             activity: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        })
+        };
+        // 分支可能复制了父会话的残缺尾部（有 tool_call 无 tool_result）——同 resume 补写
+        let patched = agent.interrupt_pending_tools_on_restart();
+        if patched > 0 {
+            println!("（分支恢复：补写 {patched} 条在途工具结果）");
+        }
+        Ok(agent)
     }
 
     /// 注入事件广播通道（嵌入方使用；CLI 不调用，输出行为不变）
@@ -595,6 +608,20 @@ impl Agent {
     pub fn interrupt_pending_tools(&mut self) -> usize {
         const SYNTHETIC: &str =
             "（会话超时中断：该命令结果未知。请勿假设成功或失败；如需结果请重新执行或查询）";
+        self.patch_pending_tools(SYNTHETIC)
+    }
+
+    /// 重启恢复补写（v0.12.6 持久化第一批 A）：进程崩溃/重启后 resume 的会话
+    /// 历史里可能挂着"有 tool_call 无 tool_result"的残缺（在途结果随进程蒸发），
+    /// 与掐断同构但来源不同——文案标注"进程重启"以区别于超时掐断。
+    /// resume/branch_from 构造完成后调用一次；幂等（已补过的不再重复补）。
+    pub fn interrupt_pending_tools_on_restart(&mut self) -> usize {
+        const SYNTHETIC_RESTART: &str =
+            "（进程重启：该命令结果未知。请勿假设成功或失败；如需结果请重新执行或查询）";
+        self.patch_pending_tools(SYNTHETIC_RESTART)
+    }
+
+    fn patch_pending_tools(&mut self, synthetic: &str) -> usize {
         let history = self.context.history();
         // 已有结果的 call_id 集合
         let answered: std::collections::HashSet<&str> = history
@@ -619,8 +646,8 @@ impl Agent {
         let mut patched = 0;
         for call_id in missing {
             // 上下文写不进去（如 token 预算满）就不落盘——两边保持一致，不制造新的残缺
-            if self.context.add_tool_result(&call_id, SYNTHETIC).is_ok() {
-                self.log_session(&SessionEntry::tool_result(&call_id, SYNTHETIC));
+            if self.context.add_tool_result(&call_id, synthetic).is_ok() {
+                self.log_session(&SessionEntry::tool_result(&call_id, synthetic));
                 patched += 1;
             }
         }
@@ -1503,6 +1530,79 @@ mod tests {
                 .any(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("c2")),
             "合成 tool_result 应落盘：{msgs:?}"
         );
+    }
+
+    #[test]
+    fn test_resume_patches_pending_tools_on_restart() {
+        // v0.12.6 持久化第一批 A：resume 路径自动补写"有 tool_call 无 tool_result"的
+        // 残缺（崩溃时在途结果随进程蒸发），文案标注"进程重启"；再 resume 幂等不重复补
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().to_string();
+        // 构造崩溃现场会话文件：assistant 挂 c1/c2，只有 c1 有结果（c2 随进程蒸发）
+        let mut session = Session::create(&dir).expect("建会话应成功");
+        let sid = session.id().to_string();
+        session
+            .append(&SessionEntry::message(Role::User, "跑两个命令"))
+            .expect("append 应成功");
+        session
+            .append(&SessionEntry::assistant(
+                "好的",
+                vec![
+                    ToolCall { id: "c1".into(), name: "bash".into(), arguments: "{}".into() },
+                    ToolCall { id: "c2".into(), name: "bash".into(), arguments: "{}".into() },
+                ],
+            ))
+            .expect("append 应成功");
+        session
+            .append(&SessionEntry::tool_result("c1", "ok"))
+            .expect("append 应成功");
+        drop(session);
+
+        let mut config = Config::default_config();
+        config.session.dir = dir.clone();
+        let agent = Agent::resume(config, &sid).expect("resume 应成功");
+
+        // 补写完成：c2 有合成结果，文案标注进程重启（非超时掐断）
+        let history = agent.context.history();
+        let synth: Vec<_> = history
+            .iter()
+            .filter(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("c2"))
+            .collect();
+        assert_eq!(synth.len(), 1, "合成消息应恰好一条：{history:?}");
+        assert!(synth[0].content.contains("进程重启"), "文案应标注重启来源：{synth:?}");
+
+        // 协议完整：每个 tool_call 都有对应 result
+        let answered: std::collections::HashSet<&str> = history
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        for m in history {
+            if let Some(calls) = &m.tool_calls {
+                for c in calls {
+                    assert!(answered.contains(c.id.as_str()), "{} 缺 tool_result", c.id);
+                }
+            }
+        }
+
+        // 合成结果已落盘
+        let (_s, msgs) = Session::recover(&dir, &sid).expect("recover 应成功");
+        let disk_synth = msgs
+            .iter()
+            .filter(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("c2"))
+            .count();
+        assert_eq!(disk_synth, 1, "合成 tool_result 应落盘且仅一条：{msgs:?}");
+
+        // 幂等：再 resume 一次不重复补
+        let mut config2 = Config::default_config();
+        config2.session.dir = dir;
+        let agent2 = Agent::resume(config2, &sid).expect("再 resume 应成功");
+        let history2 = agent2.context.history();
+        let synth2 = history2
+            .iter()
+            .filter(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("c2"))
+            .count();
+        assert_eq!(synth2, 1, "再 resume 不应重复补写：{history2:?}");
     }
 
     #[test]

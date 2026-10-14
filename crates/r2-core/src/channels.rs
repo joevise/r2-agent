@@ -32,6 +32,11 @@ const MIN_PING_INTERVAL_SECS: u64 = 10;
 const HEARTBEAT_TIMEOUT_FACTOR: u64 = 2;
 /// message_id 去重 LRU 容量
 const DEDUP_CAP: usize = 512;
+/// 持久去重（v0.12.6 持久化第一批 C）：启动时从 ~/.r2/feishu_dedup.log 加载的
+/// 最近条数（也是运行期 LRU 容量——扩容以覆盖加载窗口，重启后近期消息仍判重）
+const DEDUP_PERSIST_LOAD: usize = 2000;
+/// 去重日志轮转阈值（行数）：超过则重写只保留后半
+const DEDUP_ROTATE_MAX: usize = 50000;
 /// 分片缓存过期（秒）：超时未齐的碎片丢弃，防内存泄漏
 const FRAG_TTL_SECS: u64 = 60;
 /// 单条消息正文最大字符数（超出自动分片逐条发送）
@@ -154,6 +159,60 @@ impl DedupLru {
     }
 }
 
+/// 持久去重日志路径：~/.r2/feishu_dedup.log（全局一份，纯文本一行一个 message_id）
+fn dedup_log_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
+    Some(std::path::PathBuf::from(home).join(".r2").join("feishu_dedup.log"))
+}
+
+/// 启动加载：读去重日志，取最后 keep 条灌入 LRU（保序），返回 (lru, 文件总行数)。
+/// 文件不存在/损坏等一律降级为空集启动，不阻塞。
+fn dedup_load(path: &std::path::Path, keep: usize) -> (DedupLru, usize) {
+    let mut lru = DedupLru::new(keep.max(DEDUP_CAP));
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return (lru, 0);
+    };
+    let lines: Vec<&str> = body.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let total = lines.len();
+    for id in lines.iter().skip(total.saturating_sub(keep)) {
+        lru.check_and_insert(id);
+    }
+    (lru, total)
+}
+
+/// 追加一行 message_id（确认处理通过的瞬间调用）；失败只告警不阻塞主流程
+fn dedup_append(path: &std::path::Path, id: &str) {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let r = std::fs::OpenOptions::new().create(true).append(true).open(path)
+        .and_then(|mut f| writeln!(f, "{id}"));
+    if let Err(e) = r {
+        eprintln!("[feishu] 去重日志追加失败（{path:?}）：{e}");
+    }
+}
+
+/// 轮转：文件超 DEDUP_ROTATE_MAX 行时重写只保留后半（原子：临时文件 + rename）。
+/// 返回轮转后行数；失败返回原估值（下次再试）。
+fn dedup_rotate(path: &std::path::Path, est_lines: usize) -> usize {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    let lines: Vec<&str> = body.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let kept = &lines[lines.len() / 2..];
+    let tmp = path.with_extension("tmp");
+    let ok = std::fs::write(&tmp, kept.join("\n") + "\n")
+        .and_then(|_| std::fs::rename(&tmp, path));
+    match ok {
+        Ok(_) => kept.len(),
+        Err(e) => {
+            eprintln!("[feishu] 去重日志轮转失败（{path:?}）：{e}");
+            est_lines
+        }
+    }
+}
+
 /// 事件分片重组缓存：message_id -> (sum, seq->bytes)
 /// 按 SDK 的 DataCache 语义：buffer[seq]=data，全齐后按 seq 升序拼接
 struct FragmentCache {
@@ -212,6 +271,10 @@ struct Inner {
     params: Mutex<ClientParams>,
     token: Mutex<Option<CachedToken>>,
     dedup: Mutex<DedupLru>,
+    /// 持久去重日志路径（v0.12.6 C；None = 无 HOME 降级纯内存）
+    dedup_path: Option<std::path::PathBuf>,
+    /// 去重日志当前行数估值（加载时实测 + 每次追加 +1），超阈值触发轮转
+    dedup_lines: Mutex<usize>,
     on_message: Mutex<Option<Arc<dyn Fn(FeishuDm) + Send + Sync>>>,
     on_status: Mutex<Option<Arc<dyn Fn(ChannelStatus) + Send + Sync>>>,
     /// CancellationToken 语义：置位 + Notify 唤醒所有阻塞点
@@ -276,6 +339,13 @@ impl FeishuClient {
         if cfg.domain.is_empty() {
             cfg.domain = DEFAULT_DOMAIN.to_string();
         }
+        // v0.12.6 持久化第一批 C：启动加载持久去重日志（最近 DEDUP_PERSIST_LOAD 条），
+        // 重启后飞书 WS 重连重投的未确认消息仍判重；加载失败降级空集启动
+        let dedup_path = dedup_log_path();
+        let (dedup, dedup_lines) = match &dedup_path {
+            Some(p) => dedup_load(p, DEDUP_PERSIST_LOAD),
+            None => (DedupLru::new(DEDUP_CAP), 0),
+        };
         Self {
             inner: Arc::new(Inner {
                 cfg,
@@ -283,7 +353,9 @@ impl FeishuClient {
                 status: Mutex::new(ChannelStatus::Connecting),
                 params: Mutex::new(ClientParams::default()),
                 token: Mutex::new(None),
-                dedup: Mutex::new(DedupLru::new(DEDUP_CAP)),
+                dedup: Mutex::new(dedup),
+                dedup_path,
+                dedup_lines: Mutex::new(dedup_lines),
                 on_message: Mutex::new(None),
                 on_status: Mutex::new(None),
                 stop_flag: AtomicBool::new(true),
@@ -1010,6 +1082,16 @@ async fn handle_frame(
             };
             let fresh = inner.dedup.lock().unwrap().check_and_insert(&dedup_key);
             if fresh {
+                // v0.12.6 C：判定通过的瞬间追加持久去重日志（重启后仍判重）；
+                // 行数估值超阈值时轮转重写只保留后半
+                if let (Some(p), false) = (&inner.dedup_path, dedup_key.is_empty()) {
+                    dedup_append(p, &dedup_key);
+                    let mut n = inner.dedup_lines.lock().unwrap();
+                    *n += 1;
+                    if *n > DEDUP_ROTATE_MAX {
+                        *n = dedup_rotate(p, *n);
+                    }
+                }
                 if let Some(dm) = parse_event(&full) {
                     inner.emit_message(dm);
                 }
@@ -1587,6 +1669,53 @@ mod tests {
         assert!(small.check_and_insert("b"));
         assert!(small.check_and_insert("c")); // 挤出 "a"
         assert!(small.check_and_insert("a")); // "a" 已被淘汰，视为新
+    }
+
+    #[test]
+    fn dedup_persist_log() {
+        // v0.12.6 持久化第一批 C：写入/加载/轮转——重启后近期 message_id 仍判重，
+        // 文件缺失/损坏降级空集启动不阻塞
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("feishu_dedup.log");
+
+        // 文件不存在 → 空集降级
+        let (mut lru, total) = dedup_load(&path, 2000);
+        assert_eq!(total, 0);
+        assert!(lru.check_and_insert("om_new"), "空集全部放行");
+
+        // 追加 → 模拟重启加载：近期 ID 仍判重
+        dedup_append(&path, "om_1");
+        dedup_append(&path, "om_2");
+        let (mut lru2, total2) = dedup_load(&path, 2000);
+        assert_eq!(total2, 2);
+        assert!(!lru2.check_and_insert("om_1"), "重启后 om_1 应判重");
+        assert!(!lru2.check_and_insert("om_2"), "重启后 om_2 应判重");
+        assert!(lru2.check_and_insert("om_3"), "新消息仍放行");
+
+        // 加载窗口：只取最后 keep 条
+        let (mut lru3, total3) = dedup_load(&path, 1);
+        assert_eq!(total3, 2);
+        assert!(!lru3.check_and_insert("om_2"), "窗口内判重");
+        assert!(lru3.check_and_insert("om_1"), "窗口外最老条目不加载");
+
+        // 轮转：重写只保留后半
+        for i in 0..100 {
+            dedup_append(&path, &format!("om_r{i}"));
+        }
+        let kept = dedup_rotate(&path, 102);
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(kept, lines.len());
+        assert_eq!(lines.len(), 51, "102 行轮转后保留后半 51 行");
+        assert_eq!(lines[0], "om_r49");
+        let (mut lru4, _) = dedup_load(&path, 2000);
+        assert!(!lru4.check_and_insert("om_r99"), "轮转后近期条目仍判重");
+        assert!(lru4.check_and_insert("om_1"), "被裁掉的旧条目不再判重");
+
+        // 损坏文件（非 UTF-8）→ 空集降级
+        std::fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
+        let (_, total5) = dedup_load(&path, 2000);
+        assert_eq!(total5, 0);
     }
 
     #[test]
