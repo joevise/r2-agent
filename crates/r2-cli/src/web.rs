@@ -29,8 +29,9 @@ use std::time::Duration;
 use toml;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
-/// 上传大小上限：10MB
-const MAX_UPLOAD: usize = 10 * 1024 * 1024;
+/// 上传大小上限：100MB（2026-10-30 大 Joe 要求放宽：飞书大文件；覆盖
+/// Console 上传与飞书 DM 收文件两条链路，下载全程内存缓冲，桌面机可承受）
+const MAX_UPLOAD: usize = 100 * 1024 * 1024;
 /// 事件广播容量（所有 WS 客户端共享一条通道）
 const EVENT_CAPACITY: usize = 512;
 
@@ -538,7 +539,7 @@ async fn upload(State(state): State<Arc<WebState>>, mut multipart: Multipart) ->
         if data.len() > MAX_UPLOAD {
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
-                Json(json!({"error": "文件超过 10MB 上限"})),
+                Json(json!({"error": format!("文件超过 {}MB 上限", MAX_UPLOAD / 1048576)})),
             );
         }
         let dir = Path::new(&state.work_dir).join("uploads");
@@ -4076,7 +4077,7 @@ pub async fn run(config: Config, port: u16, host: String) -> Result<(), Box<dyn 
         .route("/api/state", get(api_state))
         .route("/api/agent-files", get(get_agent_files).post(post_agent_files))
         .route("/ws", get(ws_handler))
-        // 请求体上限：upload 10MB + 1MB 表单余量（其余路由 body 都很小，一并覆盖）
+        // 请求体上限：upload 上限 + 1MB 表单余量（其余路由 body 都很小，一并覆盖）
         .layer(DefaultBodyLimit::max(MAX_UPLOAD + 1024 * 1024))
         .with_state(state);
 
