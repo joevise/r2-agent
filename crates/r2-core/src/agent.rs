@@ -919,114 +919,152 @@ impl Agent {
                 }
             }
             // 用量统计：输入 = 本次发给模型的全部消息（含 system prompt / 摘要 / 记忆注入）
-            self.usage.input_tokens += messages
-                .iter()
-                .map(crate::context::message_tokens)
-                .sum::<usize>() as u64;
-            self.usage.llm_calls += 1;
-            // 本轮用量基线快照：服务端真实 usage（StreamChunk::Usage）到达时
-            // 按「基线 + 服务端值」覆盖本轮估算；cached_tokens 为累计值直接累加
-            let turn_base_input = self.usage.input_tokens;
-            let turn_base_output = self.usage.output_tokens;
-            let mut server_usage_seen = false;
-            // context-too-long 时此处内部会强压 + 单次重试（v0.12.7）
-            let mut stream = self
-                .chat_stream_with_ctx_retry(&messages)
-                .await
-                .map_err(|e| format!("模型请求失败（第 {} 轮）：{}", turn + 1, e))?;
+            // length 单次重试（v0.15.2）：双空 + finish_reason=length 时调大 max_tokens
+            // 重发一次（同一 messages）；每次 attempt 都是一次真实计费调用，用量按次累计
+            let mut length_retried = false;
+            let (text, tool_calls, server_usage_seen, steered_msg, chunks) = 'attempt: loop {
+                self.usage.input_tokens += messages
+                    .iter()
+                    .map(crate::context::message_tokens)
+                    .sum::<usize>() as u64;
+                self.usage.llm_calls += 1;
+                // 本轮用量基线快照：服务端真实 usage（StreamChunk::Usage）到达时
+                // 按「基线 + 服务端值」覆盖本轮估算；cached_tokens 为累计值直接累加
+                let turn_base_input = self.usage.input_tokens;
+                let turn_base_output = self.usage.output_tokens;
+                let mut server_usage_seen = false;
+                // context-too-long 时此处内部会强压 + 单次重试（v0.12.7）
+                let mut stream = self
+                    .chat_stream_with_ctx_retry(&messages)
+                    .await
+                    .map_err(|e| format!("模型请求失败（第 {} 轮）：{}", turn + 1, e))?;
 
-            let mut chunks: Vec<StreamChunk> = Vec::new();
-            // 把 steer 通道临时拿出 self：select 的流分支要借用 self（emit/quiet），
-            // 不能同时持有 self.steer_rx 的可变借用。循环结束后放回。
-            let mut steer_rx = self.steer_rx.take();
-            let mut steered_msg: Option<String> = None;
-            loop {
-                tokio::select! {
-                    item = stream.next() => match item {
-                        Some(Ok(chunk)) => {
-                            match &chunk {
-                                StreamChunk::Delta(s) => {
-                                    if !self.quiet {
-                                        print!("{s}");
-                                        let _ = std::io::stdout().flush();
+                let mut chunks: Vec<StreamChunk> = Vec::new();
+                // 流收尾原因（v0.15.2）：空响应守卫据此区分 length/content_filter/stop
+                let mut last_finish: Option<String> = None;
+                // 把 steer 通道临时拿出 self：select 的流分支要借用 self（emit/quiet），
+                // 不能同时持有 self.steer_rx 的可变借用。循环结束后放回。
+                let mut steer_rx = self.steer_rx.take();
+                let mut steered_msg: Option<String> = None;
+                loop {
+                    tokio::select! {
+                        item = stream.next() => match item {
+                            Some(Ok(chunk)) => {
+                                match &chunk {
+                                    StreamChunk::Delta(s) => {
+                                        if !self.quiet {
+                                            print!("{s}");
+                                            let _ = std::io::stdout().flush();
+                                        }
+                                        self.emit(AgentEvent::MessageUpdate(s.clone()));
                                     }
-                                    self.emit(AgentEvent::MessageUpdate(s.clone()));
-                                }
-                                // 思考流：不打印 stdout（保持 CLI 干净），广播事件给壳层展示，
-                                // 并计入输出用量（思考 token 是计费的）
-                                StreamChunk::Reasoning(s) => {
-                                    self.usage.output_tokens +=
-                                        crate::context::estimate_tokens(s) as u64;
-                                    self.emit(AgentEvent::Thinking(s.clone()));
-                                }
-                                // 服务端真实用量：校正本轮估算（0 值字段不动，
-                                // 兼容 Anthropic start/delta 分块上报）
-                                StreamChunk::Usage {
-                                    input_tokens,
-                                    output_tokens,
-                                    cached_tokens,
-                                } => {
-                                    if *input_tokens > 0 {
-                                        self.usage.input_tokens =
-                                            turn_base_input + input_tokens;
+                                    // 思考流：不打印 stdout（保持 CLI 干净），广播事件给壳层展示，
+                                    // 并计入输出用量（思考 token 是计费的）
+                                    StreamChunk::Reasoning(s) => {
+                                        self.usage.output_tokens +=
+                                            crate::context::estimate_tokens(s) as u64;
+                                        self.emit(AgentEvent::Thinking(s.clone()));
                                     }
-                                    if *output_tokens > 0 {
-                                        self.usage.output_tokens =
-                                            turn_base_output + output_tokens;
+                                    // 服务端真实用量：校正本轮估算（0 值字段不动，
+                                    // 兼容 Anthropic start/delta 分块上报）
+                                    StreamChunk::Usage {
+                                        input_tokens,
+                                        output_tokens,
+                                        cached_tokens,
+                                    } => {
+                                        if *input_tokens > 0 {
+                                            self.usage.input_tokens =
+                                                turn_base_input + input_tokens;
+                                        }
+                                        if *output_tokens > 0 {
+                                            self.usage.output_tokens =
+                                                turn_base_output + output_tokens;
+                                        }
+                                        self.usage.cached_tokens += cached_tokens;
+                                        server_usage_seen = true;
                                     }
-                                    self.usage.cached_tokens += cached_tokens;
-                                    server_usage_seen = true;
+                                    StreamChunk::Finish(reason) => {
+                                        last_finish = Some(reason.clone());
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
+                                chunks.push(chunk);
                             }
-                            chunks.push(chunk);
-                        }
-                        Some(Err(e)) => {
-                            if !self.quiet {
-                                println!();
+                            Some(Err(e)) => {
+                                if !self.quiet {
+                                    println!();
+                                }
+                                self.steer_rx = steer_rx;
+                                return Err(format!("流式响应中断：{e}").into());
                             }
-                            self.steer_rx = steer_rx;
-                            return Err(format!("流式响应中断：{e}").into());
-                        }
-                        None => break,   // 流正常结束
-                    },
-                    // 没装 steer 通道时此分支永远 pending，行为与原来完全一致
-                    msg = async {
-                        match steer_rx.as_mut() {
-                            Some(rx) => rx.recv().await,
-                            None => std::future::pending().await,
-                        }
-                    } => match msg {
-                        Some(m) => {
-                            steered_msg = Some(m);
-                            break; // 抛弃当前流（stream drop 即断开连接）
-                        }
-                        None => steer_rx = None, // 发送端已关闭：当作无 steer 通道
-                    },
+                            None => break,   // 流正常结束
+                        },
+                        // 没装 steer 通道时此分支永远 pending，行为与原来完全一致
+                        msg = async {
+                            match steer_rx.as_mut() {
+                                Some(rx) => rx.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        } => match msg {
+                            Some(m) => {
+                                steered_msg = Some(m);
+                                break; // 抛弃当前流（stream drop 即断开连接）
+                            }
+                            None => steer_rx = None, // 发送端已关闭：当作无 steer 通道
+                        },
+                    }
                 }
-            }
-            self.steer_rx = steer_rx;
-            if !self.quiet {
-                println!();
-            }
+                self.steer_rx = steer_rx;
+                if !self.quiet {
+                    println!();
+                }
+
+                // steer 处理：流被放弃后，带着部分输出 + 新指令继续下一轮（不重试）
+                if steered_msg.is_some() {
+                    break 'attempt (String::new(), vec![], server_usage_seen, steered_msg, chunks);
+                }
+
+                let (text, tool_calls) = self
+                    .provider
+                    .parse_response(&chunks)
+                    .map_err(|e| format!("解析模型响应失败：{e}"))?;
+                // length 单次重试（v0.15.2）：双空 + finish_reason=length = 思考耗尽输出
+                // 预算。max_tokens 翻倍（封顶 65536）重发一次；重试仍空才进守卫报错。
+                // 只对 length 生效：content_filter 重试无用，EOF 由 v0.12.7 网络面覆盖
+                if text.trim().is_empty()
+                    && tool_calls.is_empty()
+                    && last_finish.as_deref() == Some("length")
+                    && !length_retried
+                {
+                    length_retried = true;
+                    let cur = self.provider.current_max_tokens();
+                    let cur = if cur > 0 {
+                        cur
+                    } else {
+                        crate::models::max_output_for(self.config.current_model())
+                    };
+                    let new = cur.saturating_mul(2).min(65536);
+                    self.provider.set_max_tokens_override(new);
+                    if !self.quiet {
+                        println!("[length] 输出预算被思考耗尽（finish_reason=length），max_tokens 调大到 {new} 自动重试一次…");
+                    }
+                    continue 'attempt;
+                }
+                // 空响应守卫（v0.5.3）：流被提前掐断时正文与工具调用双空。
+                // 已知触发：GLM 内容审查（code 1301）在思考阶段掐流——HTTP 200、
+                // reasoning_content 正常流动、无 finish_reason 直接 EOF；工具结果
+                // （如新闻检索）含敏感内容时必触发，且该内容留在会话历史里会
+                // 持续触发。不拦截的话回合循环会静默写空消息结束——用户侧表现为
+                // "调了工具但不回复"。v0.15.2：带 finish_reason 证据化分支文案
+                validate_turn_output(&text, &tool_calls, last_finish.as_deref())?;
+                break 'attempt (text, tool_calls, server_usage_seen, steered_msg, chunks);
+            };
 
             // steer 处理：流被放弃后，带着部分输出 + 新指令继续下一轮
             if let Some(steer) = steered_msg {
                 self.handle_steer(&chunks, &steer)?;
                 continue;
             }
-
-            let (text, tool_calls) = self
-                .provider
-                .parse_response(&chunks)
-                .map_err(|e| format!("解析模型响应失败：{e}"))?;
-            // 空响应守卫（v0.5.3）：流被提前掐断时正文与工具调用双空。
-            // 已知触发：GLM 内容审查（code 1301）在思考阶段掐流——HTTP 200、
-            // reasoning_content 正常流动、无 finish_reason 直接 EOF；工具结果
-            // （如新闻检索）含敏感内容时必触发，且该内容留在会话历史里会
-            // 持续触发。不拦截的话回合循环会静默写空消息结束——用户侧表现为
-            // "调了工具但不回复"。
-            validate_turn_output(&text, &tool_calls)?;
             // 用量统计：输出 = 回复文本 + 工具调用参数
             // （服务端已上报真实 output 时跳过估算，避免双计）
             if !server_usage_seen {
@@ -1302,17 +1340,31 @@ fn is_context_too_long_error(e: &str) -> bool {
 /// 无 finish_reason 直接 EOF；工具结果（如新闻检索）含敏感内容时必触发，
 /// 且该内容留在会话历史会持续触发。不拦截则回合循环静默写空消息——
 /// 用户侧表现为"调了工具但不回复"。
+/// v0.15.2：带 finish_reason 证据化分支（length/content_filter/stop 各给真凶文案；
+/// length 分支到达此处说明自动调大重试已失败）
 fn validate_turn_output(
     text: &str,
     tool_calls: &[ToolCall],
+    last_finish: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if text.trim().is_empty() && tool_calls.is_empty() {
-        return Err(
-            "模型返回空响应（正文与工具调用均为空）。常见原因：\n\
-             1) 内容审查拦截（如 GLM 1301：会话上下文可能含敏感内容，例如新闻/检索结果——新建会话即可恢复，旧会话历史会持续触发）\n\
-             2) 流被网络中断提前掐断（直接重试即可）"
-                .into(),
-        );
+        let msg = match last_finish {
+            Some("length") => "模型返回空响应（正文与工具调用均为空）。\n\
+                真凶：输出预算被思考耗尽（finish_reason=length，已自动调大 max_tokens 重试仍空）——\n\
+                请在 config 调大 [model.openai_compat].max_output_tokens 或换思考预算更省的模型"
+                .to_string(),
+            Some("content_filter") => "模型返回空响应（正文与工具调用均为空）。\n\
+                确认内容审查拦截（finish_reason=content_filter）——上下文含敏感内容，新建会话可恢复"
+                .to_string(),
+            Some("stop") => "模型返回空响应（正文与工具调用均为空）。\n\
+                模型空思考即停（finish_reason=stop）——直接重试即可"
+                .to_string(),
+            _ => "模型返回空响应（正文与工具调用均为空）。常见原因：\n\
+                 1) 内容审查拦截（如 GLM 1301：会话上下文可能含敏感内容，例如新闻/检索结果——新建会话即可恢复，旧会话历史会持续触发）\n\
+                 2) 流被网络中断提前掐断（直接重试即可）"
+                .to_string(),
+        };
+        return Err(msg.into());
     }
     Ok(())
 }
@@ -1322,7 +1374,7 @@ mod tests {
     #[test]
     fn test_validate_turn_output_empty_rejected() {
         // 双空 = 掐流，必须显式报错（不静默）
-        let r = validate_turn_output("", &[]);
+        let r = validate_turn_output("", &[], None);
         assert!(r.is_err(), "双空必须报错");
         let msg = r.unwrap_err().to_string();
         assert!(
@@ -1334,15 +1386,47 @@ mod tests {
     #[test]
     fn test_validate_turn_output_valid_passes() {
         // 有正文 / 有工具调用 / 两者都有 → 均通过
-        assert!(validate_turn_output("你好", &[]).is_ok());
+        assert!(validate_turn_output("你好", &[], None).is_ok());
         let call = ToolCall {
             id: "c1".into(),
             name: "bash".into(),
             arguments: "{}".into(),
         };
-        assert!(validate_turn_output("", std::slice::from_ref(&call)).is_ok());
+        assert!(validate_turn_output("", std::slice::from_ref(&call), None).is_ok());
         // 纯空白正文 + 无调用 = 仍算空
-        assert!(validate_turn_output("   \n  ", &[]).is_err());
+        assert!(validate_turn_output("   \n  ", &[], None).is_err());
+        // 有 finish 证据但正文非空：照常通过（证据只用于双空分支）
+        assert!(validate_turn_output("你好", &[], Some("length")).is_ok());
+    }
+
+    /// v0.15.2：守卫四分支证据化文案
+    #[test]
+    fn test_validate_turn_output_finish_branches() {
+        // length：点名思考耗尽 + 出路（调 config 或换模型）
+        let msg = validate_turn_output("", &[], Some("length"))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("输出预算被思考耗尽"), "{msg}");
+        assert!(msg.contains("finish_reason=length"), "{msg}");
+        assert!(msg.contains("max_output_tokens"), "{msg}");
+        // content_filter：确认审查 + 新建会话出路
+        let msg = validate_turn_output("", &[], Some("content_filter"))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("内容审查拦截"), "{msg}");
+        assert!(msg.contains("content_filter"), "{msg}");
+        assert!(msg.contains("新建会话"), "{msg}");
+        // stop：空思考即停，直接重试
+        let msg = validate_turn_output("", &[], Some("stop"))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("空思考即停"), "{msg}");
+        assert!(msg.contains("直接重试"), "{msg}");
+        // 未知 finish 值：回退通用双因文案
+        let msg = validate_turn_output("", &[], Some("tool_calls"))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("内容审查") && msg.contains("网络"), "{msg}");
     }
 
     use super::*;
@@ -1975,6 +2059,132 @@ mod tests {
         }));
         agent.set_quiet(true);
         (agent, calls)
+    }
+
+    /// 带 finish_reason 的脚本化 Provider（v0.15.2 空响应守卫/length 重试测试用）：
+    /// 每次调用按脚本产出 [Delta(正文)?, Finish(原因), Done]；脚本耗尽复用最后一条。
+    /// 记录 set_max_tokens_override 写入值；current_max_tokens 固定报 32768。
+    struct FinishProvider {
+        calls: Arc<AtomicUsize>,
+        override_seen: Arc<std::sync::Mutex<usize>>,
+        script: Vec<(String, String)>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for FinishProvider {
+        fn id(&self) -> &str {
+            "finish-scripted"
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+        ) -> ModelResult<ChunkStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let (finish, text) = self.script[n.min(self.script.len() - 1)].clone();
+            let mut chunks = Vec::new();
+            if !text.is_empty() {
+                chunks.push(Ok(StreamChunk::Delta(text)));
+            }
+            chunks.push(Ok(StreamChunk::Finish(finish)));
+            chunks.push(Ok(StreamChunk::Done));
+            Ok(Box::pin(futures_util::stream::iter(chunks)))
+        }
+
+        fn parse_response(&self, chunks: &[StreamChunk]) -> ModelResult<(String, Vec<ToolCall>)> {
+            let text: String = chunks
+                .iter()
+                .filter_map(|c| match c {
+                    StreamChunk::Delta(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            Ok((text, vec![]))
+        }
+
+        fn set_max_tokens_override(&mut self, n: usize) {
+            *self.override_seen.lock().unwrap() = n;
+        }
+
+        fn current_max_tokens(&self) -> usize {
+            32768
+        }
+    }
+
+    fn finish_agent(
+        tmp: &tempfile::TempDir,
+        script: Vec<(String, String)>,
+    ) -> (Agent, Arc<AtomicUsize>, Arc<std::sync::Mutex<usize>>) {
+        let mut config = Config::default_config();
+        config.session.dir = tmp.path().to_string_lossy().to_string();
+        config.agent.work_dir = tmp.path().to_string_lossy().to_string();
+        config.agent.evolution_enabled = false;
+        let mut agent = Agent::new(config).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let override_seen = Arc::new(std::sync::Mutex::new(0usize));
+        agent.set_provider(Box::new(FinishProvider {
+            calls: calls.clone(),
+            override_seen: override_seen.clone(),
+            script,
+        }));
+        agent.set_quiet(true);
+        (agent, calls, override_seen)
+    }
+
+    /// v0.15.2 核心场景：首次 length + 双空 → max_tokens 翻倍（32768→65536 封顶）
+    /// 自动重试一次 → 成功。恰好 2 次模型调用
+    #[tokio::test]
+    async fn test_length_empty_retry_once_then_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut agent, calls, override_seen) = finish_agent(
+            &tmp,
+            vec![
+                ("length".into(), String::new()),   // 首次：思考耗尽，双空
+                ("stop".into(), "恢复回复".into()), // 重试：正常输出
+            ],
+        );
+        let reply = agent.run("任务").await.expect("length 重试后 run 应成功");
+        assert_eq!(reply, "恢复回复");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "首 length 空 + 重试成功 = 恰好 2 次调用"
+        );
+        assert_eq!(
+            *override_seen.lock().unwrap(),
+            65536,
+            "max_tokens 应翻倍并封顶 65536"
+        );
+    }
+
+    /// 重试仍 length + 双空 → 守卫报错点名真凶；只重试一次（共 2 次调用）
+    #[tokio::test]
+    async fn test_length_retry_still_empty_reports_culprit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut agent, calls, _) = finish_agent(
+            &tmp,
+            vec![
+                ("length".into(), String::new()),
+                ("length".into(), String::new()),
+            ],
+        );
+        let err = agent.run("任务").await.expect_err("重试仍空应报错");
+        let msg = err.to_string();
+        assert!(msg.contains("输出预算被思考耗尽"), "{msg}");
+        assert!(msg.contains("max_output_tokens"), "{msg}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "只自动重试一次");
+    }
+
+    /// content_filter 不自动重试：一次调用直接报错，文案确认审查
+    #[tokio::test]
+    async fn test_content_filter_no_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut agent, calls, _) =
+            finish_agent(&tmp, vec![("content_filter".into(), String::new())]);
+        let err = agent.run("任务").await.expect_err("content_filter 应报错");
+        assert!(err.to_string().contains("content_filter"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "content_filter 不重试");
     }
 
     fn fill_history(agent: &mut Agent, n: usize) {

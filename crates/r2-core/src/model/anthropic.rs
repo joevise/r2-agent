@@ -14,8 +14,10 @@ const MAX_RETRIES: u32 = 2;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Anthropic API 版本头
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-/// max_tokens（Anthropic 强制要求）
-const MAX_TOKENS: u32 = 4096;
+/// max_tokens（Anthropic 强制要求）。v0.15.2 从 4096 提到 16384：
+/// 思考型模型长任务输出预算不足会导致正文/工具双空（stop_reason=max_tokens）。
+/// config 覆盖本版未开（OpenAiCompat 侧已开），需要时走 length 自动重试调大
+const MAX_TOKENS: u32 = 16384;
 
 /// Anthropic Messages API Provider
 pub struct AnthropicProvider {
@@ -29,6 +31,8 @@ pub struct AnthropicProvider {
     client: reqwest::Client,
     /// 会话提示头（X-R2-Session；None = 不带）
     session_hint: Option<String>,
+    /// 输出预算覆盖（v0.15.2 length 重试调大用；0 = 用 MAX_TOKENS 常量）
+    max_tokens_override: usize,
 }
 
 impl AnthropicProvider {
@@ -44,6 +48,16 @@ impl AnthropicProvider {
             model: model.to_string(),
             client,
             session_hint: None,
+            max_tokens_override: 0,
+        }
+    }
+
+    /// 当前生效的输出预算
+    fn effective_max_tokens(&self) -> usize {
+        if self.max_tokens_override > 0 {
+            self.max_tokens_override
+        } else {
+            MAX_TOKENS as usize
         }
     }
 
@@ -148,12 +162,17 @@ fn messages_to_anthropic(messages: &[Message]) -> (Option<String>, Vec<serde_jso
 }
 
 /// 构建 /v1/messages 请求体（tools 为空时不带 tools 字段）
-fn build_request_body(model: &str, messages: &[Message], tools: &[ToolSchema]) -> serde_json::Value {
+fn build_request_body(
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolSchema],
+    max_tokens: usize,
+) -> serde_json::Value {
     let (system, msgs) = messages_to_anthropic(messages);
     let mut body = serde_json::json!({
         "model": model,
         "messages": msgs,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": max_tokens,
         "stream": true,
     });
     if let Some(system) = system {
@@ -251,6 +270,13 @@ fn parse_data_payload(payload: &str) -> ModelResult<Vec<StreamChunk>> {
                     cached_tokens: 0,
                 });
             }
+            // v0.15.2：透传 stop_reason（"end_turn"/"max_tokens"/"tool_use" 等），
+            // 空响应守卫据此区分真凶（对齐 openai 侧 finish_reason）
+            if let Some(reason) = v["delta"]["stop_reason"].as_str() {
+                if !reason.is_empty() {
+                    chunks.push(StreamChunk::Finish(reason.to_string()));
+                }
+            }
         }
         "message_stop" => chunks.push(StreamChunk::Done),
         // content_block_stop / ping 等忽略
@@ -270,12 +296,15 @@ struct SseParser {
     /// 未完整事件的残留字节（字节级：切分前不转 String，防多字节字符被
     /// 网络 chunk 边界切开产生 U+FFFD）
     buffer: Vec<u8>,
+    /// Finish chunk 只产一次（对齐 openai_compat 侧去重语义）
+    finish_seen: bool,
 }
 
 impl SseParser {
     fn new() -> Self {
         Self {
             buffer: Vec::new(),
+            finish_seen: false,
         }
     }
 
@@ -286,7 +315,18 @@ impl SseParser {
                 let payload = payload.trim_start();
                 if !payload.is_empty() {
                     match parse_data_payload(payload) {
-                        Ok(chunks) => out.extend(chunks.into_iter().map(Ok)),
+                        Ok(chunks) => {
+                            for c in chunks {
+                                // Finish 去重：首个保留，后续重复丢弃
+                                if matches!(c, StreamChunk::Finish(_)) {
+                                    if self.finish_seen {
+                                        continue;
+                                    }
+                                    self.finish_seen = true;
+                                }
+                                out.push(Ok(c));
+                            }
+                        }
                         Err(e) => out.push(Err(e)),
                     }
                 }
@@ -334,13 +374,21 @@ impl ModelProvider for AnthropicProvider {
         self.session_hint = Some(id.to_string());
     }
 
+    fn set_max_tokens_override(&mut self, n: usize) {
+        self.max_tokens_override = n;
+    }
+
+    fn current_max_tokens(&self) -> usize {
+        self.effective_max_tokens()
+    }
+
     async fn chat_stream(
         &self,
         messages: &[Message],
         tools: &[ToolSchema],
     ) -> ModelResult<ChunkStream> {
         let url = format!("{}/v1/messages", self.base_url);
-        let body = build_request_body(&self.model, messages, tools);
+        let body = build_request_body(&self.model, messages, tools, self.effective_max_tokens());
 
         // 建连阶段重试：429/5xx 指数退避（1s/2s/4s），流开始后不重试
         let mut attempt: u32 = 0;
@@ -449,6 +497,7 @@ impl ModelProvider for AnthropicProvider {
                     entry.2.push_str(arguments_delta);
                 }
                 StreamChunk::Usage { .. } => {} // 用量由 agent 层校正，不进正文/工具拼装
+                StreamChunk::Finish(_) => {} // 收尾原因只供空响应守卫诊断，不进合成
                 StreamChunk::Done => {}
             }
         }
@@ -505,8 +554,8 @@ mod tests {
     #[test]
     fn test_sse_parse_full_stream() {
         let chunks = parse_all(SSE_TEXT);
-        // Delta(text) + ToolCallDelta(start) + 2 × ToolCallDelta(json) + Done
-        assert_eq!(chunks.len(), 5);
+        // Delta(text) + ToolCallDelta(start) + 2 × ToolCallDelta(json) + Finish + Done
+        assert_eq!(chunks.len(), 6);
         match &chunks[0] {
             StreamChunk::Delta(s) => assert_eq!(s, "我需要执行命令"),
             other => panic!("期望 Delta，实际 {other:?}"),
@@ -545,7 +594,9 @@ mod tests {
             } => assert_eq!(arguments_delta, "\"ls\"}"),
             other => panic!("期望 ToolCallDelta，实际 {other:?}"),
         }
-        assert!(matches!(chunks[4], StreamChunk::Done));
+        // v0.15.2：message_delta 的 stop_reason 透传为 Finish
+        assert!(matches!(&chunks[4], StreamChunk::Finish(r) if r == "tool_use"));
+        assert!(matches!(chunks[5], StreamChunk::Done));
     }
 
     /// 恶意/畸形 SSE 输入 fuzz：解析器绝不能 panic（产出什么都行，核心是不崩）
@@ -602,7 +653,7 @@ mod tests {
                 tool_call_id: None,
             },
         ];
-        let body = build_request_body("claude-sonnet-4-20250514", &msgs, &[]);
+        let body = build_request_body("claude-sonnet-4-20250514", &msgs, &[], MAX_TOKENS as usize);
         let system = body["system"].as_array().expect("system 应为块数组");
         assert_eq!(system.len(), 1);
         assert_eq!(system[0]["type"], "text");
@@ -615,7 +666,7 @@ mod tests {
         // message_start 带 input 侧用量（含缓存明细），message_delta 带 output
         let text = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":1500,\"cache_read_input_tokens\":1200,\"cache_creation_input_tokens\":300,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         let chunks = parse_all(text);
-        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks.len(), 5);
         match &chunks[0] {
             StreamChunk::Usage {
                 input_tokens,
@@ -640,7 +691,8 @@ mod tests {
             }
             other => panic!("期望 Usage(message_delta)，实际 {other:?}"),
         }
-        assert!(matches!(chunks[3], StreamChunk::Done));
+        assert!(matches!(&chunks[3], StreamChunk::Finish(r) if r == "end_turn"));
+        assert!(matches!(chunks[4], StreamChunk::Done));
     }
 
     #[test]
@@ -655,8 +707,8 @@ mod tests {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .expect("SSE 解析失败");
-        assert_eq!(chunks.len(), 5);
-        assert!(matches!(chunks[4], StreamChunk::Done));
+        assert_eq!(chunks.len(), 6);
+        assert!(matches!(chunks[5], StreamChunk::Done));
         match &chunks[0] {
             StreamChunk::Delta(s) => assert_eq!(s, "我需要执行命令"),
             other => panic!("期望 Delta，实际 {other:?}"),
@@ -777,10 +829,10 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
         }];
-        let body = build_request_body("claude-sonnet-4-20250514", &msgs, &tools);
+        let body = build_request_body("claude-sonnet-4-20250514", &msgs, &tools, MAX_TOKENS as usize);
         assert_eq!(body["model"], "claude-sonnet-4-20250514");
         assert_eq!(body["stream"], true);
-        assert_eq!(body["max_tokens"], MAX_TOKENS);
+        assert_eq!(body["max_tokens"], MAX_TOKENS as usize);
         // tools 格式：name / description / input_schema（不是 parameters）
         assert_eq!(body["tools"][0]["name"], "bash");
         assert_eq!(body["tools"][0]["description"], "执行命令");
@@ -796,9 +848,28 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
         }];
-        let body = build_request_body("claude-sonnet-4-20250514", &msgs, &[]);
+        let body = build_request_body("claude-sonnet-4-20250514", &msgs, &[], MAX_TOKENS as usize);
         assert!(body.get("tools").is_none());
         assert!(body.get("system").is_none());
+    }
+
+    /// v0.15.2：stop_reason 透传 Finish——max_tokens（=openai 的 length）场景
+    #[test]
+    fn test_sse_parse_stop_reason_finish() {
+        let text = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":16384}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let chunks = parse_all(text);
+        assert!(chunks
+            .iter()
+            .any(|c| matches!(c, StreamChunk::Finish(r) if r == "max_tokens")));
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+        // Finish 只产一次
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|c| matches!(c, StreamChunk::Finish(_)))
+                .count(),
+            1
+        );
     }
 
     #[test]

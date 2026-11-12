@@ -12,6 +12,8 @@ pub struct ModelInfo {
     pub display_name: &'static str,
     /// 上下文窗口（tokens）
     pub context_window: usize,
+    /// 输出上限（tokens，显式发给 openai_compat 端点的 max_tokens）
+    pub max_output_tokens: usize,
     /// 输入价格（元/百万token）
     pub input_price_per_m: f64,
     /// 输出价格（元/百万token）
@@ -34,6 +36,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "glm-5.2",
         display_name: "glm-5.2",
         context_window: 1000000,
+        max_output_tokens: 32768,
         input_price_per_m: 8.0,
         output_price_per_m: 8.0,
         tool_support: true,
@@ -45,6 +48,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "glm-5.2-air",
         display_name: "glm-5.2-air",
         context_window: 128000,
+        max_output_tokens: 32768,
         input_price_per_m: 0.8,
         output_price_per_m: 2.0,
         tool_support: true,
@@ -56,6 +60,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "glm-5.2-flash",
         display_name: "glm-5.2-flash",
         context_window: 128000,
+        max_output_tokens: 32768,
         input_price_per_m: 0.5,
         output_price_per_m: 2.0,
         tool_support: true,
@@ -68,6 +73,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "glm-5.1",
         display_name: "glm-5.1",
         context_window: 204000,
+        max_output_tokens: 32768,
         input_price_per_m: 7.0,
         output_price_per_m: 21.9,
         tool_support: true,
@@ -80,6 +86,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "kimi-k3",
         display_name: "kimi-k3",
         context_window: 1048576,
+        max_output_tokens: 65536,
         input_price_per_m: 20.0,
         output_price_per_m: 100.0,
         tool_support: true,
@@ -92,6 +99,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "kimi-k2.7-code",
         display_name: "kimi-k2.7-code",
         context_window: 262000,
+        max_output_tokens: 65536,
         input_price_per_m: 5.1,
         output_price_per_m: 25.2,
         tool_support: true,
@@ -103,6 +111,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "kimi-for-coding",
         display_name: "kimi-for-coding",
         context_window: 256000,
+        max_output_tokens: 65536,
         input_price_per_m: 8.0,
         output_price_per_m: 24.0,
         tool_support: true,
@@ -115,6 +124,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "deepseek-v4-pro",
         display_name: "deepseek-v4-pro",
         context_window: 1048000,
+        max_output_tokens: 8192,
         input_price_per_m: 3.0,
         output_price_per_m: 6.0,
         tool_support: true,
@@ -127,6 +137,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "deepseek-v4-flash",
         display_name: "deepseek-v4-flash",
         context_window: 1048000,
+        max_output_tokens: 8192,
         input_price_per_m: 0.43,
         output_price_per_m: 0.94,
         tool_support: true,
@@ -139,6 +150,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "deepseek-r2",
         display_name: "deepseek-r2",
         context_window: 128000,
+        max_output_tokens: 8192,
         input_price_per_m: 4.0,
         output_price_per_m: 16.0,
         tool_support: true,
@@ -151,6 +163,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "qwen3.8-max",
         display_name: "qwen3.8-max",
         context_window: 1000000,
+        max_output_tokens: 8192,
         input_price_per_m: 14.4,
         output_price_per_m: 43.2,
         tool_support: true,
@@ -163,6 +176,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "qwen3.8-2.4t",
         display_name: "qwen3.8-2.4t",
         context_window: 1048000,
+        max_output_tokens: 8192,
         input_price_per_m: 14.4,
         output_price_per_m: 43.2,
         tool_support: true,
@@ -175,6 +189,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "qwen3.7-flash",
         display_name: "qwen3.7-flash",
         context_window: 1000000,
+        max_output_tokens: 8192,
         input_price_per_m: 0.22,
         output_price_per_m: 0.94,
         tool_support: true,
@@ -186,6 +201,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "doubao-seed-1.6",
         display_name: "doubao-seed-1.6",
         context_window: 256000,
+        max_output_tokens: 8192,
         input_price_per_m: 0.8,
         output_price_per_m: 2.0,
         tool_support: true,
@@ -198,6 +214,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "minimax-m3",
         display_name: "minimax-m3",
         context_window: 1048000,
+        max_output_tokens: 8192,
         input_price_per_m: 2.0,
         output_price_per_m: 8.0,
         tool_support: true,
@@ -209,6 +226,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "minimax-m2.7",
         display_name: "minimax-m2.7",
         context_window: 1048000,
+        max_output_tokens: 8192,
         input_price_per_m: 1.0,
         output_price_per_m: 4.0,
         tool_support: true,
@@ -220,6 +238,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "hunyuan-t2",
         display_name: "hunyuan-t2",
         context_window: 256000,
+        max_output_tokens: 8192,
         input_price_per_m: 4.0,
         output_price_per_m: 12.0,
         tool_support: true,
@@ -231,6 +250,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "mimo-v2.5-pro",
         display_name: "mimo-v2.5-pro",
         context_window: 128000,
+        max_output_tokens: 8192,
         input_price_per_m: 1.0,
         output_price_per_m: 4.0,
         tool_support: true,
@@ -243,6 +263,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "claude-opus-5",
         display_name: "claude-opus-5",
         context_window: 1000000,
+        max_output_tokens: 16384,
         input_price_per_m: 36.0,
         output_price_per_m: 180.0,
         tool_support: true,
@@ -255,6 +276,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "claude-opus-5-fast",
         display_name: "claude-opus-5-fast",
         context_window: 1000000,
+        max_output_tokens: 16384,
         input_price_per_m: 72.0,
         output_price_per_m: 360.0,
         tool_support: true,
@@ -267,6 +289,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "claude-fable-5",
         display_name: "claude-fable-5",
         context_window: 1000000,
+        max_output_tokens: 16384,
         input_price_per_m: 72.0,
         output_price_per_m: 360.0,
         tool_support: true,
@@ -279,6 +302,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "claude-sonnet-5",
         display_name: "claude-sonnet-5",
         context_window: 1000000,
+        max_output_tokens: 16384,
         input_price_per_m: 14.4,
         output_price_per_m: 72.0,
         tool_support: true,
@@ -291,6 +315,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "claude-sonnet-4.6",
         display_name: "claude-sonnet-4.6",
         context_window: 1000000,
+        max_output_tokens: 16384,
         input_price_per_m: 21.6,
         output_price_per_m: 108.0,
         tool_support: true,
@@ -303,6 +328,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "claude-haiku-4.5",
         display_name: "claude-haiku-4.5",
         context_window: 200000,
+        max_output_tokens: 16384,
         input_price_per_m: 7.2,
         output_price_per_m: 36.0,
         tool_support: true,
@@ -315,6 +341,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "gpt-5.6-sol",
         display_name: "gpt-5.6-sol",
         context_window: 1050000,
+        max_output_tokens: 16384,
         input_price_per_m: 36.0,
         output_price_per_m: 216.0,
         tool_support: true,
@@ -327,6 +354,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "gpt-5.6-terra",
         display_name: "gpt-5.6-terra",
         context_window: 1050000,
+        max_output_tokens: 16384,
         input_price_per_m: 7.2,
         output_price_per_m: 43.2,
         tool_support: true,
@@ -339,6 +367,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "gpt-5.6-luna",
         display_name: "gpt-5.6-luna",
         context_window: 1050000,
+        max_output_tokens: 16384,
         input_price_per_m: 0.72,
         output_price_per_m: 4.32,
         tool_support: true,
@@ -351,6 +380,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "gpt-5.5-pro",
         display_name: "gpt-5.5-pro",
         context_window: 1050000,
+        max_output_tokens: 16384,
         input_price_per_m: 216.0,
         output_price_per_m: 1296.0,
         tool_support: true,
@@ -363,6 +393,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "gpt-5.4-mini",
         display_name: "gpt-5.4-mini",
         context_window: 400000,
+        max_output_tokens: 16384,
         input_price_per_m: 5.4,
         output_price_per_m: 32.4,
         tool_support: true,
@@ -375,6 +406,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "gpt-5.4-nano",
         display_name: "gpt-5.4-nano",
         context_window: 400000,
+        max_output_tokens: 16384,
         input_price_per_m: 1.4,
         output_price_per_m: 9.0,
         tool_support: true,
@@ -387,6 +419,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "gemini-3-pro",
         display_name: "gemini-3-pro",
         context_window: 2000000,
+        max_output_tokens: 8192,
         input_price_per_m: 14.4,
         output_price_per_m: 86.4,
         tool_support: true,
@@ -399,6 +432,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "gemini-3.7-flash",
         display_name: "gemini-3.7-flash",
         context_window: 1048000,
+        max_output_tokens: 8192,
         input_price_per_m: 2.7,
         output_price_per_m: 13.5,
         tool_support: true,
@@ -411,6 +445,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "grok-4.6",
         display_name: "grok-4.6",
         context_window: 500000,
+        max_output_tokens: 8192,
         input_price_per_m: 14.4,
         output_price_per_m: 43.2,
         tool_support: true,
@@ -423,6 +458,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "grok-4.20",
         display_name: "grok-4.20",
         context_window: 2000000,
+        max_output_tokens: 8192,
         input_price_per_m: 9.0,
         output_price_per_m: 18.0,
         tool_support: true,
@@ -435,6 +471,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "nemotron-3.5-lightning",
         display_name: "nemotron-3.5-lightning",
         context_window: 1000000,
+        max_output_tokens: 8192,
         input_price_per_m: 0.72,
         output_price_per_m: 1.8,
         tool_support: true,
@@ -447,6 +484,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "nemotron-3-ultra-550b",
         display_name: "nemotron-3-ultra-550b",
         context_window: 512000,
+        max_output_tokens: 8192,
         input_price_per_m: 4.3,
         output_price_per_m: 25.9,
         tool_support: true,
@@ -459,6 +497,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "nemotron-3-super-120b",
         display_name: "nemotron-3-super-120b",
         context_window: 1000000,
+        max_output_tokens: 8192,
         input_price_per_m: 0.58,
         output_price_per_m: 2.88,
         tool_support: true,
@@ -470,6 +509,7 @@ static REGISTRY: &[ModelInfo] = &[
         key: "mock",
         display_name: "mock",
         context_window: 8192,
+        max_output_tokens: 8192,
         input_price_per_m: 0.0,
         output_price_per_m: 0.0,
         tool_support: false,
@@ -491,6 +531,13 @@ pub fn lookup(model_name: &str) -> Option<&'static ModelInfo> {
 /// 只读访问整个注册表（`r2 models` 列表用）
 pub fn registry() -> &'static [ModelInfo] {
     REGISTRY
+}
+
+/// 当前模型的输出上限（显式 max_tokens 用）：复用 lookup 最长 key 匹配，
+/// 未命中兜底 8192（v0.15.2：不发 max_tokens 时服务端默认 ~8k，
+/// 思考型模型长任务会把全部预算烧在 reasoning 上导致正文/工具双空）
+pub fn max_output_for(model: &str) -> usize {
+    lookup(model).map(|m| m.max_output_tokens).unwrap_or(8192)
 }
 
 /// 按注册表价格估算成本（元）。未命中模型返回 None。
@@ -659,5 +706,24 @@ mod tests {
         assert_eq!(format_tokens(12_300), "12.3k");
         assert_eq!(format_tokens(1_000), "1.0k");
         assert_eq!(format_tokens(1_000_000), "1.0M");
+    }
+
+    /// v0.15.2：输出上限注册表（思考系预算大，deepseek 硬上限，未知兜底 8192）
+    #[test]
+    fn test_max_output_for() {
+        assert_eq!(max_output_for("glm-5.2"), 32768);
+        assert_eq!(max_output_for("kimi-k3"), 65536);
+        // deepseek-chat 不命中任何注册 key（注册的是 v4-pro/v4-flash/r2）→ 兜底 8192
+        assert_eq!(max_output_for("deepseek-chat"), 8192);
+        assert_eq!(max_output_for("deepseek-v4-pro"), 8192);
+        assert_eq!(max_output_for("unknown-model-x"), 8192);
+        // 最长 key 匹配：flash/air 不被 glm-5.2 抢，同值但验证命中路径
+        assert_eq!(max_output_for("glm-5.2-flash"), 32768);
+        assert_eq!(max_output_for("claude-sonnet-5"), 16384);
+        assert_eq!(max_output_for("gpt-5.6-sol"), 16384);
+        // 注册表每个条目都补了值（防漏配）
+        for m in registry() {
+            assert!(m.max_output_tokens > 0, "{} 未配 max_output_tokens", m.key);
+        }
     }
 }

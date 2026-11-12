@@ -75,6 +75,9 @@ pub enum StreamChunk {
         output_tokens: u64,
         cached_tokens: u64,
     },
+    /// 流收尾原因（openai: finish_reason；anthropic: stop_reason）
+    /// "stop" | "length" | "content_filter" | "tool_calls" | 其他
+    Finish(String),
     /// 流结束
     Done,
 }

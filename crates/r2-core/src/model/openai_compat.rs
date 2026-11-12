@@ -25,6 +25,9 @@ pub struct OpenAiCompatProvider {
     client: reqwest::Client,
     /// 会话提示头（X-R2-Session；None = 不带）
     session_hint: Option<String>,
+    /// 输出预算覆盖（v0.15.2）：>0 时替代 models 注册表值作为 max_tokens。
+    /// config [model.openai_compat].max_output_tokens 或 length 重试调大写入
+    max_tokens_override: usize,
 }
 
 impl OpenAiCompatProvider {
@@ -40,6 +43,16 @@ impl OpenAiCompatProvider {
             model: model.to_string(),
             client,
             session_hint: None,
+            max_tokens_override: 0,
+        }
+    }
+
+    /// 当前生效的输出预算：override >0 用 override，否则查注册表（未命中 8192）
+    fn effective_max_tokens(&self) -> usize {
+        if self.max_tokens_override > 0 {
+            self.max_tokens_override
+        } else {
+            crate::models::max_output_for(&self.model)
         }
     }
 
@@ -91,12 +104,20 @@ fn message_to_json(msg: &Message) -> serde_json::Value {
 }
 
 /// 构建 /chat/completions 请求体（tools 为空时不带 tools 字段）
-fn build_request_body(model: &str, messages: &[Message], tools: &[ToolSchema]) -> serde_json::Value {
+fn build_request_body(
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolSchema],
+    max_tokens: usize,
+) -> serde_json::Value {
     let msgs: Vec<serde_json::Value> = messages.iter().map(message_to_json).collect();
     let mut body = serde_json::json!({
         "model": model,
         "messages": msgs,
         "stream": true,
+        // v0.15.2：显式输出预算。不发时服务端默认 ~8k，思考型模型长任务会把
+        // 全部预算烧在 reasoning 上 → 正文/工具双空（finish_reason=length）
+        "max_tokens": max_tokens,
         // OpenAI 标准字段：要求流尾部返回真实 usage（GLM/DeepSeek/Kimi 兼容）
         "stream_options": {"include_usage": true},
     });
@@ -165,6 +186,13 @@ fn parse_data_payload(payload: &str) -> ModelResult<Vec<StreamChunk>> {
             });
         }
     }
+    // v0.15.2：透传 finish_reason（"stop"/"length"/"content_filter"/"tool_calls"）。
+    // 空响应守卫据此区分真凶：length=思考耗尽预算（可重试），content_filter=审查
+    if let Some(reason) = v["choices"][0]["finish_reason"].as_str() {
+        if !reason.is_empty() {
+            chunks.push(StreamChunk::Finish(reason.to_string()));
+        }
+    }
     Ok(chunks)
 }
 
@@ -179,12 +207,15 @@ struct SseParser {
     /// 未完整事件的残留字节（字节级：切分前不转 String，防多字节字符被
     /// 网络 chunk 边界切开产生 U+FFFD）
     buffer: Vec<u8>,
+    /// Finish chunk 只产一次（个别代理会在多个事件重复 finish_reason）
+    finish_seen: bool,
 }
 
 impl SseParser {
     fn new() -> Self {
         Self {
             buffer: Vec::new(),
+            finish_seen: false,
         }
     }
 
@@ -197,7 +228,18 @@ impl SseParser {
                     out.push(Ok(StreamChunk::Done));
                 } else if !payload.is_empty() {
                     match parse_data_payload(payload) {
-                        Ok(chunks) => out.extend(chunks.into_iter().map(Ok)),
+                        Ok(chunks) => {
+                            for c in chunks {
+                                // Finish 去重：首个保留，后续重复丢弃
+                                if matches!(c, StreamChunk::Finish(_)) {
+                                    if self.finish_seen {
+                                        continue;
+                                    }
+                                    self.finish_seen = true;
+                                }
+                                out.push(Ok(c));
+                            }
+                        }
                         Err(e) => out.push(Err(e)),
                     }
                 }
@@ -245,13 +287,21 @@ impl ModelProvider for OpenAiCompatProvider {
         self.session_hint = Some(id.to_string());
     }
 
+    fn set_max_tokens_override(&mut self, n: usize) {
+        self.max_tokens_override = n;
+    }
+
+    fn current_max_tokens(&self) -> usize {
+        self.effective_max_tokens()
+    }
+
     async fn chat_stream(
         &self,
         messages: &[Message],
         tools: &[ToolSchema],
     ) -> ModelResult<ChunkStream> {
         let url = format!("{}/chat/completions", self.base_url);
-        let body = build_request_body(&self.model, messages, tools);
+        let body = build_request_body(&self.model, messages, tools, self.effective_max_tokens());
 
         // 建连阶段重试：429/5xx 指数退避（1s/2s/4s），流开始后不重试
         let mut attempt: u32 = 0;
@@ -358,6 +408,7 @@ impl ModelProvider for OpenAiCompatProvider {
                     entry.2.push_str(arguments_delta);
                 }
                 StreamChunk::Usage { .. } => {} // 用量由 agent 层校正，不进正文/工具拼装
+                StreamChunk::Finish(_) => {} // 收尾原因只供空响应守卫诊断，不进合成
                 StreamChunk::Done => {}
             }
         }
@@ -437,7 +488,7 @@ mod tests {
     #[test]
     fn test_sse_parse_full_stream() {
         let chunks = parse_all(SSE_TEXT);
-        assert_eq!(chunks.len(), 5);
+        assert_eq!(chunks.len(), 6);
         match &chunks[0] {
             StreamChunk::Delta(s) => assert_eq!(s, "hello"),
             other => panic!("期望 Delta，实际 {other:?}"),
@@ -476,7 +527,9 @@ mod tests {
             } => assert_eq!(arguments_delta, "d\":\"ls\"}"),
             other => panic!("期望 ToolCallDelta，实际 {other:?}"),
         }
-        assert!(matches!(chunks[4], StreamChunk::Done));
+        // v0.15.2：finish_reason 透传为 Finish（在 Done 之前）
+        assert!(matches!(&chunks[4], StreamChunk::Finish(r) if r == "tool_calls"));
+        assert!(matches!(chunks[5], StreamChunk::Done));
     }
 
     /// 含 usage 尾块的流（include_usage=true 时服务端在 [DONE] 前发 usage）
@@ -532,8 +585,8 @@ mod tests {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .expect("SSE 解析失败");
-        assert_eq!(chunks.len(), 5);
-        assert!(matches!(chunks[4], StreamChunk::Done));
+        assert_eq!(chunks.len(), 6);
+        assert!(matches!(chunks[5], StreamChunk::Done));
         match &chunks[0] {
             StreamChunk::Delta(s) => assert_eq!(s, "hello"),
             other => panic!("期望 Delta，实际 {other:?}"),
@@ -676,10 +729,56 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
         }];
-        let body = build_request_body("glm-5.2", &msgs, &[]);
+        let body = build_request_body("glm-5.2", &msgs, &[], 32768);
         assert!(body.get("tools").is_none());
         assert_eq!(body["stream"], true);
         assert_eq!(body["model"], "glm-5.2");
         assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["max_tokens"], 32768);
+    }
+
+    /// v0.15.2：finish_reason 各取值透传 Finish chunk（空响应守卫诊断依据）
+    #[test]
+    fn test_sse_finish_reason_variants() {
+        for reason in ["length", "content_filter", "stop"] {
+            let text = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"\"}},\"finish_reason\":\"{reason}\"}}]}}\n\ndata: [DONE]\n\n"
+            );
+            let chunks = parse_all(&text);
+            assert!(
+                matches!(&chunks[0], StreamChunk::Finish(r) if r == reason),
+                "应产出 Finish({reason})，实际：{chunks:?}"
+            );
+            assert!(matches!(chunks[1], StreamChunk::Done));
+        }
+        // finish_reason 为 null / 缺省：不产 Finish
+        let text = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+        let chunks = parse_all(text);
+        assert!(!chunks.iter().any(|c| matches!(c, StreamChunk::Finish(_))));
+    }
+
+    /// v0.15.2：多条事件重复携带 finish_reason 时 Finish 只产一次
+    #[test]
+    fn test_sse_finish_reason_emitted_once() {
+        let text = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"},\"finish_reason\":\"length\"}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"b\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n";
+        let chunks = parse_all(text);
+        let finishes: Vec<_> = chunks
+            .iter()
+            .filter(|c| matches!(c, StreamChunk::Finish(_)))
+            .collect();
+        assert_eq!(finishes.len(), 1, "Finish 应只产一次：{chunks:?}");
+    }
+
+    /// v0.15.2：请求体显式 max_tokens——默认取注册表值，override 优先
+    #[test]
+    fn test_max_tokens_from_registry_and_override() {
+        let p = OpenAiCompatProvider::new("https://example.com", "k", "glm-5.2");
+        assert_eq!(p.current_max_tokens(), 32768, "默认应取注册表值");
+        let mut p = p;
+        p.set_max_tokens_override(9999);
+        assert_eq!(p.current_max_tokens(), 9999, "override 应优先");
+        // 未知模型兜底 8192
+        let p2 = OpenAiCompatProvider::new("https://example.com", "k", "unknown-x");
+        assert_eq!(p2.current_max_tokens(), 8192);
     }
 }

@@ -80,6 +80,10 @@ pub struct OpenAiCompatConfig {
     /// 模型名称
     #[serde(default = "default_openai_model")]
     pub model: String,
+    /// 输出预算覆盖（v0.15.2）：0 = 用 models 注册表值；>0 = 显式覆盖
+    /// 发给端点的 max_tokens（思考型模型长任务被 length 掐断时调大此项）
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: usize,
 }
 
 /// Anthropic 接口配置
@@ -240,6 +244,10 @@ fn default_openai_base_url() -> String {
 fn default_openai_model() -> String {
     "gpt-4o".to_string()
 }
+fn default_max_output_tokens() -> usize {
+    // 0 = 不覆盖：build_request_body 用 models 注册表 max_output_for 值
+    0
+}
 fn default_anthropic_base_url() -> String {
     "https://api.anthropic.com".to_string()
 }
@@ -340,6 +348,7 @@ impl Default for OpenAiCompatConfig {
             base_url: default_openai_base_url(),
             api_key: String::new(),
             model: default_openai_model(),
+            max_output_tokens: default_max_output_tokens(),
         }
     }
 }
@@ -814,6 +823,22 @@ extensions = ["tasks"]
         // 旧配置（无 mcp 字段）向后兼容：servers 默认为空
         let config = Config::load_from_str(FULL_TOML).unwrap();
         assert!(config.mcp.servers.is_empty());
+    }
+
+    /// v0.15.2：max_output_tokens 覆盖——默认 0（用注册表值），>0 显式覆盖
+    #[test]
+    fn test_max_output_tokens_config() {
+        // 旧配置（无此字段）向后兼容：默认 0
+        let config = Config::load_from_str(FULL_TOML).unwrap();
+        assert_eq!(config.model.openai_compat.max_output_tokens, 0);
+        // 显式覆盖
+        let toml_str = r#"
+[model.openai_compat]
+model = "glm-5.2"
+max_output_tokens = 50000
+"#;
+        let config = Config::load_from_str(toml_str).unwrap();
+        assert_eq!(config.model.openai_compat.max_output_tokens, 50000);
     }
 
     #[test]

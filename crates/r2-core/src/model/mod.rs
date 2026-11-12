@@ -33,6 +33,16 @@ pub trait ModelProvider: Send + Sync {
     /// 默认空实现——mock/NullProvider 等零改动。
     fn set_session_hint(&mut self, _id: &str) {}
 
+    /// 输出预算覆盖（v0.15.2）：>0 时下一次 chat_stream 用该值作为 max_tokens。
+    /// config 显式配置与 length 空响应自动重试（调大重发）共用此入口。
+    /// 默认空实现——不支持的 provider（mock 等）零改动。
+    fn set_max_tokens_override(&mut self, _n: usize) {}
+
+    /// 当前生效的输出预算（0 = 未知/不支持；length 重试翻倍基数用）
+    fn current_max_tokens(&self) -> usize {
+        0
+    }
+
     /// Token 计数（v0.1 用近似：字符数/2）
     fn count_tokens(&self, text: &str) -> usize {
         text.len() / 2
@@ -42,11 +52,18 @@ pub trait ModelProvider: Send + Sync {
 /// 工厂函数：根据 Config 创建 Provider
 pub fn create_provider(config: &crate::config::Config) -> ModelResult<Box<dyn ModelProvider>> {
     match config.model.provider.as_str() {
-        "openai_compat" => Ok(Box::new(openai_compat::OpenAiCompatProvider::new(
-            &config.model.openai_compat.base_url,
-            &config.model.openai_compat.api_key,
-            &config.model.openai_compat.model,
-        ))),
+        "openai_compat" => {
+            let mut p = openai_compat::OpenAiCompatProvider::new(
+                &config.model.openai_compat.base_url,
+                &config.model.openai_compat.api_key,
+                &config.model.openai_compat.model,
+            );
+            // config 显式覆盖输出预算（>0 生效；0 = 用 models 注册表值）
+            if config.model.openai_compat.max_output_tokens > 0 {
+                p.set_max_tokens_override(config.model.openai_compat.max_output_tokens);
+            }
+            Ok(Box::new(p))
+        }
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(
             &config.model.anthropic.base_url,
             &config.model.anthropic.api_key,
@@ -72,5 +89,19 @@ mod tests {
         let mut config = crate::config::Config::default_config();
         config.model.provider = "unknown".to_string();
         assert!(create_provider(&config).is_err());
+    }
+
+    /// v0.15.2：config max_output_tokens >0 时 override 生效；0 用注册表值
+    #[test]
+    fn test_create_provider_max_output_override() {
+        let mut config = crate::config::Config::default_config();
+        config.model.openai_compat.model = "glm-5.2".to_string();
+        // 默认 0：注册表值 32768
+        let p = create_provider(&config).unwrap();
+        assert_eq!(p.current_max_tokens(), 32768);
+        // 显式覆盖
+        config.model.openai_compat.max_output_tokens = 50000;
+        let p = create_provider(&config).unwrap();
+        assert_eq!(p.current_max_tokens(), 50000);
     }
 }
