@@ -36,6 +36,7 @@
 
 pub mod agent;
 pub mod agents;
+pub mod approval;
 pub mod channels;
 pub mod config;
 pub mod context;

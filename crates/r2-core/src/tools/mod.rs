@@ -56,6 +56,7 @@ impl ToolRegistry {
                     sandbox_cfg.bash_timeout_secs,
                     sandbox,
                     sandbox_cfg.bash_restrict_workdir,
+                    sandbox_cfg.env_clean,
                 )),
             ],
         })

@@ -24,6 +24,9 @@ pub struct HookCtx<'a> {
     pub goal_baseline: Option<&'a str>,
     /// 本轮开始时的技能名快照（TurnEnd 的沉淀记账基线）
     pub skills_baseline: &'a [String],
+    /// 沙箱降级标记（v0.16.0：container 档但 namespaces 不可用；
+    /// 权限门据此把黄级升红级——降级期先紧后松）
+    pub sandbox_degraded: bool,
 }
 
 /// 钩子 trait：全部默认空实现，hook 按需覆盖
@@ -134,6 +137,7 @@ mod tests {
             emitter: None,
             goal_baseline: None,
             skills_baseline: &[],
+            sandbox_degraded: false,
         }
     }
 

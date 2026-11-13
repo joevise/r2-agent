@@ -23,6 +23,12 @@ pub enum AgentEvent {
     UsageUpdate(UsageStats),
     /// 进化事件（反思产出教训/技能变更等——成长可观测的实时流）
     Evolved(String),
+    /// 权限门：黄级命令等待用户授权（v0.16.0；壳层审批 UI 应答入口）
+    ApprovalRequest {
+        id: u64,
+        command: String,
+        reason: String,
+    },
     /// 出错
     Error(String),
 }

@@ -87,6 +87,10 @@ pub fn event_json(event: &AgentEvent) -> Value {
             ("tool_result", json!({"name": name, "output": output}))
         }
         AgentEvent::Steered(instruction) => ("steered", json!({"instruction": instruction})),
+        AgentEvent::ApprovalRequest { id, command, reason } => (
+            "approval_request",
+            json!({"id": id, "command": command, "reason": reason}),
+        ),
         AgentEvent::Done { final_text } => ("done", json!({"final_text": final_text})),
         AgentEvent::UsageUpdate(u) => ("usage_update", json!({
             "input_tokens": u.input_tokens,
@@ -687,6 +691,17 @@ mod tests {
         let v = parse_response(&line);
         assert_eq!(v["params"]["type"], "error");
         assert_eq!(v["params"]["data"]["message"], "炸了");
+
+        // v0.16.0 权限门：审批请求事件转发（壳层审批 UI 的数据源）
+        let line = event_notification(&AgentEvent::ApprovalRequest {
+            id: 7,
+            command: "sudo apt install vim".into(),
+            reason: "提权操作（sudo）".into(),
+        });
+        let v = parse_response(&line);
+        assert_eq!(v["params"]["type"], "approval_request");
+        assert_eq!(v["params"]["data"]["id"], 7);
+        assert_eq!(v["params"]["data"]["command"], "sudo apt install vim");
     }
 
     #[test]

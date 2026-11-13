@@ -18,6 +18,8 @@ pub struct BashTool {
     sandbox: Sandbox,
     /// 高危命令启发式拦截开关（config: sandbox.bash_restrict_workdir）
     restrict_workdir: bool,
+    /// 子进程环境清洗开关（config: sandbox.env_clean，v0.16.0）
+    env_clean: bool,
 }
 
 impl BashTool {
@@ -26,12 +28,14 @@ impl BashTool {
         default_timeout_secs: u64,
         sandbox: Sandbox,
         restrict_workdir: bool,
+        env_clean: bool,
     ) -> Self {
         Self {
             work_dir: PathBuf::from(work_dir),
             default_timeout_secs,
             sandbox,
             restrict_workdir,
+            env_clean,
         }
     }
 }
@@ -159,6 +163,18 @@ impl BashTool {
             // 子进程设为进程组组长，超时可整组 kill
             .process_group(0)
             .kill_on_drop(true);
+
+        // 环境清洗（v0.16.0 权限模型配套）：沙箱内进程不应看到宿主会话管理器
+        // 句柄——systemd-run 借权绕限额依赖 XDG_RUNTIME_DIR/bus，断桥而非封命令。
+        // 关掉 sandbox.env_clean 可回退（特殊场景）
+        if self.env_clean {
+            cmd.env_remove("XDG_RUNTIME_DIR")
+                .env_remove("DBUS_SESSION_BUS_ADDRESS")
+                .env_remove("DBUS_SYSTEM_BUS_ADDRESS")
+                .env_remove("SSH_AUTH_SOCK")
+                .env_remove("XAUTHORITY")
+                .env_remove("DISPLAY");
+        }
 
         // 顺序关键（v0.5.2 双 fork）：先装 rlimits/seccomp 闭包，再装 ns 闭包——
         // pre_exec 按注册序执行，ns 闭包成功路径会 _exit（中间进程），后装的闭包
@@ -394,7 +410,7 @@ mod tests {
             ..Default::default()
         };
         let sandbox = Sandbox::from_config(&cfg).unwrap();
-        BashTool::new(dir.to_str().unwrap(), 30, sandbox, false)
+        BashTool::new(dir.to_str().unwrap(), 30, sandbox, false, false)
     }
 
     /// 开启高危命令拦截的测试工具
@@ -404,7 +420,17 @@ mod tests {
             ..Default::default()
         };
         let sandbox = Sandbox::from_config(&cfg).unwrap();
-        BashTool::new(dir.to_str().unwrap(), 30, sandbox, true)
+        BashTool::new(dir.to_str().unwrap(), 30, sandbox, true, false)
+    }
+
+    /// 指定 env_clean 的测试工具
+    fn make_env_tool(dir: &std::path::Path, env_clean: bool) -> BashTool {
+        let cfg = SandboxConfig {
+            level: "off".to_string(),
+            ..Default::default()
+        };
+        let sandbox = Sandbox::from_config(&cfg).unwrap();
+        BashTool::new(dir.to_str().unwrap(), 30, sandbox, false, env_clean)
     }
 
     #[tokio::test]
@@ -562,10 +588,36 @@ mod tests {
         assert!(result.starts_with("exit_code=0"), "got: {result}");
     }
 
+    /// v0.16.0 环境清洗：子进程看不到宿主会话管理器句柄（systemd-run 断桥）
+    #[tokio::test]
+    async fn test_env_clean_strips_session_handles() {
+        // 环境变量是进程级全局：与改 HOME 的测试共用互斥锁，防并行踩踏
+        let _guard = crate::testutil::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("XDG_RUNTIME_DIR", "/tmp/r2-fake-xdg");
+        std::env::set_var("SSH_AUTH_SOCK", "/tmp/r2-fake-ssh");
+        let tmp = tempfile::tempdir().unwrap();
+
+        let clean = make_env_tool(tmp.path(), true);
+        let r = clean
+            .execute(&serde_json::json!({"command": "echo \"X=[${XDG_RUNTIME_DIR:-unset}] S=[${SSH_AUTH_SOCK:-unset}]\""}))
+            .await;
+        assert!(r.contains("X=[unset] S=[unset]"), "清洗后应为空：{r}");
+
+        let dirty = make_env_tool(tmp.path(), false);
+        let r = dirty
+            .execute(&serde_json::json!({"command": "echo \"X=[${XDG_RUNTIME_DIR:-unset}]\""}))
+            .await;
+        assert!(r.contains("X=[/tmp/r2-fake-xdg]"), "关开关应回退继承：{r}");
+
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        std::env::remove_var("SSH_AUTH_SOCK");
+    }
+
     /// command 参数类型错误（数字/对象而非字符串）→ ERROR 不 panic
     #[tokio::test]
-    async fn test_bash_command_wrong_type() {
-        let tmp = tempfile::tempdir().unwrap();
+    async fn test_bash_command_wrong_type() {        let tmp = tempfile::tempdir().unwrap();
         let tool = make_tool(tmp.path());
         let result = tool.execute(&serde_json::json!({"command": 123})).await;
         assert!(result.starts_with("ERROR: 缺少 command"), "got: {result}");

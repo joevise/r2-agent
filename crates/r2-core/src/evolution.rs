@@ -937,6 +937,7 @@ mod v2_tests {
             emitter: None,
             goal_baseline: None,
             skills_baseline: &[],
+            sandbox_degraded: false,
         };
         // 引用技能 → 落 usage 统计；非技能调用 → 不记
         hook.on_tool_end(
@@ -981,6 +982,7 @@ mod v2_tests {
             emitter: None,
             goal_baseline: None,
             skills_baseline: &[],
+            sandbox_degraded: false,
         };
         hook.on_turn_end(&mut ctx).await;
         assert_eq!(

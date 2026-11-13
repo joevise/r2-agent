@@ -127,6 +127,10 @@ pub struct AgentConfig {
     /// 默认全装 = v0.13 行为等价；分身可在 AGENT.toml 里裁剪。
     #[serde(default = "default_extensions")]
     pub extensions: Vec<String>,
+    /// 权限门开关（v0.16.0）：true 时注册 ApprovalHook——黄级 bash 命令
+    /// 拦下问用户（无审批通道默认拒），红级直接拒。默认开（先紧后松）。
+    #[serde(default = "default_approval_enabled")]
+    pub approval_enabled: bool,
 }
 
 /// 上下文管理配置
@@ -201,6 +205,11 @@ pub struct SandboxConfig {
     /// bash 高危命令启发式拦截（默认关，向后兼容；开启后拦截 rm -rf / 等明显逃逸模式）
     #[serde(default)]
     pub bash_restrict_workdir: bool,
+    /// bash 子进程环境清洗（v0.16.0，默认开）：摘掉宿主会话管理器句柄
+    /// （XDG_RUNTIME_DIR/DBUS/SSH_AUTH_SOCK 等）——systemd-run 借权依赖
+    /// XDG_RUNTIME_DIR/bus，断桥而非封命令；特殊场景可关掉回退
+    #[serde(default = "default_env_clean")]
+    pub env_clean: bool,
 }
 
 /// 会话存储配置
@@ -259,6 +268,14 @@ fn default_max_turns() -> usize {
 }
 fn default_evolution_enabled() -> bool {
     // 默认开启：与 v0.12.x 内嵌行为等价；测试/嵌入宿主显式关闭
+    true
+}
+fn default_approval_enabled() -> bool {
+    // 默认开启：手机权限模型先紧后松（宁可多问）
+    true
+}
+fn default_env_clean() -> bool {
+    // 默认开启：沙箱内进程不应看到宿主会话管理器句柄
     true
 }
 /// 默认 Extension 清单（全装 = v0.13 行为等价）
@@ -373,6 +390,7 @@ impl Default for AgentConfig {
             persona_dir: None,
             evolution_enabled: default_evolution_enabled(),
             extensions: default_extensions(),
+            approval_enabled: default_approval_enabled(),
         }
     }
 }
@@ -412,6 +430,7 @@ impl Default for SandboxConfig {
             cgroup: default_cgroup(),
             cgroup_memory_mb: 0,
             bash_restrict_workdir: false,
+            env_clean: default_env_clean(),
         }
     }
 }
@@ -436,6 +455,12 @@ pub fn expand_tilde(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+/// v0.2 示例老值三特征（max_memory_mb=512 && max_file_size_mb=100 && cpu_time_secs=60）
+/// 同时命中才算疑似旧配置——单项命中可能是用户有意设置，不误报
+fn sandbox_legacy_values_hit(s: &SandboxConfig) -> bool {
+    s.max_memory_mb == 512 && s.max_file_size_mb == 100 && s.cpu_time_secs == 60
 }
 
 impl Config {
@@ -481,6 +506,15 @@ impl Config {
             .into());
         }
         crate::sandbox::SandboxLevel::parse(&self.sandbox.level)?;
+        // v0.2 示例老值迁移提示（v0.16.0）：三特征同时命中 = 疑似旧版示例配置。
+        // 只提示不自动改——用户配置不能静默动
+        if sandbox_legacy_values_hit(&self.sandbox) {
+            eprintln!(
+                "⚠️ sandbox 配置疑似 v0.2 示例老值（max_memory_mb=512 / max_file_size_mb=100 / \
+                 cpu_time_secs=60）：硬限值会误杀现代工具链（node/opencode 级内存常态），\
+                 建议三项改 0（物理护栏走 cgroup_memory_mb）"
+            );
+        }
         self.session.dir = expand_tilde(&self.session.dir);
         self.agent.work_dir = expand_tilde(&self.agent.work_dir);
         self.resolve_auto_budget();
@@ -871,5 +905,42 @@ args = ["mcp-server-fetch"]
         apply_overrides(&mut config, None, None);
         assert_eq!(config.model.openai_compat.model, model_before);
         assert_eq!(config.agent.work_dir, dir_before);
+    }
+
+    /// v0.16.0：approval_enabled / env_clean 默认开 + 旧配置向后兼容
+    #[test]
+    fn test_approval_and_env_clean_defaults() {
+        let config = Config::load_from_str(FULL_TOML).unwrap();
+        assert!(config.agent.approval_enabled, "旧配置缺字段应默认开");
+        assert!(config.sandbox.env_clean, "旧配置缺字段应默认开");
+
+        let toml_str = r#"
+[agent]
+approval_enabled = false
+
+[sandbox]
+env_clean = false
+"#;
+        let config = Config::load_from_str(toml_str).unwrap();
+        assert!(!config.agent.approval_enabled);
+        assert!(!config.sandbox.env_clean);
+    }
+
+    /// v0.16.0 旧配置迁移提示：v0.2 示例三特征同时命中才告警（单项命中不误报）
+    #[test]
+    fn test_sandbox_legacy_values_detection() {
+        let mut s = SandboxConfig {
+            max_memory_mb: 512,
+            max_file_size_mb: 100,
+            cpu_time_secs: 60,
+            ..Default::default()
+        };
+        assert!(sandbox_legacy_values_hit(&s));
+        s.max_memory_mb = 0;
+        assert!(!sandbox_legacy_values_hit(&s), "单项偏离即不报");
+        // FULL_TOML 正是三特征老值：只提示不报错（load 成功，不静默改值）
+        let config = Config::load_from_str(FULL_TOML).unwrap();
+        assert_eq!(config.sandbox.max_memory_mb, 512, "不自动改用户配置");
+        assert_eq!(config.sandbox.cpu_time_secs, 60);
     }
 }

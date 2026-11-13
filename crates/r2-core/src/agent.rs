@@ -291,20 +291,40 @@ pub struct Agent {
     activity: ActivityHandle,
     /// 行为钩子注册表（v0.13.0：核心循环只调点位；evolution 为第一个 hook 实现）
     hooks: crate::hooks::HookRegistry,
+    /// 权限门中枢（v0.16.0：黄级命令的授权请求/三档答复/白名单/留痕）
+    approvals: std::sync::Arc<crate::approval::ApprovalHub>,
+    /// 沙箱降级标记：container 档但 namespaces 不可用（构造时探一次）——
+    /// 权限门据此把黄级升红级
+    sandbox_degraded: bool,
 }
 
 impl Agent {
     /// 组装钩子注册表（v0.14.0）：按清单 resolve extensions 收集 hooks。
     /// evolution_enabled=false（v0.13 兼容开关）时 resolve_for 已过滤掉
     /// evolution extension——反思/草稿/技能追踪全关（测试与嵌入宿主的确定性保障）
-    fn build_hooks(config: &Config) -> crate::hooks::HookRegistry {
+    fn build_hooks(
+        config: &Config,
+        approvals: &std::sync::Arc<crate::approval::ApprovalHub>,
+    ) -> crate::hooks::HookRegistry {
         let mut hooks = crate::hooks::HookRegistry::new();
+        // 权限门（v0.16.0）：approval_enabled 默认 true；先注册先判——
+        // 高危/黄级命令在进化等副业 hook 之前短路
+        if config.agent.approval_enabled {
+            hooks.register(std::sync::Arc::new(crate::approval::ApprovalHook::new(
+                approvals.clone(),
+            )));
+        }
         for ext in crate::extensions::resolve_for(&config.agent) {
             for h in ext.hooks() {
                 hooks.register(h);
             }
         }
         hooks
+    }
+
+    /// 沙箱降级探测（构造时探一次存字段）：container 档但 namespaces 不可用
+    fn probe_sandbox_degraded(config: &Config) -> bool {
+        config.sandbox.level == "container" && !crate::namespaces::can_namespace()
     }
 
     /// 组装工具注册表（v0.14.0）：核心 5 工具恒注册 + 按清单 resolve 的
@@ -347,7 +367,14 @@ impl Agent {
         }
         #[cfg(feature = "l3-memory")]
         let (memory, embedding) = Self::init_memory(&config);
-        let hooks = Self::build_hooks(&config);
+        let approvals = std::sync::Arc::new(crate::approval::ApprovalHub::new());
+        let hooks = Self::build_hooks(&config, &approvals);
+        let sandbox_degraded = Self::probe_sandbox_degraded(&config);
+        if sandbox_degraded {
+            eprintln!(
+                "⚠️ 沙箱降级：namespaces 不可用（userns 被拒），rlimits-only 模式——黄级操作将直接拒绝"
+            );
+        }
         Ok(Self {
             provider,
             context,
@@ -370,6 +397,8 @@ impl Agent {
             last_event_at: std::sync::Arc::new(std::sync::Mutex::new(None)),
             activity: std::sync::Arc::new(std::sync::Mutex::new(None)),
             hooks,
+            approvals,
+            sandbox_degraded,
         })
     }
 
@@ -399,7 +428,9 @@ impl Agent {
         println!("已恢复会话 {session_id}（{count} 条历史消息）");
         #[cfg(feature = "l3-memory")]
         let (memory, embedding) = Self::init_memory(&config);
-        let hooks = Self::build_hooks(&config);
+        let approvals = std::sync::Arc::new(crate::approval::ApprovalHub::new());
+        let hooks = Self::build_hooks(&config, &approvals);
+        let sandbox_degraded = Self::probe_sandbox_degraded(&config);
         let mut agent = Self {
             provider,
             context,
@@ -422,6 +453,8 @@ impl Agent {
             last_event_at: std::sync::Arc::new(std::sync::Mutex::new(None)),
             activity: std::sync::Arc::new(std::sync::Mutex::new(None)),
             hooks,
+            approvals,
+            sandbox_degraded,
         };
         // v0.12.6 持久化第一批 A：重启恢复时补写历史里缺结果的 tool_call
         // （崩溃时结果随进程蒸发，不补则下轮请求协议残废）。幂等。
@@ -460,7 +493,9 @@ impl Agent {
         println!("已从会话 {parent_session_id} 分叉（继承 {count} 条消息，新会话 {new_id}）");
         #[cfg(feature = "l3-memory")]
         let (memory, embedding) = Self::init_memory(&config);
-        let hooks = Self::build_hooks(&config);
+        let approvals = std::sync::Arc::new(crate::approval::ApprovalHub::new());
+        let hooks = Self::build_hooks(&config, &approvals);
+        let sandbox_degraded = Self::probe_sandbox_degraded(&config);
         let mut agent = Self {
             provider,
             context,
@@ -484,6 +519,8 @@ impl Agent {
             last_event_at: std::sync::Arc::new(std::sync::Mutex::new(None)),
             activity: std::sync::Arc::new(std::sync::Mutex::new(None)),
             hooks,
+            approvals,
+            sandbox_degraded,
         };
         // 分支可能复制了父会话的残缺尾部（有 tool_call 无 tool_result）——同 resume 补写
         let patched = agent.interrupt_pending_tools_on_restart();
@@ -496,6 +533,11 @@ impl Agent {
     /// 注入事件广播通道（嵌入方使用；CLI 不调用，输出行为不变）
     pub fn set_emitter(&mut self, emitter: tokio::sync::broadcast::Sender<AgentEvent>) {
         self.emitter = Some(emitter);
+    }
+
+    /// 权限门中枢句柄（v0.16.0；壳层审批 UI 经此答复/订阅——批2 接口）
+    pub fn approvals(&self) -> std::sync::Arc<crate::approval::ApprovalHub> {
+        self.approvals.clone()
     }
 
     /// 注入 steer 通道（AgentSession / CLI 用）：运行中可接收用户中途转向指令
@@ -1084,6 +1126,9 @@ impl Agent {
             }
 
             // 逐个执行工具调用，结果回灌上下文后继续下一轮循环
+            // 权限门需要真实 session_id（session 白名单 keyed by session_id）——
+            // 提前取出避免与 &mut provider 借用冲突
+            let tool_session_id = self.session_id().unwrap_or("").to_string();
             for call in &tool_calls {
                 self.emit(AgentEvent::ToolCall {
                     name: call.name.clone(),
@@ -1097,10 +1142,11 @@ impl Agent {
                         signals: &self.turn_signals,
                         task_summary: "",
                         work_dir: &self.config.agent.work_dir,
-                        session_id: "",
+                        session_id: &tool_session_id,
                         emitter: self.emitter.as_ref(),
                         goal_baseline: None,
                         skills_baseline: &[],
+                        sandbox_degraded: self.sandbox_degraded,
                     };
                     self.hooks.fire_tool_start(call, &ctx).await
                 };
@@ -1123,10 +1169,11 @@ impl Agent {
                         signals: &self.turn_signals,
                         task_summary: "",
                         work_dir: &self.config.agent.work_dir,
-                        session_id: "",
+                        session_id: &tool_session_id,
                         emitter: self.emitter.as_ref(),
                         goal_baseline: None,
                         skills_baseline: &[],
+                        sandbox_degraded: self.sandbox_degraded,
                     };
                     self.hooks.fire_tool_end(call, tool_ok, &ctx).await;
                 }
@@ -1225,6 +1272,7 @@ impl Agent {
             emitter: self.emitter.as_ref(),
             goal_baseline: self.turn_start_goal.as_deref(),
             skills_baseline: &self.turn_start_skills,
+            sandbox_degraded: self.sandbox_degraded,
         };
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -2299,20 +2347,28 @@ mod tests {
 
     #[test]
     fn test_evolution_hook_registered_by_default_and_disabled_by_config() {
-        // 默认注册 EvolutionHook（与 v0.12.x 内嵌行为等价）
+        // 默认注册 ApprovalHook(v0.16.0) + EvolutionHook（与 v0.12.x 内嵌行为等价）
         let tmp = tempfile::tempdir().unwrap();
         let mut config = Config::default_config();
         config.session.dir = tmp.path().to_string_lossy().to_string();
         let agent = Agent::new(config).unwrap();
-        assert_eq!(agent.hooks.len(), 1, "默认应注册 EvolutionHook");
+        assert_eq!(agent.hooks.len(), 2, "默认应注册 ApprovalHook + EvolutionHook");
 
-        // evolution_enabled=false：不注册，注册表为空
+        // evolution_enabled=false：只剩权限门
         let mut config2 = Config::default_config();
         config2.session.dir = tmp.path().to_string_lossy().to_string();
         config2.agent.evolution_enabled = false;
         let agent2 = Agent::new(config2).unwrap();
-        assert_eq!(agent2.hooks.len(), 0);
-        assert!(agent2.hooks.is_empty());
+        assert_eq!(agent2.hooks.len(), 1);
+
+        // approval_enabled=false + evolution_enabled=false：注册表为空
+        let mut config3 = Config::default_config();
+        config3.session.dir = tmp.path().to_string_lossy().to_string();
+        config3.agent.evolution_enabled = false;
+        config3.agent.approval_enabled = false;
+        let agent3 = Agent::new(config3).unwrap();
+        assert_eq!(agent3.hooks.len(), 0);
+        assert!(agent3.hooks.is_empty());
     }
 
     #[tokio::test]
@@ -2419,5 +2475,136 @@ mod tests {
                 && m.content.contains("已被拦截")),
             "拦截文案应作为工具结果：{history:?}"
         );
+    }
+
+    /// 权限门端到端（v0.16.0）：按调用序消费 bash 命令脚本，耗尽后回纯文本
+    struct CmdSeqProvider {
+        calls: Arc<AtomicUsize>,
+        commands: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CmdSeqProvider {
+        fn id(&self) -> &str {
+            "cmd-seq"
+        }
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+        ) -> ModelResult<ChunkStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::Delta("go".to_string())),
+                Ok(StreamChunk::Done),
+            ])))
+        }
+        fn parse_response(&self, chunks: &[StreamChunk]) -> ModelResult<(String, Vec<ToolCall>)> {
+            let idx = self.calls.load(Ordering::SeqCst) - 1;
+            if let Some(cmd) = self.commands.get(idx) {
+                return Ok((
+                    "go".into(),
+                    vec![ToolCall {
+                        id: format!("t{idx}"),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": cmd}).to_string(),
+                    }],
+                ));
+            }
+            Ok(("完成".into(), vec![]))
+        }
+    }
+
+    /// 端到端 fixture：level=off（降级联动不干扰断言）+ tmp HOME（Hub 不碰真实 ~/.r2）
+    fn approval_e2e_agent(tmp: &tempfile::TempDir, commands: Vec<String>) -> (Agent, Arc<AtomicUsize>) {
+        let mut config = Config::default_config();
+        config.session.dir = tmp.path().join("sess").to_string_lossy().to_string();
+        config.agent.work_dir = tmp.path().to_string_lossy().to_string();
+        config.agent.evolution_enabled = false;
+        config.sandbox.level = "off".to_string();
+        let mut agent = Agent::new(config).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        agent.set_provider(Box::new(CmdSeqProvider {
+            calls: calls.clone(),
+            commands,
+        }));
+        agent.set_quiet(true);
+        (agent, calls)
+    }
+
+    /// 黄级命令 + 无审批通道 → 默认拒（文案含"无审批通道"），命令不执行
+    #[tokio::test]
+    async fn test_approval_gate_no_channel_default_deny_e2e() {
+        let _guard = crate::testutil::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let (mut agent, _calls) =
+            approval_e2e_agent(&tmp, vec!["tee DENIED_MARK ~/.bashrc </dev/null".into()]);
+
+        let reply = agent.run("跑").await.expect("run 应成功");
+        assert_eq!(reply, "完成");
+        assert!(
+            !tmp.path().join("DENIED_MARK").exists(),
+            "无通道默认拒：命令不得执行"
+        );
+        let history = agent.context.history();
+        assert!(
+            history
+                .iter()
+                .any(|m| m.role == Role::Tool && m.content.contains("无审批通道")),
+            "工具结果应含无通道文案：{history:?}"
+        );
+        // 留痕：no-channel-deny 落 approvals.log（HOME=tmp）
+        let log = std::fs::read_to_string(tmp.path().join(".r2/approvals.log")).unwrap();
+        assert!(log.contains("no-channel-deny"), "{log}");
+    }
+
+    /// 黄级命令 + 订阅通道 + Allow(Session) → 真执行（marker 落盘）；
+    /// 第二条同规则命令免问直接放行（session 白名单生效，无第二次请求）
+    #[tokio::test]
+    async fn test_approval_gate_session_allow_e2e() {
+        let _guard = crate::testutil::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let (mut agent, _calls) = approval_e2e_agent(
+            &tmp,
+            vec![
+                "tee E2E_MARK1 ~/.bashrc </dev/null".into(),
+                "tee E2E_MARK2 ~/.bashrc </dev/null".into(),
+            ],
+        );
+        let hub = agent.approvals();
+        let mut rx = hub.subscribe();
+        let reqs = Arc::new(AtomicUsize::new(0));
+        let hub2 = hub.clone();
+        let reqs2 = reqs.clone();
+        let resolver = tokio::spawn(async move {
+            while let Ok(req) = rx.recv().await {
+                reqs2.fetch_add(1, Ordering::SeqCst);
+                hub2.resolve(req.id, crate::approval::Decision::Allow(crate::approval::Scope::Session));
+            }
+        });
+
+        agent.run("第一条").await.expect("run1");
+        assert!(tmp.path().join("E2E_MARK1").exists(), "授权后应真执行");
+        assert_eq!(reqs.load(Ordering::SeqCst), 1, "第一条应产生一次审批请求");
+
+        agent.run("第二条").await.expect("run2");
+        assert!(tmp.path().join("E2E_MARK2").exists(), "白名单放行应真执行");
+        assert_eq!(
+            reqs.load(Ordering::SeqCst),
+            1,
+            "第二条同规则命令应免问（session 白名单）"
+        );
+        resolver.abort();
+        // 留痕：allow/session + whitelist 各一条
+        let log = std::fs::read_to_string(tmp.path().join(".r2/approvals.log")).unwrap();
+        assert!(log.contains("\"decision\":\"allow\""), "{log}");
+        assert!(log.contains("\"scope\":\"session\""), "{log}");
+        assert!(log.contains("whitelist"), "{log}");
     }
 }
