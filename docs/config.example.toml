@@ -23,9 +23,11 @@ level = "container"        # off | container | strict（strict 需 --features sa
 bash_timeout_secs = 30
 max_processes = 0          # 进程数上限：同时作用于 RLIMIT_NPROC 与 cgroup pids.max；0 = 不限。
                            # 生产/独占 uid 部署建议 64-256；桌面共享 uid 勿设小值（NPROC 按真实 uid 计数）
-max_memory_mb = 512
-cpu_time_secs = 60
-max_file_size_mb = 100
+max_memory_mb = 0          # RLIMIT_AS 虚拟地址空间：0=不设。JIT（V8/rustc）启动即预留 4-16GB VA，
+                           # 硬限必误伤（512MB 曾让 node/opencode 全灭）；物理护栏用 cgroup_memory_mb
+cpu_time_secs = 0          # RLIMIT_CPU：0=不设（大编译单进程可超 300s CPU；防死循环由 bash_timeout_secs 墙钟兜底）
+max_file_size_mb = 0       # RLIMIT_FSIZE：0=不设（node 117MB/opencode 184MB/模型文件百 MB 是常态，硬限追着包大小改没意义）
+cgroup_memory_mb = 0       # RSS 物理内存护栏（0=不限；物理占用真实计费，不误伤 JIT 的 VA 预留）
 cgroup = true              # cgroup v2 pids 硬限（fork 炸弹防护）；无 root/非 v2 自动降级 rlimits
 bash_restrict_workdir = false  # 高危命令启发式拦截（rm -rf /、| sh、mkfs 等；软层防误操作，非硬隔离）
 
