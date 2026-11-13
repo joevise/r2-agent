@@ -67,6 +67,17 @@ impl AgentSession {
         self.agent.messages()
     }
 
+    /// 权限门中枢句柄（v0.16.1 批2：壳层 /approve /deny 与 console 审批 UI 经此答复）。
+    /// Option 为句柄短暂缺 agent 的窗口预留；正常 Some
+    pub fn approvals(&self) -> Option<std::sync::Arc<crate::approval::ApprovalHub>> {
+        Some(self.agent.approvals())
+    }
+
+    /// 沙箱是否降级（转发内部 agent；降级期黄级操作按红级拒）
+    pub fn sandbox_degraded(&self) -> bool {
+        self.agent.sandbox_degraded()
+    }
+
     pub fn session_id(&self) -> Option<&str> {
         self.agent.session_id()
     }

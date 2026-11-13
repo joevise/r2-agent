@@ -335,6 +335,11 @@ fn state_json(state: &WebState) -> Value {
         Ok(g) => g.as_ref().map(session_history_json),
         Err(_) => None,
     };
+    // v0.16.1：沙箱降级标记（无会话 null；前端据此示一次性警示条）
+    let sandbox_degraded = match state.agent.try_lock() {
+        Ok(g) => g.as_ref().map(|s| s.sandbox_degraded()),
+        Err(_) => None,
+    };
     json!({
         "model": cfg.current_model(),
         // 可切换模型档案（下拉/命令用；只给名字与模型名，绝不带 key）
@@ -369,6 +374,7 @@ fn state_json(state: &WebState) -> Value {
             "extensions": sections.extensions,
         },
         "running": running,
+        "sandbox_degraded": sandbox_degraded,
     })
 }
 
@@ -790,6 +796,34 @@ async fn api_growth() -> Json<Value> {
 /// GET /api/state：完整状态快照
 async fn api_state(State(state): State<Arc<WebState>>) -> Json<Value> {
     Json(state_json(&state))
+}
+
+/// POST /api/approve（v0.16.1 批2 console 审批应答）：
+/// body {id: u64, decision: "allow"|"deny", scope: 1|2|3}（deny 时 scope 忽略）
+/// → {ok:true, resolved:bool}（resolved=false = 请求不存在/已超时）；无会话 {ok:false}
+async fn api_approve(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    use r2_core::approval::{Decision, Scope};
+    let Some(id) = body.get("id").and_then(|v| v.as_u64()) else {
+        return Json(json!({"ok": false, "error": "缺 id"}));
+    };
+    let decision = match body.get("decision").and_then(|v| v.as_str()) {
+        Some("deny") => Decision::Deny,
+        Some("allow") => match body.get("scope").and_then(|v| v.as_u64()).unwrap_or(1) {
+            2 => Decision::Allow(Scope::Session),
+            3 => Decision::Allow(Scope::Forever),
+            _ => Decision::Allow(Scope::Once),
+        },
+        _ => return Json(json!({"ok": false, "error": "decision 须为 allow|deny"})),
+    };
+    // tokio Mutex 短持即放，不跨 await（resolve 是同步锁操作）
+    let hub = state.agent.lock().await.as_ref().and_then(|s| s.approvals());
+    let Some(hub) = hub else {
+        return Json(json!({"ok": false, "error": "无活动会话"}));
+    };
+    Json(json!({"ok": true, "resolved": hub.resolve(id, decision)}))
 }
 
 /// main agent 的固定档案视图（无 AGENT.toml，~/.r2 根即档案）
@@ -1737,6 +1771,9 @@ struct DmSession {
     /// 真死保险丝计数（v0.12.5）：掐断触发续跑前 +1，回合正常完成清零；
     /// >= DM_RESUME_MAX 不再自动续跑，挂起等用户
     resume_count: StdMutex<u32>,
+    /// 权限门中枢（v0.16.1 批2）：/approve /deny 应答入口；与 session 同生命周期，
+    /// /new /model 重建会话后随 steer_tx/activity 一并刷新
+    hub: StdMutex<Option<Arc<r2_core::approval::ApprovalHub>>>,
 }
 
 /// show_process 分档（带序：None < Compact < Full，便于 >= 判断）
@@ -1995,9 +2032,42 @@ async fn dm_slash_command(
     };
     match cmd {
         "/help" => Some(
-            "📋 可用命令：\n             /model [名字] — 查看/切换模型（不带参数列出可用档案）\n             /new — 开启新话题（历史自动归档）\n             /status — 当前模型/会话/通道状态\n             /help — 本帮助\n\n💡 回复进行中直接发消息 = ⚡ 插话转向（不用等它跑完）"
+            "📋 可用命令：\n             /model [名字] — 查看/切换模型（不带参数列出可用档案）\n             /new — 开启新话题（历史自动归档）\n             /status — 当前模型/会话/通道状态\n             /approve <id> [1|2|3] — 放行授权请求（仅此一次/本会话/永远，缺省 1）\n             /deny <id> — 拒绝授权请求\n             /help — 本帮助\n\n💡 回复进行中直接发消息 = ⚡ 插话转向（不用等它跑完）"
                 .to_string(),
         ),
+        "/approve" | "/deny" => {
+            use r2_core::approval::{Decision, Scope};
+            // 解析：/approve <id> [1|2|3]（档位缺省 1）；/deny <id>
+            let mut parts = arg.split_whitespace();
+            let id: Option<u64> = parts.next().and_then(|s| s.parse().ok());
+            let Some(id) = id else {
+                return Some(format!("用法：{cmd} <id>{}", if cmd == "/approve" { " [1|2|3]" } else { "" }));
+            };
+            let decision = if cmd == "/approve" {
+                match parts.next().unwrap_or("1") {
+                    "1" => Decision::Allow(Scope::Once),
+                    "2" => Decision::Allow(Scope::Session),
+                    "3" => Decision::Allow(Scope::Forever),
+                    s => return Some(format!("（未知档位 {s}：1=仅此一次 2=本会话 3=永远）")),
+                }
+            } else {
+                Decision::Deny
+            };
+            let hub = dm_sess.and_then(|d| d.hub.lock().expect("hub 锁中毒").clone());
+            let Some(hub) = hub else {
+                return Some("当前无会话".into());
+            };
+            // resolve 是同步锁操作，无需 await（返回 false = 请求不存在或已超时关闭）
+            if !hub.resolve(id, decision) {
+                return Some("该请求不存在或已超时关闭（300 秒无人应答默认拒）".into());
+            }
+            match decision {
+                Decision::Allow(Scope::Once) => Some(format!("✅ 已放行 #{id}（仅此一次）")),
+                Decision::Allow(Scope::Session) => Some(format!("✅ 已放行 #{id}（本会话）")),
+                Decision::Allow(Scope::Forever) => Some(format!("✅ 已放行 #{id}（永远）")),
+                Decision::Deny => Some(format!("🚫 已拒绝 #{id}，agent 会收到拒绝说明")),
+            }
+        }
         "/status" => {
             let cfg = state.config.lock().expect("config 锁中毒").clone();
             let prof = if cfg.model.active_profile.is_empty() {
@@ -2040,12 +2110,14 @@ async fn dm_slash_command(
                     let sid = s.session_id().map(|x| x[..8.min(x.len())].to_string()).unwrap_or_default();
                     let steer = s.steer_handle();
                     let activity = s.activity_handle();
+                    let hub = s.approvals();
                     if let Some(full) = s.session_id() {
                         write_dm_sid(agent, open_id, full);
                     }
                     *guard = s;
                     *d.steer_tx.lock().expect("steer 锁中毒") = steer;
                     *d.activity.lock().expect("activity 锁中毒") = activity;
+                    *d.hub.lock().expect("hub 锁中毒") = hub;
                     Some(format!("🆕 新话题已开启（{sid}…）——历史已归档，我们从头开始"))
                 }
                 Err(e) => Some(format!("（新建会话失败：{e}）")),
@@ -2105,9 +2177,11 @@ async fn dm_slash_command(
                 Ok(s) => {
                     let steer = s.steer_handle();
                     let activity = s.activity_handle();
+                    let hub = s.approvals();
                     *guard = s;
                     *d.steer_tx.lock().expect("steer 锁中毒") = steer;
                     *d.activity.lock().expect("activity 锁中毒") = activity;
+                    *d.hub.lock().expect("hub 锁中毒") = hub;
                     Some(format!("{msg}\n会话已按新模型重建（历史保留）"))
                 }
                 Err(e) => Some(format!("{msg}\n（会话重建失败：{e}；新消息将新建会话）")),
@@ -2124,6 +2198,17 @@ fn tool_call_summary(name: &str, arguments: &str) -> String {
         args.push('…');
     }
     format!("🔧 {name} {args}")
+}
+
+/// 飞书授权卡文案（v0.16.1 批2，纯函数可测）：命令超长截 300 字符防刷屏
+fn approval_card_text(id: u64, command: &str, reason: &str) -> String {
+    let mut cmd: String = command.chars().take(300).collect();
+    if command.chars().count() > 300 {
+        cmd.push('…');
+    }
+    format!(
+        "🔐 授权请求 #{id}\n命令：{cmd}\n理由：{reason}\n回复应答（300 秒内有效）：\n  /approve {id} 1 — 仅此一次\n  /approve {id} 2 — 本会话内允许\n  /approve {id} 3 — 永远允许\n  /deny {id} — 拒绝"
+    )
 }
 
 /// token 数紧凑格式：999 → 999，1234 → 1.2k，1234567 → 1.2m（状态行用）
@@ -2483,6 +2568,7 @@ async fn get_dm_session(
     state: &Arc<WebState>,
     agent: &str,
     open_id: &str,
+    client: &Arc<FeishuClient>,
 ) -> Result<Arc<DmSession>, String> {
     let key = dm_key(agent, open_id);
     let existing = state
@@ -2507,10 +2593,14 @@ async fn get_dm_session(
     if let Some(sid) = session.session_id() {
         write_dm_sid(agent, open_id, sid);
     }
+    let degraded = session.sandbox_degraded();
+    let hub = session.approvals();
     let mut map = state.dm_sessions.lock().expect("dm 锁中毒");
-    Ok(map
+    let mut inserted = false;
+    let dm = map
         .entry(key)
         .or_insert_with(|| {
+            inserted = true;
             let steer = session.steer_handle();
             let activity = session.activity_handle();
             Arc::new(DmSession {
@@ -2520,9 +2610,25 @@ async fn get_dm_session(
                 steer_tx: StdMutex::new(steer),
                 activity: StdMutex::new(activity),
                 resume_count: StdMutex::new(0),
+                hub: StdMutex::new(hub),
             })
         })
-        .clone())
+        .clone();
+    drop(map);
+    // v0.16.1：沙箱降级一次性提示（entry 只插一次 = 每进程每 DM 一次，重建不重发）
+    if inserted && degraded {
+        let c = client.clone();
+        let oid = open_id.to_string();
+        tokio::spawn(async move {
+            let _ = c
+                .send_text(
+                    &oid,
+                    "⚠️ 沙箱降级提示：本机 namespaces 不可用（userns 被拒），当前 rlimits-only 模式——需要授权的操作将直接拒绝，直至环境修复",
+                )
+                .await;
+        });
+    }
+    Ok(dm)
 }
 
 /// 处理一条飞书 DM：白名单 → 文本校验 → 会话获取 → 排队/prompt → 回复
@@ -2597,7 +2703,7 @@ async fn handle_dm(
         clear_dm_resume_marker(&agent, &dm.open_id);
     }
     // c. 会话获取：每 (agent, open_id) 一个持久 AgentSession
-    let dm_sess = match get_dm_session(&state, &agent, &dm.open_id).await {
+    let dm_sess = match get_dm_session(&state, &agent, &dm.open_id, &client).await {
         Ok(d) => d,
         Err(e) => {
             let _ = client.send_text(&dm.open_id, &e).await;
@@ -2793,7 +2899,7 @@ fn startup_recover_dm(
         let oid2 = oid.clone();
         tokio::spawn(async move {
             // 先懒建会话（resume 指针）；失败记日志跳过，不打扰用户
-            if let Err(e) = get_dm_session(&st2, &agent2, &oid2).await {
+            if let Err(e) = get_dm_session(&st2, &agent2, &oid2, &client2).await {
                 eprintln!("[feishu] 启动续跑建会话失败（{agent2}/{oid2}）：{e}");
                 return;
             }
@@ -2902,6 +3008,12 @@ async fn run_dm_prompt(
                         }
                         AgentEvent::UsageUpdate(u) => {
                             *usnap.lock().unwrap() = Some(u.clone());
+                        }
+                        // 🔐 授权请求（v0.16.1 批2）：发授权卡，用户回 /approve /deny 应答
+                        AgentEvent::ApprovalRequest { id, command, reason } => {
+                            let _ = client2
+                                .send_text(&oid, &approval_card_text(*id, command, reason))
+                                .await;
                         }
                         // ⚡ 插话反馈：note 区瞬时提示（finalize 时被状态行替换）
                         AgentEvent::Steered(_) => {
@@ -4075,6 +4187,7 @@ pub async fn run(config: Config, port: u16, host: String) -> Result<(), Box<dyn 
         .route("/api/growth", get(api_growth))
         .route("/skill_preview", get(skill_preview))
         .route("/api/state", get(api_state))
+        .route("/api/approve", post(api_approve))
         .route("/api/agent-files", get(get_agent_files).post(post_agent_files))
         .route("/ws", get(ws_handler))
         // 请求体上限：upload 上限 + 1MB 表单余量（其余路由 body 都很小，一并覆盖）
@@ -5057,5 +5170,192 @@ mod tests {
         assert!(prompt.contains("聊聊 Q3 预算"));
         assert!(prompt.contains("[DONE]"));
         assert!(prompt.contains("[DELEGATE"));
+    }
+
+    // ═══ v0.16.1 批2：审批应答闭环 ═══
+
+    #[test]
+    fn test_approval_card_text() {
+        let t = approval_card_text(7, "sudo apt install vim", "提权操作（sudo） [规则:sudo]");
+        assert!(t.contains("🔐 授权请求 #7"), "{t}");
+        assert!(t.contains("命令：sudo apt install vim"), "{t}");
+        assert!(t.contains("理由：提权操作"), "{t}");
+        assert!(t.contains("/approve 7 1"), "{t}");
+        assert!(t.contains("/approve 7 2"), "{t}");
+        assert!(t.contains("/approve 7 3"), "{t}");
+        assert!(t.contains("/deny 7"), "{t}");
+        assert!(t.contains("300 秒"), "{t}");
+    }
+
+    #[test]
+    fn test_approval_card_text_truncates_long_command() {
+        let long = "x".repeat(500);
+        let t = approval_card_text(1, &long, "r");
+        // 截 300 字符 + 省略号，绝不含完整 500 字
+        assert!(!t.contains(&long), "超长命令必须截断");
+        assert!(t.contains(&format!("{}…", "x".repeat(300))), "{t}");
+    }
+
+    /// 测试用最小 DmSession（hub 外挂，不起通道）
+    fn make_test_dm_session(
+        sess: AgentSession,
+        hub: Option<Arc<r2_core::approval::ApprovalHub>>,
+    ) -> Arc<DmSession> {
+        let steer = sess.steer_handle();
+        let activity = sess.activity_handle();
+        Arc::new(DmSession {
+            session: Mutex::new(sess),
+            pending: StdMutex::new(VecDeque::new()),
+            steer_tx: StdMutex::new(steer),
+            activity: StdMutex::new(activity),
+            resume_count: StdMutex::new(0),
+            hub: StdMutex::new(hub),
+        })
+    }
+
+    fn test_feishu_client() -> Arc<FeishuClient> {
+        Arc::new(FeishuClient::new(FeishuConfig {
+            app_id: String::new(),
+            app_secret: String::new(),
+            domain: String::new(),
+        }))
+    }
+
+    fn test_agent_session(tmp: &tempfile::TempDir) -> AgentSession {
+        let mut cfg = Config::default_config();
+        cfg.session.dir = tmp.path().join("sessions").to_string_lossy().to_string();
+        cfg.agent.work_dir = tmp.path().to_string_lossy().to_string();
+        AgentSession::new(cfg).expect("建会话应成功")
+    }
+
+    #[tokio::test]
+    async fn test_dm_slash_approve_three_scopes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(make_test_state("/tmp/sessions"));
+        let sess = test_agent_session(&tmp);
+        let hub = sess.approvals().unwrap();
+        let dm = make_test_dm_session(sess, Some(hub.clone()));
+        let client = test_feishu_client();
+        // 登记三条在途请求，分别用 1/2/3 档应答
+        let t1 = hub.request("s", "sudo ls", "r1");
+        let t2 = hub.request("s", "sudo ps", "r2");
+        let t3 = hub.request("s", "npm -g i x", "r3");
+        let r1 = dm_slash_command(&state, "main", Some(&dm), &client, "ou_t", "/approve 1 1").await.unwrap();
+        assert!(r1.contains("已放行 #1（仅此一次）"), "{r1}");
+        let r2 = dm_slash_command(&state, "main", Some(&dm), &client, "ou_t", "/approve 2 2").await.unwrap();
+        assert!(r2.contains("已放行 #2（本会话）"), "{r2}");
+        let r3 = dm_slash_command(&state, "main", Some(&dm), &client, "ou_t", "/approve 3 3").await.unwrap();
+        assert!(r3.contains("已放行 #3（永远）"), "{r3}");
+        use r2_core::approval::{Decision, Scope};
+        assert_eq!(t1.rx.await.unwrap(), Decision::Allow(Scope::Once));
+        assert_eq!(t2.rx.await.unwrap(), Decision::Allow(Scope::Session));
+        assert_eq!(t3.rx.await.unwrap(), Decision::Allow(Scope::Forever));
+        // 档位缺省 = 1
+        let t4 = hub.request("s", "sudo top", "r4");
+        let r4 = dm_slash_command(&state, "main", Some(&dm), &client, "ou_t", "/approve 4").await.unwrap();
+        assert!(r4.contains("仅此一次"), "{r4}");
+        assert_eq!(t4.rx.await.unwrap(), Decision::Allow(Scope::Once));
+        // /deny
+        let t5 = hub.request("s", "sudo kill", "r5");
+        let r5 = dm_slash_command(&state, "main", Some(&dm), &client, "ou_t", "/deny 5").await.unwrap();
+        assert!(r5.contains("已拒绝 #5"), "{r5}");
+        assert_eq!(t5.rx.await.unwrap(), Decision::Deny);
+    }
+
+    #[tokio::test]
+    async fn test_dm_slash_approve_bad_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(make_test_state("/tmp/sessions"));
+        let sess = test_agent_session(&tmp);
+        let hub = sess.approvals().unwrap();
+        let dm = make_test_dm_session(sess, Some(hub.clone()));
+        let client = test_feishu_client();
+        // 缺 id / 非数字 id / 坏档位 / 未知 id
+        let r = dm_slash_command(&state, "main", Some(&dm), &client, "ou_t", "/approve").await.unwrap();
+        assert!(r.contains("用法"), "{r}");
+        let r = dm_slash_command(&state, "main", Some(&dm), &client, "ou_t", "/approve abc").await.unwrap();
+        assert!(r.contains("用法"), "{r}");
+        let r = dm_slash_command(&state, "main", Some(&dm), &client, "ou_t", "/approve 1 9").await.unwrap();
+        assert!(r.contains("未知档位"), "{r}");
+        let r = dm_slash_command(&state, "main", Some(&dm), &client, "ou_t", "/approve 999").await.unwrap();
+        assert!(r.contains("不存在或已超时"), "{r}");
+        let r = dm_slash_command(&state, "main", Some(&dm), &client, "ou_t", "/deny 999").await.unwrap();
+        assert!(r.contains("不存在或已超时"), "{r}");
+        // 无会话（dm_sess None）→ 当前无会话
+        let r = dm_slash_command(&state, "main", None, &client, "ou_t", "/approve 1").await.unwrap();
+        assert!(r.contains("当前无会话"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn test_api_approve_json_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(make_test_state("/tmp/sessions"));
+        // 无会话 → ok:false
+        let v = api_approve(
+            State(state.clone()),
+            Json(json!({"id": 1, "decision": "allow", "scope": 1})),
+        )
+        .await
+        .0;
+        assert_eq!(v["ok"], false);
+        assert!(v["error"].as_str().unwrap().contains("无活动会话"), "{v}");
+        // 装入会话 → resolve 闭环
+        let sess = test_agent_session(&tmp);
+        let hub = sess.approvals().unwrap();
+        *state.agent.lock().await = Some(sess);
+        let t = hub.request("s", "sudo ls", "r");
+        let v = api_approve(
+            State(state.clone()),
+            Json(json!({"id": t.id, "decision": "allow", "scope": 2})),
+        )
+        .await
+        .0;
+        assert_eq!(v, json!({"ok": true, "resolved": true}));
+        assert_eq!(
+            t.rx.await.unwrap(),
+            r2_core::approval::Decision::Allow(r2_core::approval::Scope::Session)
+        );
+        // 已答复的 id 再答 → resolved:false（已超时/不存在）
+        let v = api_approve(
+            State(state.clone()),
+            Json(json!({"id": t.id, "decision": "deny"})),
+        )
+        .await
+        .0;
+        assert_eq!(v, json!({"ok": true, "resolved": false}));
+        // 坏 decision
+        let v = api_approve(
+            State(state.clone()),
+            Json(json!({"id": 1, "decision": "maybe"})),
+        )
+        .await
+        .0;
+        assert_eq!(v["ok"], false);
+    }
+
+    #[test]
+    fn test_state_json_sandbox_degraded_field() {
+        // v0.16.1：/api/state 快照带 sandbox_degraded（无会话 = null）
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default_config();
+        config.session.dir = tmp.path().join("sessions").to_string_lossy().to_string();
+        let (event_tx, _) = broadcast::channel(EVENT_CAPACITY);
+        let state = WebState {
+            tools: vec![],
+            config: StdMutex::new(config),
+            agent: Mutex::new(None),
+            steer_tx: StdMutex::new(None),
+            pending_prompt: StdMutex::new(None),
+            event_tx,
+            session_dir: tmp.path().to_string_lossy().to_string(),
+            work_dir: tmp.path().to_string_lossy().to_string(),
+            current_agent: StdMutex::new(MAIN.to_string()),
+            group_running: StdMutex::new(HashMap::new()),
+            group_seq: StdMutex::new(0),
+            channels: StdMutex::new(HashMap::new()),
+            dm_sessions: StdMutex::new(HashMap::new()),
+        };
+        let v = state_json(&state);
+        assert!(v["sandbox_degraded"].is_null(), "{v}");
     }
 }

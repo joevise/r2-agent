@@ -540,6 +540,11 @@ impl Agent {
         self.approvals.clone()
     }
 
+    /// 沙箱是否降级（namespaces 不可用 → rlimits-only，黄级操作按红级拒）
+    pub fn sandbox_degraded(&self) -> bool {
+        self.sandbox_degraded
+    }
+
     /// 注入 steer 通道（AgentSession / CLI 用）：运行中可接收用户中途转向指令
     pub fn set_steer_channel(&mut self, rx: tokio::sync::mpsc::Receiver<String>) {
         self.steer_rx = Some(rx);

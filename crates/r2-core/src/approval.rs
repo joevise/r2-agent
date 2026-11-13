@@ -381,11 +381,15 @@ impl ApprovalHub {
         }
     }
 
-    /// 壳层/测试答复入口
-    pub fn resolve(&self, id: u64, d: Decision) {
+    /// 壳层/测试答复入口。返回 false = 该请求不存在或已超时关闭（调用方据此回执）
+    pub fn resolve(&self, id: u64, d: Decision) -> bool {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(tx) = inner.pending_map.remove(&id) {
-            let _ = tx.send(d);
+        match inner.pending_map.remove(&id) {
+            Some(tx) => {
+                let _ = tx.send(d);
+                true
+            }
+            None => false,
         }
     }
 
@@ -850,8 +854,20 @@ mod tests {
         assert_eq!(req.command, "sudo ls");
         hub.resolve(1, Decision::Allow(Scope::Once));
         assert_eq!(t.rx.await.unwrap(), Decision::Allow(Scope::Once));
-        // 未知 id 答复不 panic
-        hub.resolve(999, Decision::Deny);
+        // 未知 id 答复不 panic，返回 false（已超时/不存在）
+        assert!(!hub.resolve(999, Decision::Deny));
+    }
+
+    #[tokio::test]
+    async fn test_hub_resolve_returns_bool() {
+        // v0.16.1 批2：resolve 返回值供壳层回执「已放行」vs「不存在/已超时」
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = temp_hub(&tmp);
+        let _rx = hub.subscribe();
+        let t = hub.request("s1", "sudo ls", "提权");
+        assert!(hub.resolve(t.id, Decision::Deny));
+        // 同一 id 二次答复 = 已关闭
+        assert!(!hub.resolve(t.id, Decision::Allow(Scope::Once)));
     }
 
     #[test]

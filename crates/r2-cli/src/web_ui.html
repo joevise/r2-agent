@@ -74,6 +74,19 @@ textarea[readonly]{color:var(--dim)}
 .taskcard button.ok{border-color:#3a6045;color:#7ad0a0}
 .taskcard button.no{border-color:#6a3535;color:#e08080}
 .taskcard button:hover{background:#1a2332}
+/* 授权请求横幅（v0.16.1 批2：叠放栈，顶部） */
+#aprvbox{position:sticky;top:0;z-index:30}
+.aprv{border:1px solid #6a5535;border-radius:8px;padding:10px 14px;margin:8px;background:#1d1a12}
+.aprv .aname{font-weight:bold;color:#e0b070}
+.aprv .acmd{font-size:12.5px;color:var(--fg);border-left:2px solid var(--line);padding-left:8px;margin:6px 0;word-break:break-all;white-space:pre-wrap}
+.aprv .arsn{font-size:12px;color:var(--dim);margin:4px 0}
+.aprv .abtns{display:flex;gap:8px;margin-top:6px;flex-wrap:wrap}
+.aprv button{cursor:pointer;border:1px solid var(--line);background:transparent;color:var(--fg);border-radius:6px;padding:4px 14px;font-size:12.5px}
+.aprv button.ok{border-color:#3a6045;color:#7ad0a0}
+.aprv button.no{border-color:#6a3535;color:#e08080}
+.aprv button:hover{background:#1a2332}
+/* 沙箱降级警示条（一次性） */
+#degbar{display:none;border:1px solid #6a3535;background:#1d1212;color:#e08080;font-size:12.5px;padding:8px 14px;margin:8px;border-radius:8px}
 .gtask{border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:8px;font-size:12.5px}
 .gtask .st{font-size:11px;border:1px solid var(--line);border-radius:10px;padding:0 6px;margin-left:6px}
 .gtask .st.active{color:#7ad0a0;border-color:#3a6045}
@@ -345,6 +358,8 @@ textarea[readonly]{color:var(--dim)}
     <span id="sandbox">SANDBOX: —</span>
   </div>
   <div id="flowwrap">
+    <div id="degbar">⚠️ 沙箱降级：rlimits-only 模式，黄级操作直接拒绝</div>
+    <div id="aprvbox"></div>
     <div id="groupbar"></div>
     <div id="flow"></div>
     <div id="scrollhint">↓ 新消息</div>
@@ -591,6 +606,8 @@ function applyState(st){
   store.agents=st.agents||[];store.currentAgent=st.current_agent||"main";
   store.channels=st.channels||[];
   renderAgentSel();renderAgentList();renderAgentBadge();
+  /* v0.16.1：沙箱降级一次性警示条（true 才示；null/false 不示） */
+  if(st.sandbox_degraded===true)$("#degbar").style.display="block";
   if(store.tab==="channel")renderChannelList();
   setRunning(!!st.running);
   tryRestoreGroup();
@@ -1292,6 +1309,32 @@ function renderTaskCard(t){
   d.querySelector(".no").onclick=()=>{wsSend({t:"task_reject",id:t.id});d.querySelector(".tname").textContent="已拒绝";d.querySelector(".tbtns").remove()};
   flow.appendChild(d);scrollBottom();
 }
+/* 授权请求横幅（v0.16.1 批2）：approval_request 事件 → 顶部叠放卡 → POST /api/approve */
+function renderApproval(d){
+  const box=$("#aprvbox");if(!box)return;
+  const id=d.id;
+  const el=document.createElement("div");el.className="aprv";
+  el.innerHTML='<div class="aname">🔐 授权请求 #'+id+'</div>'
+    +'<div class="acmd">'+esc(d.command||"")+'</div>'
+    +'<div class="arsn">'+esc(d.reason||"")+'</div>'
+    +'<div class="abtns">'
+    +'<button class="ok" data-s="1">仅此一次</button>'
+    +'<button class="ok" data-s="2">本会话</button>'
+    +'<button class="ok" data-s="3">永远允许</button>'
+    +'<button class="no" data-s="0">拒绝</button></div>';
+  el.querySelectorAll("button").forEach(b=>b.onclick=async()=>{
+    const s=+b.dataset.s;
+    try{
+      const r=await fetch("/api/approve",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify(s?{id,decision:"allow",scope:s}:{id,decision:"deny"})});
+      const j=await r.json();
+      if(j.ok&&j.resolved){el.remove()}
+      else if(j.ok){el.querySelector(".arsn").textContent="该请求已超时关闭";el.querySelector(".abtns").remove()}
+      else{el.querySelector(".arsn").textContent=j.error||"应答失败"}
+    }catch(e){el.querySelector(".arsn").textContent="网络错误，请重试"}
+  });
+  box.appendChild(el);
+}
 /* 会话历史回放（切换/分叉/浏览器刷新） */
 function renderHistory(h){
   clearFlow();
@@ -1349,6 +1392,7 @@ function onEvent(evt){
     case"tool_call":thinkDone();onToolCall(d.name||"?",d.arguments);turnGotContent=true;break;
     case"tool_result":onToolResult(d.name||"?",d.output);turnGotContent=true;break;
     case"steered":addLine("msg-sys","⌁ steer: "+esc(d.instruction||""));break;
+    case"approval_request":renderApproval(d);break;
     case"evolved":addLine("msg-sys","🌱 "+esc(d.text||""));break;
     case"notice":addLine("msg-sys","⏳ "+esc(d.text||""));break;
     case"queued_prompt":addLine("msg-sys",esc(evt.message||d.message||"⏳ 已排队，即将自动发送"));break;
