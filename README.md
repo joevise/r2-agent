@@ -97,10 +97,28 @@ app_secret = ""
 每个分身绑定一个飞书自建应用（WebSocket 长连接，无需公网回调 / HTTPS / Nginx）：
 
 - **私聊**：直接和分身对话，CardKit 流式卡片实时渲染
-- **斜杠命令**：`/model`（切模型档案，会话原地重建保历史）/ `/new`（新会话）/ `/status` / `/help`
+- **斜杠命令**：`/model`（切模型档案，会话原地重建保历史）/ `/new`（新会话）/ `/status` / `/restart`（官方重启）/ `/help`
 - **steer 插话**：生成过程中发消息 = 中途转向，注入当前流；收尾窗口残留自动补投，绝不静默丢弃
 - **文件 / 图片 / post 富文本**：全部接收——文件落 `work/uploads/`，富文本自动拍平为纯文本进对话
 - **会话续接**：DM 会话 ID 落盘（`dm/<open_id>.sid`），R2 重启后继续原会话
+
+## 部署与重启
+
+重启走**官方通道**（v0.17.0）：飞书 `/restart`、Console 顶栏 🔄 按钮、或 agent 的 `restart` 工具。
+进程 **exec 自替换**（PID 不变、不依赖外部管理器），重启前 graceful 收尾（等在途回合 ≤10s、
+停飞书通道、停 MCP 子进程），重启后自动恢复会话与未完成任务并回报。配置改动（模型等）随之生效。
+**不要**用 `kill` / `pkill` / `systemctl stop` 直接杀进程——权限门会拦（黄级 `host-restart` 规则），
+裸杀没有收尾与恢复，会失联。
+
+systemd 部署建议加 `Restart=always` 兜底（防崩溃场景；exec 自替换是主通道，不依赖它）：
+
+```ini
+# /etc/systemd/system/r2.service（示例）
+[Service]
+ExecStart=/usr/local/bin/r2 web --port 8686
+Restart=always        # 兜底：进程崩溃/被杀时由 systemd 拉起
+RestartSec=2
+```
 
 ## 多分身与 MCP
 

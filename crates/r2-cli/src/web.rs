@@ -64,6 +64,11 @@ struct WebState {
     /// 飞书 DM 会话：key = "agent|open_id" → 会话槽。
     /// 与 state.agent 主槽位完全隔离：main console 会话不受任何影响。
     dm_sessions: StdMutex<HashMap<String, Arc<DmSession>>>,
+    /// v0.17.0 重启防重入：true = 已有重启在收尾/执行中
+    restarting: std::sync::atomic::AtomicBool,
+    /// v0.17.0 重启回报上下文（重启前 marker 恢复）：(reason, 回报方式)，
+    /// 通道首次 Connected 后消费（take 一次性）
+    restart_ctx: StdMutex<Option<(String, RestartNotify)>>,
 }
 
 /// 当前 agent 名
@@ -824,6 +829,23 @@ async fn api_approve(
         return Json(json!({"ok": false, "error": "无活动会话"}));
     };
     Json(json!({"ok": true, "resolved": hub.resolve(id, decision)}))
+}
+
+/// POST /api/restart（v0.17.0 console 重启按钮）：body {reason?} → {ok:true}；
+/// 已有重启在进行时 {ok:false, error:"restarting"}
+async fn api_restart(
+    State(state): State<Arc<WebState>>,
+    body: Option<Json<Value>>,
+) -> Json<Value> {
+    let reason = body
+        .and_then(|Json(v)| v.get("reason").and_then(|r| r.as_str()).map(String::from))
+        .unwrap_or_else(|| "console /api/restart".to_string());
+    let ok = schedule_restart(&state, &reason, RestartNotify::Console).await;
+    if ok {
+        Json(json!({"ok": true}))
+    } else {
+        Json(json!({"ok": false, "error": "已有重启在进行中"}))
+    }
 }
 
 /// main agent 的固定档案视图（无 AGENT.toml，~/.r2 根即档案）
@@ -2032,7 +2054,7 @@ async fn dm_slash_command(
     };
     match cmd {
         "/help" => Some(
-            "📋 可用命令：\n             /model [名字] — 查看/切换模型（不带参数列出可用档案）\n             /new — 开启新话题（历史自动归档）\n             /status — 当前模型/会话/通道状态\n             /approve <id> [1|2|3] — 放行授权请求（仅此一次/本会话/永远，缺省 1）\n             /deny <id> — 拒绝授权请求\n             /help — 本帮助\n\n💡 回复进行中直接发消息 = ⚡ 插话转向（不用等它跑完）"
+            "📋 可用命令：\n             /model [名字] — 查看/切换模型（不带参数列出可用档案）\n             /new — 开启新话题（历史自动归档）\n             /status — 当前模型/会话/通道状态\n             /approve <id> [1|2|3] — 放行授权请求（仅此一次/本会话/永远，缺省 1）\n             /deny <id> — 拒绝授权请求\n             /restart — 重启服务（配置改动生效，未完成任务自动续跑）\n             /help — 本帮助\n\n💡 回复进行中直接发消息 = ⚡ 插话转向（不用等它跑完）"
                 .to_string(),
         ),
         "/approve" | "/deny" => {
@@ -2067,6 +2089,26 @@ async fn dm_slash_command(
                 Decision::Allow(Scope::Forever) => Some(format!("✅ 已放行 #{id}（永远）")),
                 Decision::Deny => Some(format!("🚫 已拒绝 #{id}，agent 会收到拒绝说明")),
             }
+        }
+        "/restart" => {
+            // v0.17.0 官方重启通道：回执由调用方在本函数返回后发出，
+            // fire 层本身有最多 10s 的在途等待，回执必然先于 exec 送达
+            let reason = if arg.is_empty() {
+                "手动 /restart".to_string()
+            } else {
+                format!("手动 /restart：{arg}")
+            };
+            let ok = schedule_restart(
+                state,
+                &reason,
+                RestartNotify::Feishu(open_id.to_string()),
+            )
+            .await;
+            Some(if ok {
+                "🔄 正在重启——几秒后恢复，未完成任务自动续跑".to_string()
+            } else {
+                "（已有重启在进行中，无需重复触发）".to_string()
+            })
         }
         "/status" => {
             let cfg = state.config.lock().expect("config 锁中毒").clone();
@@ -2545,6 +2587,9 @@ fn start_feishu_channels(state: &Arc<WebState>) {
                 // 只触发一次：重连的 Connected 不重复扫
                 if first_connected {
                     startup_recover_dm(&st_recover, &agent_recover, &cf_recover, &client_recover);
+                    // v0.17.0：重启自愈回报（marker 有 Feishu 回报上下文时发「✅ 重启完成」，
+                    // 一次性 take；与 startup_recover_dm 互不干扰——残缺回合续跑是它的事）
+                    maybe_report_restart(&st_recover, &client_recover);
                 }
             }),
         );
@@ -4151,6 +4196,239 @@ fn redirect_stdio_to_log() {
     }
 }
 
+// ═══ v0.17.0 官方重启通道：marker + plan/fire 分层调度 ═══
+//
+// 分层原则：plan 层（防重入 + marker 落盘）可测；fire 层（graceful 收尾 +
+// exec 自替换）绝不进测试——测试不真 exec、不真停通道。
+
+/// 重启回报方式：重启完成后「✅ 重启完成」发给谁
+#[derive(Debug, Clone, PartialEq)]
+enum RestartNotify {
+    /// 飞书 DM（值为回报对象 open_id；需等通道首次 Connected 后发出）
+    Feishu(String),
+    /// Console 触发（前端 WS 重连/refetchState 天然恢复，只记日志）
+    Console,
+    /// agent restart 工具触发（回报由会话续跑机制覆盖，不额外发消息）
+    Silent,
+}
+
+impl RestartNotify {
+    fn to_json(&self) -> Value {
+        match self {
+            RestartNotify::Feishu(oid) => json!({"t": "feishu", "open_id": oid}),
+            RestartNotify::Console => json!({"t": "console"}),
+            RestartNotify::Silent => json!({"t": "silent"}),
+        }
+    }
+    fn from_json(v: &Value) -> Option<Self> {
+        match v.get("t").and_then(|t| t.as_str()) {
+            Some("feishu") => Some(RestartNotify::Feishu(
+                v.get("open_id")?.as_str()?.to_string(),
+            )),
+            Some("console") => Some(RestartNotify::Console),
+            Some("silent") => Some(RestartNotify::Silent),
+            _ => None,
+        }
+    }
+}
+
+/// 重启 marker 默认路径（~/.r2/restart.marker）
+fn restart_marker_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join(".r2/restart.marker")
+}
+
+/// marker 落盘（原子：临时文件 + rename）
+fn write_restart_marker_to(
+    path: &Path,
+    reason: &str,
+    notify: &RestartNotify,
+) -> Result<(), String> {
+    let body = json!({
+        "ts": now_ts(),
+        "reason": reason,
+        "notify": notify.to_json(),
+    })
+    .to_string();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("建目录失败：{e}"))?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, body)
+        .and_then(|_| std::fs::rename(&tmp, path))
+        .map_err(|e| format!("marker 落盘失败（{}）：{e}", path.display()))
+}
+
+/// 读 marker（损坏容错：读不出/解析失败 → None——回报是锦上添花，不阻塞启动）
+fn read_restart_marker_from(path: &Path) -> Option<(String, RestartNotify)> {
+    let body = std::fs::read_to_string(path).ok()?;
+    let v: Value = serde_json::from_str(&body).ok()?;
+    let reason = v.get("reason")?.as_str()?.to_string();
+    let notify = RestartNotify::from_json(v.get("notify")?)?;
+    Some((reason, notify))
+}
+
+/// 删 marker（幂等：不存在不算错）
+fn clear_restart_marker_at(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("[restart] marker 删除失败（{}）：{e}", path.display()),
+    }
+}
+
+/// plan 层：防重入 + marker 落盘。返回 false = 已有重启在进行或落盘失败
+fn schedule_restart_plan(
+    state: &Arc<WebState>,
+    marker_path: &Path,
+    reason: &str,
+    notify: &RestartNotify,
+) -> bool {
+    if state
+        .restarting
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return false;
+    }
+    if let Err(e) = write_restart_marker_to(marker_path, reason, notify) {
+        eprintln!("[restart] {e}，取消本次重启");
+        state
+            .restarting
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        return false;
+    }
+    true
+}
+
+/// 统一重启调度入口（三入口共用）：plan 通过后 spawn fire 任务
+async fn schedule_restart(state: &Arc<WebState>, reason: &str, notify: RestartNotify) -> bool {
+    if !schedule_restart_plan(state, &restart_marker_path(), reason, &notify) {
+        return false;
+    }
+    eprintln!("[restart] 重启已调度（原因：{reason}，回报：{:?}）", notify);
+    let st = state.clone();
+    tokio::spawn(async move { fire_restart(st).await });
+    true
+}
+
+/// fire 层：graceful 收尾 → exec 自替换。**绝不进测试**（不真 exec/真停通道）。
+async fn fire_restart(state: Arc<WebState>) {
+    // 1. 等在途回合收尾：主会话 + 全部 DM 会话锁可得 = 空闲；上限 10s 到点照样重启
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let main_idle = state.agent.try_lock().is_ok();
+        let dm_idle = state
+            .dm_sessions
+            .lock()
+            .expect("dm 锁中毒")
+            .values()
+            .all(|d| d.session.try_lock().is_ok());
+        if main_idle && dm_idle {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!("[restart] 等待在途回合超时（10s），强制继续重启");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // 2. 停全部飞书通道（幂等 stop：置 stop_flag + abort ws 任务）
+    {
+        let table = state.channels.lock().expect("通道锁中毒");
+        for (name, rt) in table.iter() {
+            rt.client.stop();
+            eprintln!("[restart] 通道 {name} 已停止");
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // 3. 显式停 MCP 子进程：exec 不跑 Drop，McpConnection 的 child.kill 不会执行。
+    //    兜底：Rust std 对所有 fd 默认 CLOEXEC，exec 时父侧 stdin 管道关闭，
+    //    守规矩的 stdio MCP server 收到 EOF 也会自退
+    if let Some(sess) = state.agent.lock().await.as_ref() {
+        sess.shutdown_mcp();
+    }
+    for d in state.dm_sessions.lock().expect("dm 锁中毒").values() {
+        if let Ok(g) = d.session.try_lock() {
+            g.shutdown_mcp();
+        }
+    }
+    // 4. exec 自替换（进程映替换，PID 不变，不依赖外部管理器）。
+    //    必须独立线程：async 上下文 exec 会卡 runtime。
+    //    argv[0] 用 current_exe()：systemd PATH 环境可能不同
+    eprintln!("[restart] 执行 exec 自替换…");
+    let st2 = state.clone();
+    std::thread::spawn(move || {
+        use std::os::unix::process::CommandExt;
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        match std::env::current_exe() {
+            Ok(exe) => {
+                let err = std::process::Command::new(exe).args(&args).exec();
+                // exec 成功不返回；走到这里 = 失败
+                eprintln!("[restart] exec 失败：{err}");
+            }
+            Err(e) => eprintln!("[restart] current_exe 失败：{e}"),
+        }
+        // exec 失败恢复防重入 flag（进程还活着，允许再次触发重启）
+        st2.restarting
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+/// host 信号泵（web 启动时 spawn）：restart 工具 → host::request → 本泵消费。
+/// watch 只存最新值，重复请求天然去重；restarting flag 再兜底一次。
+fn spawn_restart_signal_pump(state: &Arc<WebState>) {
+    let st = state.clone();
+    tokio::spawn(async move {
+        let mut rx = r2_core::host::subscribe();
+        loop {
+            if rx.changed().await.is_err() {
+                break; // 发送端永不 drop，正常走不到
+            }
+            let reason = rx.borrow().clone();
+            if let Some(r) = reason {
+                schedule_restart(&st, &r, RestartNotify::Silent).await;
+            }
+        }
+    });
+}
+
+/// 启动时恢复重启 marker（v0.17.0 自愈回报）：读入 restart_ctx 等通道首次
+/// Connected 回报；Console/Silent 无需通道，直接记日志 + 删 marker。
+fn restore_restart_ctx(state: &Arc<WebState>) {
+    let path = restart_marker_path();
+    let Some((reason, notify)) = read_restart_marker_from(&path) else {
+        return;
+    };
+    match &notify {
+        RestartNotify::Feishu(_) => {
+            *state.restart_ctx.lock().expect("restart_ctx 锁中毒") = Some((reason, notify));
+        }
+        other => {
+            eprintln!("[restart] 重启完成（原因：{reason}，回报：{other:?}）");
+            clear_restart_marker_at(&path);
+        }
+    }
+}
+
+/// 通道首次 Connected 后的重启回报（与 startup_recover_dm 同钩子位）：
+/// Feishu(open_id) → 发完成通知 → 删 marker。一次性（take 语义）。
+fn maybe_report_restart(state: &Arc<WebState>, client: &Arc<FeishuClient>) {
+    let ctx = state.restart_ctx.lock().expect("restart_ctx 锁中毒").take();
+    let Some((reason, RestartNotify::Feishu(open_id))) = ctx else {
+        return;
+    };
+    clear_restart_marker_at(&restart_marker_path());
+    let c = client.clone();
+    tokio::spawn(async move {
+        let _ = c
+            .send_text(
+                &open_id,
+                &format!("✅ 重启完成（原因：{reason}）。会话与未完成任务已自动恢复。"),
+            )
+            .await;
+    });
+}
+
 pub async fn run(config: Config, port: u16, host: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     redirect_stdio_to_log();
     let session_dir = config::expand_tilde(&config.session.dir);
@@ -4174,10 +4452,16 @@ pub async fn run(config: Config, port: u16, host: String) -> Result<(), Box<dyn 
         group_seq: StdMutex::new(0),
         channels: StdMutex::new(HashMap::new()),
         dm_sessions: StdMutex::new(HashMap::new()),
+        restarting: std::sync::atomic::AtomicBool::new(false),
+        restart_ctx: StdMutex::new(None),
     });
 
     // 调度器/通道先克隆再建路由（with_state 会 move state）
     spawn_scheduler(state.clone());
+    // v0.17.0：host 重启信号泵（restart 工具 → 统一调度）
+    spawn_restart_signal_pump(&state);
+    // v0.17.0：重启 marker 恢复（Feishu 回报等通道首次 Connected；Console/Silent 直接删）
+    restore_restart_ctx(&state);
     let state_channels = state.clone();
     let app = Router::new()
         .route("/", get(index))
@@ -4188,6 +4472,7 @@ pub async fn run(config: Config, port: u16, host: String) -> Result<(), Box<dyn 
         .route("/skill_preview", get(skill_preview))
         .route("/api/state", get(api_state))
         .route("/api/approve", post(api_approve))
+        .route("/api/restart", post(api_restart))
         .route("/api/agent-files", get(get_agent_files).post(post_agent_files))
         .route("/ws", get(ws_handler))
         // 请求体上限：upload 上限 + 1MB 表单余量（其余路由 body 都很小，一并覆盖）
@@ -4780,6 +5065,8 @@ mod tests {
             group_seq: StdMutex::new(0),
             channels: StdMutex::new(HashMap::new()),
             dm_sessions: StdMutex::new(HashMap::new()),
+            restarting: std::sync::atomic::AtomicBool::new(false),
+            restart_ctx: StdMutex::new(None),
         };
         assert_eq!(session_dir_for(&state), "/main/sessions");
         *state.current_agent.lock().unwrap() = "cfo".to_string();
@@ -4823,6 +5110,8 @@ mod tests {
             group_seq: StdMutex::new(0),
             channels: StdMutex::new(HashMap::new()),
             dm_sessions: StdMutex::new(HashMap::new()),
+            restarting: std::sync::atomic::AtomicBool::new(false),
+            restart_ctx: StdMutex::new(None),
         };
         let v = state_json(&state);
         assert!(v["model"].is_string());
@@ -4857,6 +5146,8 @@ mod tests {
             group_seq: StdMutex::new(0),
             channels: StdMutex::new(HashMap::new()),
             dm_sessions: StdMutex::new(HashMap::new()),
+            restarting: std::sync::atomic::AtomicBool::new(false),
+            restart_ctx: StdMutex::new(None),
         }
     }
 
@@ -5354,8 +5645,129 @@ mod tests {
             group_seq: StdMutex::new(0),
             channels: StdMutex::new(HashMap::new()),
             dm_sessions: StdMutex::new(HashMap::new()),
+            restarting: std::sync::atomic::AtomicBool::new(false),
+            restart_ctx: StdMutex::new(None),
         };
         let v = state_json(&state);
         assert!(v["sandbox_degraded"].is_null(), "{v}");
+    }
+
+    // ═══ v0.17.0 重启通道：marker 与 plan 层测试（fire 层不进测试）═══
+
+    #[test]
+    fn test_restart_marker_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".r2/restart.marker");
+        // 三种 notify 往返
+        for notify in [
+            RestartNotify::Feishu("ou_x".to_string()),
+            RestartNotify::Console,
+            RestartNotify::Silent,
+        ] {
+            write_restart_marker_to(&path, "原因A", &notify).unwrap();
+            let (reason, got) = read_restart_marker_from(&path).unwrap();
+            assert_eq!(reason, "原因A");
+            assert_eq!(got, notify);
+        }
+        // 原子写不残留临时文件
+        assert!(!path.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn test_restart_marker_corrupt_and_missing_tolerant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("restart.marker");
+        // 不存在 → None
+        assert!(read_restart_marker_from(&path).is_none());
+        // 损坏 JSON → None
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(read_restart_marker_from(&path).is_none());
+        // 缺字段 → None
+        std::fs::write(&path, r#"{"ts":1}"#).unwrap();
+        assert!(read_restart_marker_from(&path).is_none());
+        // notify 类型未知 → None
+        std::fs::write(&path, r#"{"ts":1,"reason":"r","notify":{"t":"pigeon"}}"#).unwrap();
+        assert!(read_restart_marker_from(&path).is_none());
+    }
+
+    #[test]
+    fn test_clear_restart_marker_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("restart.marker");
+        // 不存在时删 = 无错
+        clear_restart_marker_at(&path);
+        write_restart_marker_to(&path, "r", &RestartNotify::Silent).unwrap();
+        assert!(path.exists());
+        clear_restart_marker_at(&path);
+        assert!(!path.exists());
+        // 再删一次仍无错（幂等）
+        clear_restart_marker_at(&path);
+    }
+
+    #[tokio::test]
+    async fn test_schedule_restart_plan_reentrant_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("restart.marker");
+        let state = Arc::new(make_test_state("/tmp/sessions"));
+        // 第一次成功 + marker 落盘
+        assert!(schedule_restart_plan(
+            &state,
+            &marker,
+            "第一次",
+            &RestartNotify::Console
+        ));
+        let (reason, notify) = read_restart_marker_from(&marker).unwrap();
+        assert_eq!(reason, "第一次");
+        assert_eq!(notify, RestartNotify::Console);
+        // 第二次被防重入拦下（false），marker 不被覆盖
+        assert!(!schedule_restart_plan(
+            &state,
+            &marker,
+            "第二次",
+            &RestartNotify::Silent
+        ));
+        let (reason, _) = read_restart_marker_from(&marker).unwrap();
+        assert_eq!(reason, "第一次");
+        // flag 复位后可再调度（模拟 exec 失败恢复路径）
+        state
+            .restarting
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(schedule_restart_plan(
+            &state,
+            &marker,
+            "第三次",
+            &RestartNotify::Silent
+        ));
+    }
+
+    #[test]
+    fn test_restore_restart_ctx_console_clears_marker() {
+        // Console/Silent：restore 时直接删 marker，不进 restart_ctx
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let old_home = std::env::var("HOME").unwrap_or_default();
+        std::env::set_var("HOME", tmp.path());
+        let state = Arc::new(make_test_state("/tmp/sessions"));
+        write_restart_marker_to(
+            &restart_marker_path(),
+            "console 触发",
+            &RestartNotify::Console,
+        )
+        .unwrap();
+        restore_restart_ctx(&state);
+        assert!(!restart_marker_path().exists());
+        assert!(state.restart_ctx.lock().unwrap().is_none());
+        // Feishu：进 restart_ctx 等 Connected 回报，marker 保留
+        write_restart_marker_to(
+            &restart_marker_path(),
+            "飞书触发",
+            &RestartNotify::Feishu("ou_r".into()),
+        )
+        .unwrap();
+        restore_restart_ctx(&state);
+        assert!(restart_marker_path().exists());
+        let ctx = state.restart_ctx.lock().unwrap().clone();
+        assert_eq!(ctx, Some(("飞书触发".to_string(), RestartNotify::Feishu("ou_r".into()))));
+        std::env::set_var("HOME", old_home);
     }
 }

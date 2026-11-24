@@ -116,6 +116,22 @@ fn classify_segment(segment: &str) -> Option<(String, String)> {
     let toks = tokens(segment);
     let first = toks.first().copied().unwrap_or("");
 
+    // v0.17.0 防裸自杀：直接 stop/restart/kill R2 进程 → 引导官方重启通道
+    //（restart 工具 / 飞书 /restart / Console 按钮：graceful 收尾 + 重启后自动恢复）。
+    // 判定在提权词之前：`systemctl restart r2` 命中本规则（带引导文案），
+    // `systemctl status r2` 不含动作词不命中（仍走 systemctl 提权黄级，不新增误伤）
+    const HOST_RESTART_HINT: &str =
+        "直接操作 R2 服务进程会失联：请改用官方重启通道（restart 工具或飞书 /restart 命令），graceful 收尾且重启后自动恢复";
+    if first == "systemctl"
+        && toks.iter().any(|t| matches!(*t, "stop" | "restart" | "kill"))
+        && toks.iter().any(|t| t.contains("r2"))
+    {
+        return Some(("host-restart".to_string(), HOST_RESTART_HINT.to_string()));
+    }
+    if matches!(first, "pkill" | "pgrep") && toks.iter().any(|t| t.contains("r2")) {
+        return Some(("host-restart".to_string(), HOST_RESTART_HINT.to_string()));
+    }
+
     // 提权
     if PRIVESC_WORDS.contains(&first) {
         return Some((first.to_string(), format!("提权操作（{first}）")));
@@ -652,6 +668,30 @@ mod tests {
         }
         assert!(yellow_rule_of("sudo apt update").contains("sudo"));
         assert!(yellow_rule_of("systemd-run --scope ls").contains("systemd-run"));
+    }
+
+    #[test]
+    fn test_judge_yellow_host_restart() {
+        // v0.17.0 防裸自杀：命中 ×2（systemctl 动作 + r2 / pkill + r2）
+        let r = yellow_rule_of("systemctl restart r2-agent");
+        assert!(r.contains("host-restart"), "{r}");
+        assert!(r.contains("官方重启通道"), "{r}");
+        let r = yellow_rule_of("pkill r2");
+        assert!(r.contains("host-restart"), "{r}");
+        assert!(yellow_rule_of("systemctl stop r2").contains("host-restart"));
+        assert!(yellow_rule_of("pgrep -f r2").contains("host-restart"));
+        // 误伤对照 ×2：
+        // systemctl status r2 —— 无 stop/restart/kill 动作词，不命中 host-restart
+        // （仍走既有 systemctl 提权黄级，权限门核心行为不变）
+        let r = yellow_rule_of("systemctl status r2");
+        assert!(r.contains("systemctl"), "{r}");
+        assert!(!r.contains("host-restart"), "{r}");
+        // pkill nginx —— 不含 r2，绿
+        assert!(is_green("pkill nginx"));
+        // 多段命令：子串含 r2 的非动作段不误伤，动作段命中
+        assert!(is_green("cargo build -p r2-core"));
+        let r = yellow_rule_of("echo ok && systemctl kill r2");
+        assert!(r.contains("host-restart"), "{r}");
     }
 
     #[test]

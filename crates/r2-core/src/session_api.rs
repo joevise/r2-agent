@@ -112,6 +112,11 @@ impl AgentSession {
         self.steer_tx.clone()
     }
 
+    /// 显式停全部 MCP 子进程（v0.17.0 进程重启收尾：exec 不跑 Drop，宿主 exec 前调用）
+    pub fn shutdown_mcp(&self) {
+        self.agent.shutdown_mcp();
+    }
+
     /// run 结束后取走未消费的 steer（宿主补投递用——绝不丢用户消息）
     pub fn take_stale_steers(&mut self) -> Vec<String> {
         self.agent.take_stale_steers()

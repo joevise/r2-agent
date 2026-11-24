@@ -49,6 +49,7 @@ pub mod evolution;
 pub mod extensions;
 pub mod hooks;
 pub mod groups;
+pub mod host;
 pub mod models;
 pub mod namespaces;
 pub mod rpc;

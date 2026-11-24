@@ -278,9 +278,9 @@ fn default_env_clean() -> bool {
     // 默认开启：沙箱内进程不应看到宿主会话管理器句柄
     true
 }
-/// 默认 Extension 清单（全装 = v0.13 行为等价）
+/// 默认 Extension 清单（全装 = v0.13 行为等价；v0.17.0 加 restart 官方重启通道）
 pub fn default_extensions() -> Vec<String> {
-    ["evolution", "tasks", "summon", "mcp-admin"]
+    ["evolution", "tasks", "summon", "mcp-admin", "restart"]
         .iter()
         .map(|s| s.to_string())
         .collect()
@@ -841,7 +841,7 @@ bash_restrict_workdir = true
         assert_eq!(config.agent.extensions, default_extensions());
         assert_eq!(
             config.agent.extensions,
-            vec!["evolution", "tasks", "summon", "mcp-admin"]
+            vec!["evolution", "tasks", "summon", "mcp-admin", "restart"]
         );
         // 显式裁剪清单
         let toml_str = r#"

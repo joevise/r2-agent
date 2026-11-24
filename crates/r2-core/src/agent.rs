@@ -545,6 +545,12 @@ impl Agent {
         self.sandbox_degraded
     }
 
+    /// 显式停全部 MCP 子进程（v0.17.0 进程重启收尾：exec 自替换不跑 Drop，
+    /// 宿主 exec 前调用；常规退出路径 Drop 已覆盖，无需调用）
+    pub fn shutdown_mcp(&self) {
+        self.tools.shutdown_mcp();
+    }
+
     /// 注入 steer 通道（AgentSession / CLI 用）：运行中可接收用户中途转向指令
     pub fn set_steer_channel(&mut self, rx: tokio::sync::mpsc::Receiver<String>) {
         self.steer_rx = Some(rx);

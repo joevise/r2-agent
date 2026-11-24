@@ -7,6 +7,7 @@ mod edit;
 mod history;
 pub(crate) mod mcp_admin;
 mod read;
+pub(crate) mod restart;
 pub(crate) mod summon;
 pub(crate) mod task_tool;
 mod write;
@@ -31,6 +32,9 @@ pub trait Tool: Send + Sync {
 /// 工具注册表：持有全部工具，负责 schema 导出与分发执行
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    /// MCP 子进程连接（v0.17.0 显式关停用：exec 自替换不跑 Drop，
+    /// 进程重启前需显式 kill 防 server 变孤儿）
+    mcp_conns: Vec<std::sync::Arc<tokio::sync::Mutex<crate::mcp::McpConnection>>>,
 }
 
 impl ToolRegistry {
@@ -59,7 +63,26 @@ impl ToolRegistry {
                     sandbox_cfg.env_clean,
                 )),
             ],
+            mcp_conns: vec![],
         })
+    }
+
+    /// 显式停全部 MCP 子进程（v0.17.0 进程重启收尾：exec 不跑 Drop，必须显式
+    /// kill；try_lock 抢不到说明有调用在途，跳过——兜底是 exec 时 stdin EOF 自退）
+    pub fn shutdown_mcp(&self) {
+        for conn in &self.mcp_conns {
+            if let Ok(mut c) = conn.try_lock() {
+                c.kill();
+            }
+        }
+    }
+
+    /// 登记一条 MCP 连接（connect_mcp 用）
+    pub(crate) fn track_mcp_conn(
+        &mut self,
+        conn: std::sync::Arc<tokio::sync::Mutex<crate::mcp::McpConnection>>,
+    ) {
+        self.mcp_conns.push(conn);
     }
 
     /// 注入一批 Extension 工具（Agent 构造时按清单 resolve 后调用）
@@ -225,8 +248,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let reg = make_registry(tmp.path());
         let schemas = reg.schemas();
-        // 默认清单下 8 个（核心 5 + tasks/summon/mcp-admin 各 1）
-        assert_eq!(schemas.len(), 8);
+        // 默认清单下 9 个（核心 5 + tasks/summon/mcp-admin/restart 各 1）
+        assert_eq!(schemas.len(), 9);
         let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"read"));
         assert!(names.contains(&"write"));

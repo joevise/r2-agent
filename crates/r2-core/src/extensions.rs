@@ -41,6 +41,7 @@ pub fn builtin() -> Vec<Arc<dyn Extension>> {
         Arc::new(TasksExtension),
         Arc::new(SummonExtension),
         Arc::new(McpAdminExtension),
+        Arc::new(RestartExtension),
     ]
 }
 
@@ -157,6 +158,24 @@ impl Extension for McpAdminExtension {
     }
 }
 
+/// restart：官方重启通道（v0.17.0）——exec 自替换，替代 bash kill 裸自杀
+struct RestartExtension;
+
+impl Extension for RestartExtension {
+    fn name(&self) -> &str {
+        "restart"
+    }
+    fn title(&self) -> &str {
+        ""
+    }
+    fn description(&self) -> &str {
+        "官方重启通道（restart 工具，exec 自替换 + 自动恢复）"
+    }
+    fn tools(&self, _ctx: &ExtCtx) -> Vec<Box<dyn Tool>> {
+        vec![Box::new(crate::tools::restart::RestartTool::new())]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,7 +191,7 @@ mod tests {
     #[test]
     fn test_builtin_registry_names() {
         let names: Vec<String> = builtin().iter().map(|e| e.name().to_string()).collect();
-        assert_eq!(names, vec!["evolution", "tasks", "summon", "mcp-admin"]);
+        assert_eq!(names, vec!["evolution", "tasks", "summon", "mcp-admin", "restart"]);
         for e in builtin() {
             assert!(!e.description().is_empty(), "{} 缺 description", e.name());
         }
@@ -201,12 +220,12 @@ mod tests {
     #[test]
     fn test_resolve_for_evolution_enabled_filter() {
         let mut agent = crate::config::AgentConfig::default();
-        // 默认全开：4 个全在
-        assert_eq!(resolve_for(&agent).len(), 4);
+        // 默认全开：5 个全在
+        assert_eq!(resolve_for(&agent).len(), 5);
         // v0.13 兼容开关：false 时过滤 evolution（即便清单里有）
         agent.evolution_enabled = false;
         let out = resolve_for(&agent);
-        assert_eq!(out.len(), 3);
+        assert_eq!(out.len(), 4);
         assert!(!out.iter().any(|e| e.name() == "evolution"));
     }
 
@@ -236,17 +255,18 @@ mod tests {
         assert_eq!(tool_name(&by_name("tasks")), "task");
         assert_eq!(tool_name(&by_name("summon")), "summon");
         assert_eq!(tool_name(&by_name("mcp-admin")), "mcp");
+        assert_eq!(tool_name(&by_name("restart")), "restart");
     }
 
     #[test]
     fn test_default_extensions_resolve_full_set() {
-        // 默认清单 = 全装（v0.13 行为等价）：4 extension、3 个工具、1 hook
+        // 默认清单 = 全装（v0.13 行为等价 + v0.17.0 restart）：5 extension、4 个工具、1 hook
         let out = resolve(&crate::config::default_extensions());
-        assert_eq!(out.len(), 4);
+        assert_eq!(out.len(), 5);
         let c = ctx();
         let n_tools: usize = out.iter().map(|e| e.tools(&c).len()).sum();
         let n_hooks: usize = out.iter().map(|e| e.hooks().len()).sum();
-        assert_eq!(n_tools, 3);
+        assert_eq!(n_tools, 4);
         assert_eq!(n_hooks, 1);
     }
 }

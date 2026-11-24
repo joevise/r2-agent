@@ -215,13 +215,19 @@ impl McpConnection {
             .and_then(|_| self.stdin.flush())
             .map_err(|e| format!("MCP server {} 写入 stdin 失败：{e}", self.name))
     }
+    /// 显式杀子进程（幂等）。进程重启收尾用：exec 自替换不跑 Drop，
+    /// 宿主需在 exec 前显式调用（兜底：Rust std 的 fd 默认 CLOEXEC，
+    /// exec 时父侧 stdin 管道关闭，守规矩的 stdio server 收到 EOF 自退）
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for McpConnection {
     /// 连接销毁时杀掉子进程，避免 MCP server 变孤儿
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.kill();
     }
 }
 
@@ -332,6 +338,8 @@ impl ToolRegistry {
                             Arc::clone(&conn),
                         )));
                     }
+                    // v0.17.0：登记连接供进程重启收尾时显式 kill（exec 不跑 Drop）
+                    self.track_mcp_conn(conn);
                     // 走 stderr：serve 模式 stdout 是 JSON-RPC 协议通道，不能污染
                     eprintln!("[mcp] 已连接 MCP server {}（{count} 个工具）", server.name);
                     connected += 1;
